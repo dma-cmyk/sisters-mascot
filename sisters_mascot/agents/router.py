@@ -11,7 +11,7 @@ from pathlib import Path
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from sisters_mascot.agents.agy_adapter import AgyAdapter
-from sisters_mascot.agents.base import BaseAgentAdapter
+from sisters_mascot.agents.base import BaseAgentAdapter, ModelChoice
 from sisters_mascot.agents.claude_adapter import ClaudeAdapter
 from sisters_mascot.agents.codex_adapter import CodexAdapter
 from sisters_mascot.agents.opencode_adapter import OpenCodeAdapter
@@ -29,6 +29,7 @@ class AgentRouter(QObject):
     reply_finished = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
     models_discovered = pyqtSignal(str, list)
+    model_choices_discovered = pyqtSignal(str, list)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -39,6 +40,8 @@ class AgentRouter(QObject):
             "opencode": OpenCodeAdapter(),
         }
         self._sessions: dict[tuple[str, str], str] = {}
+        self._model_cache: dict[str, list[ModelChoice]] = {}
+        self._discovering_agents: set[str] = set()
         self._lock = threading.Lock()
         self._process: subprocess.Popen[str] | None = None
         self._running = False
@@ -280,14 +283,51 @@ class AgentRouter(QObject):
         for key in [k for k in self._sessions if k[0] == agent_id]:
             self._sessions.pop(key, None)
 
-    def refresh_models_async(self, agent_id: str) -> None:
-        """Discover models for `agent_id` in a background thread and emit `models_discovered`."""
+    def get_cached_model_choices(self, agent_id: str) -> list[ModelChoice] | None:
+        """Return cached ModelChoices for `agent_id`, or None if not discovered yet."""
+        with self._lock:
+            cached = self._model_cache.get(agent_id)
+            return list(cached) if cached is not None else None
+
+    def refresh_models_async(self, agent_id: str, *, force: bool = False) -> bool:
+        """Discover models for `agent_id` in a background thread.
+
+        Returns True if a background refresh was started, False if served from
+        cache, invalid agent_id, or a refresh is already running.
+        """
         if agent_id not in self._adapters:
-            return
+            return False
         adapter = self._adapters[agent_id]
 
+        with self._lock:
+            if not force and agent_id in self._model_cache:
+                cached = list(self._model_cache[agent_id])
+            else:
+                cached = None
+                if agent_id in self._discovering_agents:
+                    return False
+                if cached is None:
+                    self._discovering_agents.add(agent_id)
+
+        if cached is not None:
+            self.models_discovered.emit(agent_id, [c.id for c in cached])
+            self.model_choices_discovered.emit(agent_id, cached)
+            return False
+
         def _worker() -> None:
-            models = adapter.discover_models()
-            self.models_discovered.emit(agent_id, models)
+            try:
+                choices = adapter.discover_model_choices()
+            except Exception:
+                choices = [ModelChoice(id=m, label=m) for m in adapter.spec.default_models]
+            else:
+                with self._lock:
+                    self._model_cache[agent_id] = list(choices)
+            finally:
+                with self._lock:
+                    self._discovering_agents.discard(agent_id)
+
+            self.models_discovered.emit(agent_id, [c.id for c in choices])
+            self.model_choices_discovered.emit(agent_id, list(choices))
 
         threading.Thread(target=_worker, daemon=True).start()
+        return True

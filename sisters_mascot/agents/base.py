@@ -27,6 +27,12 @@ class AgentSpec:
     supports_system_prompt: bool = False
 
 
+@dataclass
+class ModelChoice:
+    id: str
+    label: str = ""
+
+
 def is_playwright_tool(tool_name: str, payload: Any = None) -> bool:
     """Return True if a tool call targets Playwright / Chrome browser automation."""
     haystack = tool_name.lower()
@@ -85,6 +91,10 @@ class BaseAgentAdapter:
     def discover_models(self) -> list[str]:
         """Return available model names for this agent."""
         return list(self.spec.default_models)
+
+    def discover_model_choices(self) -> list[ModelChoice]:
+        """Return available model choices (id + display label) for this agent."""
+        return [ModelChoice(id=m, label=m) for m in self.discover_models()]
 
     def build_command(
         self,

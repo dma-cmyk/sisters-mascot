@@ -19,6 +19,7 @@ from PyQt6.QtGui import (
     QRadialGradient,
 )
 
+from sisters_mascot import SPRITES_DIR, USER_SPRITES_DIR
 from sisters_mascot.sisters_loader import SisterProfile, find_sprite_path
 
 _MAX_CACHE_ITEMS = 64
@@ -28,6 +29,18 @@ _PIXMAP_CACHE: OrderedDict[tuple[str, str, int, int, str, int], QPixmap] = Order
 def clear_sprite_cache() -> None:
     """Clear the rendered pixmap LRU cache (call after importing/resetting sprites)."""
     _PIXMAP_CACHE.clear()
+
+
+def find_animated_sprite_path(sister_id: str, state: str = "idle") -> Path | None:
+    """Resolve animated .gif sprite path, preferring user sprites over bundled sprites."""
+    safe_state = state or "idle"
+    states_to_check = [safe_state] if safe_state == "idle" else [safe_state, "idle"]
+    for st in states_to_check:
+        for root in (USER_SPRITES_DIR, SPRITES_DIR):
+            candidate = root / sister_id / f"{st}.gif"
+            if candidate.is_file():
+                return candidate
+    return None
 
 
 def _extract_short_jp_name(display_name: str) -> str:
@@ -410,13 +423,16 @@ def render_sister_pixmap(
         img = QImage(path_str)
         if not img.isNull():
             phys_w = max(1, int(round(safe_width * safe_dpr)))
-            max_phys_h = max(phys_w, int(round(safe_width * 1.9 * safe_dpr)))
-            scaled = img.scaled(
-                phys_w,
-                max_phys_h,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+            max_phys_h = max(phys_w, int(round(safe_width * 2.2 * safe_dpr)))
+            if img.width() > 0 and (img.height() / img.width()) <= 2.2:
+                scaled = img.scaledToWidth(phys_w, Qt.TransformationMode.SmoothTransformation)
+            else:
+                scaled = img.scaled(
+                    phys_w,
+                    max_phys_h,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
             pixmap = QPixmap.fromImage(scaled)
             pixmap.setDevicePixelRatio(safe_dpr)
             _cache_put(cache_key, pixmap)

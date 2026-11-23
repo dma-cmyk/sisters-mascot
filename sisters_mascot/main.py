@@ -57,8 +57,14 @@ class MascotAppController(QObject):
             self.config.tts_engine if self.config.tts_engine != "off" else "edge"
         )
         self._last_scale: str = self.config.mascot_scale
+        self._last_anim_mode: str = str(getattr(self.config, "animation_mode", "rich") or "rich")
         self._last_top: bool = self.config.always_on_top
         self._shutting_down: bool = False
+
+        self._size_save_timer = QTimer(self)
+        self._size_save_timer.setSingleShot(True)
+        self._size_save_timer.setInterval(250)
+        self._size_save_timer.timeout.connect(self._save_config_safe)
 
         self.router = AgentRouter(self)
         self.tts = TTSManager(self)
@@ -81,6 +87,8 @@ class MascotAppController(QObject):
         self.mascot.raise_()
         if current.greeting:
             self.mascot.show_toast(current.greeting, duration_ms=3200)
+
+        self.panel.ensure_models_discovered(self.config.agent_id)
 
     def current_sister(self) -> SisterProfile:
         return self.sister_map[self.config.sister_id]
@@ -123,12 +131,15 @@ class MascotAppController(QObject):
         self.mascot.position_changed.connect(self._on_mascot_position_changed)
         self.mascot.moved_geometry.connect(self._on_mascot_moved_geometry)
         self.mascot.mascot_clicked_line.connect(self._on_mascot_click_line)
+        if hasattr(self.mascot, "size_changed"):
+            self.mascot.size_changed.connect(self._on_mascot_size_changed)
         self.mascot.quit_requested.connect(self.quit)
 
         # Bubble panel
         self.panel.sister_changed.connect(self.switch_sister)
         self.panel.agent_changed.connect(self.switch_agent)
         self.panel.config_updated.connect(self._on_panel_config_updated)
+        self.panel.mascot_size_changed.connect(self._on_panel_mascot_size_changed)
         self.panel.mute_toggled.connect(self.toggle_mute)
         self.panel.sprite_updated.connect(self.mascot.refresh_sprite)
         self.panel.reset_corner_requested.connect(lambda: self.mascot.reset_to_corner(save=True))
@@ -149,7 +160,7 @@ class MascotAppController(QObject):
         self.router.status_changed.connect(self._on_agent_status)
         self.router.reply_finished.connect(self._on_agent_finished)
         self.router.error_occurred.connect(self._on_agent_error)
-        self.router.models_discovered.connect(self.panel.on_models_discovered)
+        self.router.model_choices_discovered.connect(self.panel.on_model_choices_discovered)
 
         # TTS
         self.tts.speaking_started.connect(lambda: self._sync_mascot_idle_or_speaking(True))
@@ -192,6 +203,7 @@ class MascotAppController(QObject):
         self._save_config_safe()
         self.mascot.set_agent_id(agent_id)
         self.panel.sync_from_config(self.current_sister())
+        self.panel.ensure_models_discovered(agent_id)
         self.tray.update_tooltip(
             f"{self.current_sister().rank_label} · {self.current_sister().display_name}",
             agent_id,
@@ -236,6 +248,19 @@ class MascotAppController(QObject):
         ):
             self.tts.speak(line, self.current_sister(), self.config)
 
+    def _on_panel_mascot_size_changed(self, width: int) -> None:
+        clamped = max(100, min(420, int(width)))
+        self.config.mascot_width = clamped
+        if hasattr(self.mascot, "set_mascot_width"):
+            self.mascot.set_mascot_width(clamped, emit_signal=False)
+        self._size_save_timer.start()
+
+    def _on_mascot_size_changed(self, width: int) -> None:
+        clamped = max(100, min(420, int(width)))
+        self.config.mascot_width = clamped
+        self.panel.set_mascot_width_display(clamped)
+        self._size_save_timer.start()
+
     def _on_panel_config_updated(self) -> None:
         if self.config.tts_engine != "off":
             self._preferred_tts_engine = self.config.tts_engine
@@ -247,6 +272,12 @@ class MascotAppController(QObject):
         if self.config.mascot_scale != self._last_scale:
             self._last_scale = self.config.mascot_scale
             self.mascot.set_scale(self.config.mascot_scale)
+
+        anim_mode = str(getattr(self.config, "animation_mode", "rich") or "rich")
+        if anim_mode != self._last_anim_mode:
+            self._last_anim_mode = anim_mode
+            if hasattr(self.mascot, "set_animation_mode"):
+                self.mascot.set_animation_mode(anim_mode)
 
         if self.config.always_on_top != self._last_top:
             self._last_top = self.config.always_on_top

@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizeGrip,
     QSlider,
     QSpinBox,
     QTabWidget,
@@ -33,6 +34,7 @@ from PyQt6.QtWidgets import (
 )
 
 from sisters_mascot import USER_SPRITES_DIR
+from sisters_mascot.agents.base import ModelChoice
 from sisters_mascot.agents.router import AGENT_IDS, AgentRouter
 from sisters_mascot.config import (
     SCALE_WIDTHS,
@@ -194,6 +196,7 @@ class BubblePanel(QWidget):
     sister_changed = pyqtSignal(str)
     agent_changed = pyqtSignal(str)
     config_updated = pyqtSignal()
+    mascot_size_changed = pyqtSignal(int)
     mute_toggled = pyqtSignal()
     sprite_updated = pyqtSignal()
     reset_corner_requested = pyqtSignal()
@@ -217,12 +220,18 @@ class BubblePanel(QWidget):
         self._voice_recorder = voice_recorder
 
         self._updating_controls: bool = False
+        self._ui_ready: bool = False
         self._messages: list[dict[str, str]] = []
         self._streaming_text: str | None = None
-        self._discovered_models: dict[str, list[str]] = {}
+        self._discovered_choices: dict[str, list[ModelChoice]] = {}
+        self._manual_refresh_pending: set[str] = set()
         self._header_drag_pos: QPoint | None = None
 
-        self.setFixedSize(440, 600)
+        self.setMinimumSize(360, 440)
+        self.setMaximumSize(820, 920)
+        init_w = max(360, min(820, int(getattr(self._config, "panel_width", 440) or 440)))
+        init_h = max(440, min(920, int(getattr(self._config, "panel_height", 600) or 600)))
+        self.resize(init_w, init_h)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self._apply_window_flags(initial=True)
 
@@ -231,7 +240,13 @@ class BubblePanel(QWidget):
         self._stream_flush_timer.setInterval(40)
         self._stream_flush_timer.timeout.connect(self._render_chat_log)
 
+        self._resize_save_timer = QTimer(self)
+        self._resize_save_timer.setSingleShot(True)
+        self._resize_save_timer.setInterval(300)
+        self._resize_save_timer.timeout.connect(self._on_resize_save_timeout)
+
         self._build_ui()
+        self._ui_ready = True
         self.sync_from_config(self._sister)
         self._append_system_or_greeting()
 
@@ -256,7 +271,7 @@ class BubblePanel(QWidget):
         root.addWidget(self._frame)
 
         layout = QVBoxLayout(self._frame)
-        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setContentsMargins(14, 12, 14, 6)
         layout.setSpacing(8)
 
         # Header
@@ -327,6 +342,22 @@ class BubblePanel(QWidget):
         self._tabs.addTab(self._build_chat_tab(), "💬 会話")
         self._tabs.addTab(self._build_launcher_tab(), "🚀 ランチャー")
         self._tabs.addTab(self._build_settings_tab(), "⚙️ 設定")
+
+        grip_row = QHBoxLayout()
+        grip_row.setContentsMargins(0, 0, 0, 0)
+        grip_row.addStretch(1)
+        self._size_grip = QSizeGrip(self._frame)
+        self._size_grip.setFixedSize(16, 16)
+        self._size_grip.setToolTip("ドラッグしてサイズ変更")
+        self._size_grip.setStyleSheet(
+            "QSizeGrip { background: transparent; width: 16px; height: 16px; }"
+        )
+        grip_row.addWidget(
+            self._size_grip,
+            0,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
+        )
+        layout.addLayout(grip_row)
 
     def _build_chat_tab(self) -> QWidget:
         tab = QWidget()
@@ -583,12 +614,42 @@ class BubblePanel(QWidget):
         cwd_row.addWidget(cwd_btn)
         di_form.addRow("作業フォルダ:", cwd_row)
 
-        self._scale_combo = QComboBox(disp_card)
-        self._scale_combo.addItem(f"小 ({SCALE_WIDTHS['small']}px)", "small")
-        self._scale_combo.addItem(f"中 ({SCALE_WIDTHS['medium']}px)", "medium")
-        self._scale_combo.addItem(f"大 ({SCALE_WIDTHS['large']}px)", "large")
-        self._scale_combo.currentIndexChanged.connect(self._on_display_setting_changed)
-        di_form.addRow("サイズ:", self._scale_combo)
+        size_container = QWidget(disp_card)
+        size_vbox = QVBoxLayout(size_container)
+        size_vbox.setContentsMargins(0, 0, 0, 0)
+        size_vbox.setSpacing(5)
+
+        size_slider_row = QHBoxLayout()
+        size_slider_row.setSpacing(8)
+        self._size_slider = QSlider(Qt.Orientation.Horizontal, size_container)
+        self._size_slider.setRange(100, 420)
+        self._size_slider.setSingleStep(5)
+        self._size_slider.setPageStep(20)
+        self._size_slider.valueChanged.connect(self._on_size_slider_changed)
+        self._size_slider.sliderReleased.connect(self._on_size_slider_released)
+        self._size_value_lbl = QLabel("210px", size_container)
+        self._size_value_lbl.setStyleSheet("border: none; min-width: 44px; font-weight: 600;")
+        size_slider_row.addWidget(self._size_slider, 1)
+        size_slider_row.addWidget(self._size_value_lbl)
+        size_vbox.addLayout(size_slider_row)
+
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(5)
+        for label_prefix, preset_w in (("小", 165), ("中", 210), ("大", 275), ("特大", 340)):
+            p_btn = QPushButton(f"{label_prefix} {preset_w}", size_container)
+            p_btn.setStyleSheet("padding: 3px 6px; font-size: 11px;")
+            p_btn.clicked.connect(lambda _=False, w=preset_w: self._apply_size_preset(w))
+            preset_row.addWidget(p_btn, 1)
+        size_vbox.addLayout(preset_row)
+
+        di_form.addRow("📏 マスコットサイズ:", size_container)
+
+        self._anim_mode_combo = QComboBox(disp_card)
+        self._anim_mode_combo.addItem("リッチ (おすすめ)", "rich")
+        self._anim_mode_combo.addItem("控えめ", "subtle")
+        self._anim_mode_combo.addItem("OFF", "off")
+        self._anim_mode_combo.currentIndexChanged.connect(self._on_display_setting_changed)
+        di_form.addRow("✨ アニメーション:", self._anim_mode_combo)
 
         di_lay.addLayout(di_form)
 
@@ -662,9 +723,16 @@ class BubblePanel(QWidget):
             self._stt_auto_send_check.setChecked(bool(self._config.stt_auto_send))
 
             self._cwd_edit.setText(self._config.working_dir)
-            sc_idx = self._scale_combo.findData(self._config.mascot_scale)
-            if sc_idx >= 0:
-                self._scale_combo.setCurrentIndex(sc_idx)
+            fallback_w = SCALE_WIDTHS.get(self._config.mascot_scale, 210)
+            mascot_w = max(100, min(420, int(getattr(self._config, "mascot_width", fallback_w) or fallback_w)))
+            self._size_slider.setValue(mascot_w)
+            self._size_value_lbl.setText(f"{mascot_w}px")
+
+            anim_mode = str(getattr(self._config, "animation_mode", "rich") or "rich")
+            am_idx = self._anim_mode_combo.findData(anim_mode)
+            if am_idx >= 0:
+                self._anim_mode_combo.setCurrentIndex(am_idx)
+
             self._auto_approve_check.setChecked(bool(self._config.auto_approve))
             self._always_on_top_check.setChecked(bool(self._config.always_on_top))
 
@@ -679,29 +747,65 @@ class BubblePanel(QWidget):
         muted = self._config.tts_engine == "off"
         self._mute_btn.setText("🔇" if muted else "🔊")
 
+    def ensure_models_discovered(self, agent_id: str, *, force: bool = False) -> None:
+        """Trigger async model discovery for `agent_id` if not cached (or when `force=True`)."""
+        if not force:
+            cached = self._router.get_cached_model_choices(agent_id)
+            if cached is not None:
+                self._discovered_choices[agent_id] = list(cached)
+                if agent_id == self._config.agent_id:
+                    self._refresh_models_btn.setText("↻")
+                    self._refresh_models_btn.setEnabled(True)
+                    self._updating_controls = True
+                    try:
+                        self._populate_model_combo(agent_id)
+                    finally:
+                        self._updating_controls = False
+                return
+
+        started = self._router.refresh_models_async(agent_id, force=force)
+        if started and agent_id == self._config.agent_id:
+            self._refresh_models_btn.setText("…")
+            self._refresh_models_btn.setEnabled(False)
+
     def _populate_model_combo(self, agent_id: str) -> None:
         self._model_combo.clear()
-        adapter = self._router.get_adapter(agent_id)
-        defaults = list(getattr(getattr(adapter, "spec", None), "default_models", []) or [])
-        discovered = list(self._discovered_models.get(agent_id, []))
+        self._model_combo.addItem("（既定モデル）", "")
+
+        choices = self._discovered_choices.get(agent_id)
+        if choices is None:
+            cached = self._router.get_cached_model_choices(agent_id)
+            if cached is not None:
+                choices = list(cached)
+                self._discovered_choices[agent_id] = choices
 
         seen: set[str] = set()
-        merged: list[str] = []
-        for m in discovered + defaults:
-            m_clean = (m or "").strip()
-            if m_clean and m_clean not in seen:
-                seen.add(m_clean)
-                merged.append(m_clean)
-
-        self._model_combo.addItem("（既定モデル）", "")
-        for m in merged:
-            self._model_combo.addItem(m, m)
+        if choices:
+            for choice in choices:
+                cid = (choice.id or "").strip()
+                if not cid or cid in seen:
+                    continue
+                seen.add(cid)
+                display = (choice.label or cid).strip()
+                self._model_combo.addItem(display, cid)
+        else:
+            adapter = self._router.get_adapter(agent_id)
+            defaults = list(getattr(getattr(adapter, "spec", None), "default_models", []) or [])
+            for m in defaults:
+                m_clean = (m or "").strip()
+                if m_clean and m_clean not in seen:
+                    seen.add(m_clean)
+                    self._model_combo.addItem(m_clean, m_clean)
 
         saved_model = (self._config.models_by_agent.get(agent_id, "") or "").strip()
         if saved_model:
-            if saved_model not in seen:
+            idx = self._model_combo.findData(saved_model)
+            if idx >= 0:
+                self._model_combo.setCurrentIndex(idx)
+            else:
                 self._model_combo.addItem(saved_model, saved_model)
-            self._model_combo.setEditText(saved_model)
+                self._model_combo.setCurrentIndex(self._model_combo.count() - 1)
+                self._model_combo.setEditText(saved_model)
         else:
             self._model_combo.setCurrentIndex(0)
             self._model_combo.setEditText("")
@@ -736,6 +840,7 @@ class BubblePanel(QWidget):
         self.move(x, y)
 
     def show_for_mascot(self, mascot_rect: QRect, *, tab_index: int | None = None) -> None:
+        self.ensure_models_discovered(self._config.agent_id)
         self.reposition_near_mascot(mascot_rect)
         if tab_index is not None:
             self._tabs.setCurrentIndex(tab_index)
@@ -882,16 +987,37 @@ class BubblePanel(QWidget):
         self.set_running_state(False)
         self._render_chat_log()
 
-    def on_models_discovered(self, agent_id: str, models: list) -> None:
-        self._discovered_models[agent_id] = [str(m) for m in models if str(m).strip()]
-        self._refresh_models_btn.setText("↻")
-        self._refresh_models_btn.setEnabled(True)
+    def on_model_choices_discovered(self, agent_id: str, choices: list) -> None:
+        normalized: list[ModelChoice] = []
+        for entry in choices:
+            if isinstance(entry, ModelChoice):
+                cid = (entry.id or "").strip()
+                if cid:
+                    normalized.append(ModelChoice(id=cid, label=(entry.label or cid).strip()))
+            else:
+                cid = str(entry).strip()
+                if cid:
+                    normalized.append(ModelChoice(id=cid, label=cid))
+
+        self._discovered_choices[agent_id] = normalized
         if agent_id == self._config.agent_id:
+            self._refresh_models_btn.setText("↻")
+            self._refresh_models_btn.setEnabled(True)
             self._updating_controls = True
             try:
                 self._populate_model_combo(agent_id)
             finally:
                 self._updating_controls = False
+
+        if agent_id in self._manual_refresh_pending:
+            self._manual_refresh_pending.discard(agent_id)
+            adapter = self._router.get_adapter(agent_id)
+            disp = getattr(getattr(adapter, "spec", None), "display_name", agent_id) or agent_id
+            self.toast_requested.emit(f"{disp}: {len(normalized)} 件のモデルを取得しました", False)
+
+    def on_models_discovered(self, agent_id: str, models: list) -> None:
+        choices = [ModelChoice(id=str(m).strip(), label=str(m).strip()) for m in models if str(m).strip()]
+        self.on_model_choices_discovered(agent_id, choices)
 
     def set_voice_state(self, state: str) -> None:
         """Update mic button look: 'idle' | 'recording' | 'transcribing'."""
@@ -1248,6 +1374,7 @@ class BubblePanel(QWidget):
                 self._populate_model_combo(aid)
             finally:
                 self._updating_controls = False
+            self.ensure_models_discovered(aid)
             self.agent_changed.emit(aid)
             self.config_updated.emit()
 
@@ -1265,8 +1392,16 @@ class BubblePanel(QWidget):
         if self._updating_controls:
             return
         text = self._model_combo.currentText().strip()
-        if text == "（既定モデル）":
-            text = ""
+        if not text or text == "（既定モデル）":
+            self._model_combo.setEditText("")
+            self._save_model_selection("")
+            return
+        for idx in range(self._model_combo.count()):
+            item_text = self._model_combo.itemText(idx).strip()
+            item_data = str(self._model_combo.itemData(idx) or "").strip()
+            if text == item_text or (item_data and text == item_data):
+                self._save_model_selection(item_data)
+                return
         self._save_model_selection(text)
 
     def _save_model_selection(self, model_name: str) -> None:
@@ -1278,9 +1413,9 @@ class BubblePanel(QWidget):
         self.config_updated.emit()
 
     def _on_refresh_models(self) -> None:
-        self._refresh_models_btn.setText("…")
-        self._refresh_models_btn.setEnabled(False)
-        self._router.refresh_models_async(self._config.agent_id)
+        aid = self._config.agent_id
+        self._manual_refresh_pending.add(aid)
+        self.ensure_models_discovered(aid, force=True)
 
     def _on_new_session(self) -> None:
         if self._router.is_running():
@@ -1376,16 +1511,59 @@ class BubblePanel(QWidget):
             self._cwd_edit.setText(chosen)
             self._on_display_setting_changed()
 
+    def set_mascot_width_display(self, width: int) -> None:
+        """Sync size slider and readout label without re-emitting size-change signals."""
+        clamped = max(100, min(420, int(width)))
+        self._updating_controls = True
+        try:
+            self._size_slider.setValue(clamped)
+            self._size_value_lbl.setText(f"{clamped}px")
+        finally:
+            self._updating_controls = False
+
+    def _on_size_slider_changed(self, value: int) -> None:
+        clamped = max(100, min(420, int(value)))
+        self._size_value_lbl.setText(f"{clamped}px")
+        if not self._updating_controls:
+            self._config.mascot_width = clamped
+            self.mascot_size_changed.emit(clamped)
+
+    def _on_size_slider_released(self) -> None:
+        if not self._updating_controls:
+            self.config_updated.emit()
+
+    def _apply_size_preset(self, width: int) -> None:
+        clamped = max(100, min(420, int(width)))
+        self._size_slider.setValue(clamped)
+        self.config_updated.emit()
+
     def _on_display_setting_changed(self) -> None:
         if self._updating_controls:
             return
         self._config.working_dir = self._cwd_edit.text().strip() or "/home/dma"
-        self._config.mascot_scale = str(self._scale_combo.currentData() or "medium")
+        self._config.animation_mode = str(self._anim_mode_combo.currentData() or "rich")
         self._config.auto_approve = self._auto_approve_check.isChecked()
         self._config.always_on_top = self._always_on_top_check.isChecked()
         self._apply_window_flags()
         self.config_updated.emit()
 
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        if self._ui_ready:
+            self._resize_save_timer.start()
+
+    def _on_resize_save_timeout(self) -> None:
+        w = max(360, min(820, self.width()))
+        h = max(440, min(920, self.height()))
+        if (
+            getattr(self._config, "panel_width", None) != w
+            or getattr(self._config, "panel_height", None) != h
+        ):
+            self._config.panel_width = w
+            self._config.panel_height = h
+            self.config_updated.emit()
+
     def closeEvent(self, event) -> None:  # noqa: ANN001
         self._stream_flush_timer.stop()
+        self._resize_save_timer.stop()
         super().closeEvent(event)

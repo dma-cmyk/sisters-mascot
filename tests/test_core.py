@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -14,12 +17,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from PyQt6.QtCore import QRect  # noqa: E402
-from PyQt6.QtGui import QImage  # noqa: E402
+from PyQt6.QtCore import QPointF, QRect, Qt  # noqa: E402
+from PyQt6.QtGui import QImage, QWheelEvent  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 from sisters_mascot import SPRITES_DIR  # noqa: E402
 from sisters_mascot.agents.agy_adapter import AgyAdapter  # noqa: E402
+from sisters_mascot.agents.base import ModelChoice  # noqa: E402
 from sisters_mascot.agents.claude_adapter import ClaudeAdapter  # noqa: E402
 from sisters_mascot.agents.codex_adapter import CodexAdapter  # noqa: E402
 from sisters_mascot.agents.opencode_adapter import OpenCodeAdapter  # noqa: E402
@@ -197,6 +201,34 @@ class TestConfigPersistence(unittest.TestCase):
             corrupt.write_text("{not valid json", encoding="utf-8")
             self.assertEqual(load_config(corrupt).agent_id, "agy")
 
+    def test_clamping_and_legacy_scale_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            legacy = Path(tmpdir) / "legacy.json"
+            legacy.write_text(json.dumps({"mascot_scale": "large"}), encoding="utf-8")
+            loaded_legacy = load_config(legacy)
+            self.assertEqual(loaded_legacy.mascot_width, 275)
+            self.assertEqual(loaded_legacy.animation_mode, "rich")
+            self.assertEqual(loaded_legacy.panel_width, 440)
+            self.assertEqual(loaded_legacy.panel_height, 600)
+
+            extreme = Path(tmpdir) / "extreme.json"
+            extreme.write_text(
+                json.dumps(
+                    {
+                        "mascot_width": 999,
+                        "panel_width": 120,
+                        "panel_height": 2000,
+                        "animation_mode": "invalid",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded_extreme = load_config(extreme)
+            self.assertEqual(loaded_extreme.mascot_width, 420)
+            self.assertEqual(loaded_extreme.panel_width, 360)
+            self.assertEqual(loaded_extreme.panel_height, 920)
+            self.assertEqual(loaded_extreme.animation_mode, "rich")
+
 
 class TestAgentAdapters(unittest.TestCase):
     def test_agy_command_and_parsing(self) -> None:
@@ -366,6 +398,83 @@ class TestAgentAdapters(unittest.TestCase):
         evs_err = adapter.parse_line('{"type":"error","error":{"data":{"message":"provider offline"}}}')
         self.assertEqual([(e.kind, e.text) for e in evs_err], [("error", "provider offline")])
 
+    def test_dynamic_model_discovery_parsers(self) -> None:
+        agy = AgyAdapter()
+        agy_stdout = (
+            "Fetching available models...\n"
+            "gemini-4-hydrogen-high\tGemini 4 Hydrogen (High)\n"
+            "claude-sonnet-5-5-high\tClaude Sonnet 5.5 (High)\n"
+        )
+        with (
+            patch.object(agy, "is_available", return_value=True),
+            patch("sisters_mascot.agents.agy_adapter.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=["agy", "models"], returncode=0, stdout=agy_stdout, stderr=""
+            )
+            agy_choices = agy.discover_model_choices()
+        self.assertEqual([c.id for c in agy_choices], ["gemini-4-hydrogen-high", "claude-sonnet-5-5-high"])
+        self.assertIn("Gemini 4 Hydrogen (High)", agy_choices[0].label)
+        self.assertNotIn("gemini-2.5-pro", [c.id for c in agy_choices])
+
+        oc = OpenCodeAdapter()
+        oc_stdout = "opencode/big-pickle\nopencode/mimo-v2.6-flash-free\n"
+        with (
+            patch.object(oc, "is_available", return_value=True),
+            patch("sisters_mascot.agents.opencode_adapter.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=["opencode", "models"], returncode=0, stdout=oc_stdout, stderr=""
+            )
+            oc_models = oc.discover_models()
+        self.assertEqual(oc_models, ["opencode/big-pickle", "opencode/mimo-v2.6-flash-free"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_home = Path(tmpdir)
+            codex_dir = fake_home / ".codex"
+            codex_dir.mkdir()
+            (codex_dir / "config.toml").write_text('model = "gpt-6.1-sol"\n', encoding="utf-8")
+            (codex_dir / "models_cache.json").write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {"slug": "gpt-6-astra", "display_name": "GPT-6-Astra", "visibility": "list", "priority": 2},
+                            {"slug": "gpt-reserve", "display_name": "GPT-Reserve", "visibility": "hide", "priority": 0},
+                            {"slug": "gpt-6.1-sol", "display_name": "GPT-6.1-Sol", "visibility": "list", "priority": 1},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            claude_dir = fake_home / ".claude"
+            claude_dir.mkdir()
+            (claude_dir / "settings.json").write_text(
+                json.dumps(
+                    {
+                        "model": "claude-opus-5-5",
+                        "env": {
+                            "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
+                            "ANTHROPIC_API_KEY": "should-never-appear",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch("pathlib.Path.home", return_value=fake_home),
+                patch.dict(os.environ, {}, clear=True),
+            ):
+                codex_choices = CodexAdapter().discover_model_choices()
+                claude_models = ClaudeAdapter().discover_models()
+
+        self.assertEqual([c.id for c in codex_choices], ["gpt-6.1-sol", "gpt-6-astra"])
+        self.assertEqual(codex_choices[0].label, "GPT-6.1-Sol (gpt-6.1-sol)")
+        self.assertNotIn("gpt-5.4", [c.id for c in codex_choices])
+        self.assertIn("claude-opus-5-5", claude_models)
+        self.assertIn("claude-sonnet-4-6", claude_models)
+        self.assertIn("sonnet", claude_models)
+        self.assertNotIn("should-never-appear", claude_models)
+
 
 class TestSpeechSanitizer(unittest.TestCase):
     def test_clean_text_for_speech_strips_markdown_and_truncates_at_sentence(self) -> None:
@@ -509,6 +618,56 @@ class TestHeadlessUI(unittest.TestCase):
                     break
             panel._rebuild_launcher_sections()
             self.assertTrue(any(b.label == "Playwright Updated" for b in cfg.bookmarks))
+
+            # Animation modes, particles, activity states, and mascot resizing
+            mascot.set_animation_mode("rich")
+            mascot.trigger_bounce()
+            self.assertGreater(len(mascot._particles), 0)
+            mascot.set_activity("speaking")
+            mascot._on_anim_tick()
+            mascot.set_activity("tool")
+            mascot._on_anim_tick()
+            mascot.set_animation_mode("subtle")
+            mascot._on_anim_tick()
+            mascot.set_animation_mode("off")
+            self.assertEqual(len(mascot._particles), 0)
+            mascot.set_animation_mode("rich")
+
+            mascot.set_mascot_width(130, emit_signal=True)
+            self.assertEqual(cfg.mascot_width, 130)
+            mascot.set_mascot_width(340, emit_signal=True)
+            self.assertEqual(cfg.mascot_width, 340)
+
+            wheel_up = QWheelEvent(
+                QPointF(50.0, 50.0),
+                QPointF(50.0, 50.0),
+                QPointF(0.0, 0.0).toPoint(),
+                QPointF(0.0, 120.0).toPoint(),
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+                Qt.ScrollPhase.NoScrollPhase,
+                False,
+            )
+            mascot.wheelEvent(wheel_up)
+            self.assertEqual(cfg.mascot_width, 354)
+
+            # Panel resizing & dynamic model choice mapping
+            self.assertEqual(panel.minimumWidth(), 360)
+            self.assertEqual(panel.minimumHeight(), 440)
+            panel.resize(520, 680)
+            panel._on_resize_save_timeout()
+            self.assertEqual((cfg.panel_width, cfg.panel_height), (520, 680))
+
+            cfg.agent_id = "agy"
+            panel.on_model_choices_discovered(
+                "agy",
+                [ModelChoice(id="gemini-4-hydrogen-high", label="Gemini 4 Hydrogen (High) (gemini-4-hydrogen-high)")],
+            )
+            idx = panel._model_combo.findData("gemini-4-hydrogen-high")
+            self.assertGreater(idx, 0)
+            panel._model_combo.setCurrentIndex(idx)
+            panel._on_model_edited()
+            self.assertEqual(cfg.models_by_agent.get("agy"), "gemini-4-hydrogen-high")
 
             app.processEvents()
         finally:

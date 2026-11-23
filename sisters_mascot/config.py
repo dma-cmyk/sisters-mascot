@@ -15,7 +15,28 @@ from sisters_mascot import CONFIG_DIR
 
 logger = logging.getLogger(__name__)
 
-SCALE_WIDTHS: dict[str, int] = {"small": 160, "medium": 210, "large": 265}
+SCALE_WIDTHS: dict[str, int] = {
+    "small": 165,
+    "medium": 210,
+    "large": 275,
+    "xlarge": 340,
+}
+
+MASCOT_WIDTH_MIN = 100
+MASCOT_WIDTH_MAX = 420
+PANEL_WIDTH_MIN = 360
+PANEL_WIDTH_MAX = 820
+PANEL_HEIGHT_MIN = 440
+PANEL_HEIGHT_MAX = 920
+ANIMATION_MODES = ("rich", "subtle", "off")
+
+
+def _clamp_int(value: Any, default: int, low: int, high: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(low, min(high, parsed))
 
 
 @dataclass
@@ -141,6 +162,10 @@ class AppConfig:
     mascot_x: int | None = None
     mascot_y: int | None = None
     mascot_scale: str = "medium"
+    mascot_width: int = 210
+    panel_width: int = 440
+    panel_height: int = 600
+    animation_mode: str = "rich"
     always_on_top: bool = True
     tts_engine: str = "edge"
     tts_volume: int = 80
@@ -204,6 +229,10 @@ def load_config(path: Path | None = None) -> AppConfig:
         "mascot_x",
         "mascot_y",
         "mascot_scale",
+        "mascot_width",
+        "panel_width",
+        "panel_height",
+        "animation_mode",
         "always_on_top",
         "tts_engine",
         "tts_volume",
@@ -226,6 +255,22 @@ def load_config(path: Path | None = None) -> AppConfig:
 
     if cfg.mascot_scale not in SCALE_WIDTHS:
         cfg.mascot_scale = "medium"
+
+    default_mascot_w = SCALE_WIDTHS.get(cfg.mascot_scale, 210)
+    if "mascot_width" not in data or data.get("mascot_width") is None:
+        cfg.mascot_width = default_mascot_w
+    else:
+        cfg.mascot_width = _clamp_int(
+            cfg.mascot_width,
+            default_mascot_w,
+            MASCOT_WIDTH_MIN,
+            MASCOT_WIDTH_MAX,
+        )
+
+    cfg.panel_width = _clamp_int(cfg.panel_width, 440, PANEL_WIDTH_MIN, PANEL_WIDTH_MAX)
+    cfg.panel_height = _clamp_int(cfg.panel_height, 600, PANEL_HEIGHT_MIN, PANEL_HEIGHT_MAX)
+    if cfg.animation_mode not in ANIMATION_MODES:
+        cfg.animation_mode = "rich"
 
     if "quick_prompts" in data:
         cfg.quick_prompts = _deserialize_items(data["quick_prompts"], QuickPromptItem, _default_quick_prompts)

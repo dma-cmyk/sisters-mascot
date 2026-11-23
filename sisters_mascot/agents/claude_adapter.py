@@ -3,10 +3,32 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+from pathlib import Path
 from typing import Any
 
-from sisters_mascot.agents.base import AgentSpec, BaseAgentAdapter, StreamEvent, make_tool_event
+from sisters_mascot.agents.base import (
+    AgentSpec,
+    BaseAgentAdapter,
+    ModelChoice,
+    StreamEvent,
+    make_tool_event,
+)
+
+_DYNAMIC_ALIASES: tuple[tuple[str, str], ...] = (
+    ("sonnet", "Sonnet (sonnet)"),
+    ("opus", "Opus (opus)"),
+    ("haiku", "Haiku (haiku)"),
+    ("sonnet[1m]", "Sonnet 1M (sonnet[1m])"),
+    ("opus[1m]", "Opus 1M (opus[1m])"),
+)
+_SENSITIVE_KEY_PARTS = ("KEY", "TOKEN", "SECRET", "PASS", "AUTH", "CREDENTIAL")
+
+
+def _is_safe_model_key(key: str) -> bool:
+    upper = key.upper()
+    return "MODEL" in upper and not any(part in upper for part in _SENSITIVE_KEY_PARTS)
 
 
 class ClaudeAdapter(BaseAgentAdapter):
@@ -18,13 +40,11 @@ class ClaudeAdapter(BaseAgentAdapter):
             display_name="Claude Code",
             binary=shutil.which("claude") or "/usr/bin/claude",
             default_models=[
-                "default",
                 "sonnet",
                 "opus",
                 "haiku",
-                "claude-sonnet-4-6",
-                "claude-opus-4-6",
-                "claude-haiku-4-5",
+                "sonnet[1m]",
+                "opus[1m]",
             ],
             supports_system_prompt=True,
         )
@@ -35,16 +55,69 @@ class ClaudeAdapter(BaseAgentAdapter):
         self._saw_stream_delta = False
         self._emitted_any_text = False
 
+    def discover_model_choices(self) -> list[ModelChoice]:
+        configured: list[str] = []
+
+        for filename in ("settings.json", "settings.local.json"):
+            cfg_path = Path.home() / ".claude" / filename
+            if not cfg_path.is_file():
+                continue
+            try:
+                data = json.loads(cfg_path.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+
+            model_val = data.get("model")
+            if isinstance(model_val, str) and model_val.strip():
+                configured.append(model_val.strip())
+
+            avail = data.get("availableModels")
+            if isinstance(avail, list):
+                for entry in avail:
+                    if isinstance(entry, str) and entry.strip():
+                        configured.append(entry.strip())
+
+            env_map = data.get("env")
+            if isinstance(env_map, dict):
+                for key, val in env_map.items():
+                    if (
+                        isinstance(key, str)
+                        and _is_safe_model_key(key)
+                        and isinstance(val, str)
+                        and val.strip()
+                    ):
+                        configured.append(val.strip())
+
+        for key, val in os.environ.items():
+            if (
+                key.upper().startswith(("ANTHROPIC_", "CLAUDE_CODE_"))
+                and _is_safe_model_key(key)
+                and val.strip()
+            ):
+                configured.append(val.strip())
+
+        alias_labels = dict(_DYNAMIC_ALIASES)
+        choices: list[ModelChoice] = []
+        seen: set[str] = set()
+
+        for model_id in configured:
+            if not model_id or model_id == "default" or model_id in seen:
+                continue
+            seen.add(model_id)
+            choices.append(ModelChoice(id=model_id, label=alias_labels.get(model_id, model_id)))
+
+        for alias_id, alias_label in _DYNAMIC_ALIASES:
+            if alias_id in seen:
+                continue
+            seen.add(alias_id)
+            choices.append(ModelChoice(id=alias_id, label=alias_label))
+
+        return choices
+
     def discover_models(self) -> list[str]:
-        return [
-            "default",
-            "sonnet",
-            "opus",
-            "haiku",
-            "claude-sonnet-4-6",
-            "claude-opus-4-6",
-            "claude-haiku-4-5",
-        ]
+        return [choice.id for choice in self.discover_model_choices()]
 
     def build_command(
         self,

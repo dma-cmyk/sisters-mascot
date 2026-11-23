@@ -7,7 +7,13 @@ import re
 import shutil
 from pathlib import Path
 
-from sisters_mascot.agents.base import AgentSpec, BaseAgentAdapter, StreamEvent, make_tool_event
+from sisters_mascot.agents.base import (
+    AgentSpec,
+    BaseAgentAdapter,
+    ModelChoice,
+    StreamEvent,
+    make_tool_event,
+)
 
 _CONFIG_MODEL_RE = re.compile(r'^\s*model\s*=\s*["\']([^"\']+)["\']')
 
@@ -35,33 +41,76 @@ class CodexAdapter(BaseAgentAdapter):
     def reset_state(self) -> None:
         self._item_texts.clear()
 
-    def discover_models(self) -> list[str]:
-        curated = [
-            "gpt-5.4",
-            "gpt-5.3-codex",
-            "gpt-5.2-codex",
-            "gpt-5.1-codex-mini",
-            "o3",
-            "o4-mini",
-        ]
-        found: list[str] = []
+    def discover_model_choices(self) -> list[ModelChoice]:
+        configured_models: list[str] = []
         cfg_path = Path.home() / ".codex" / "config.toml"
         if cfg_path.is_file():
             try:
                 for line in cfg_path.read_text(encoding="utf-8", errors="replace").splitlines():
                     match = _CONFIG_MODEL_RE.match(line)
                     if match:
-                        found.append(match.group(1).strip())
+                        val = match.group(1).strip()
+                        if val:
+                            configured_models.append(val)
             except OSError:
                 pass
 
+        visible_entries: list[tuple[int, int, str, str]] = []
+        by_slug: dict[str, str] = {}
+        cache_path = Path.home() / ".codex" / "models_cache.json"
+        if cache_path.is_file():
+            try:
+                data = json.loads(cache_path.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, json.JSONDecodeError):
+                data = None
+            raw_models = data.get("models") if isinstance(data, dict) else None
+            if isinstance(raw_models, list):
+                for idx, entry in enumerate(raw_models):
+                    if not isinstance(entry, dict):
+                        continue
+                    slug = str(entry.get("slug") or "").strip()
+                    if not slug:
+                        continue
+                    display_name = str(entry.get("display_name") or "").strip()
+                    by_slug[slug] = display_name
+                    visibility = str(entry.get("visibility") or "list").strip().lower()
+                    if visibility == "hide":
+                        continue
+                    raw_prio = entry.get("priority", 9999)
+                    try:
+                        prio = int(raw_prio)
+                    except (TypeError, ValueError):
+                        prio = 9999
+                    visible_entries.append((prio, idx, slug, display_name))
+
+        visible_entries.sort(key=lambda item: (item[0], item[1]))
+
+        choices: list[ModelChoice] = []
         seen: set[str] = set()
-        merged: list[str] = []
-        for model in [*found, *curated]:
-            if model and model not in seen:
-                seen.add(model)
-                merged.append(model)
-        return merged
+
+        def _fmt_label(slug: str, display_name: str) -> str:
+            if display_name and display_name != slug:
+                return f"{display_name} ({slug})"
+            return slug
+
+        for model_id in configured_models:
+            if model_id in seen:
+                continue
+            seen.add(model_id)
+            choices.append(ModelChoice(id=model_id, label=_fmt_label(model_id, by_slug.get(model_id, ""))))
+
+        for _prio, _idx, slug, display_name in visible_entries:
+            if slug in seen:
+                continue
+            seen.add(slug)
+            choices.append(ModelChoice(id=slug, label=_fmt_label(slug, display_name)))
+
+        if choices:
+            return choices
+        return [ModelChoice(id=m, label=m) for m in self.spec.default_models]
+
+    def discover_models(self) -> list[str]:
+        return [choice.id for choice in self.discover_model_choices()]
 
     def build_command(
         self,

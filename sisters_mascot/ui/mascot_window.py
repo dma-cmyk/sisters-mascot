@@ -1,21 +1,28 @@
-"""Transparent desktop mascot window with animations, hover mini-bar, and drag/click UX."""
+"""Transparent desktop mascot window with rich animations, hover mini-bar, and interactive resizing."""
 
 from __future__ import annotations
 
 import math
 import random
+import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
 
-from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
     QCursor,
     QFont,
     QGuiApplication,
+    QImageReader,
     QLinearGradient,
+    QMovie,
     QPainter,
+    QPainterPath,
     QPen,
+    QPixmap,
     QRadialGradient,
 )
 from PyQt6.QtWidgets import (
@@ -27,15 +34,28 @@ from PyQt6.QtWidgets import (
 )
 
 from sisters_mascot.agents.router import AGENT_IDS
-from sisters_mascot.config import SCALE_WIDTHS, AppConfig
+from sisters_mascot.config import (
+    ANIMATION_MODES,
+    MASCOT_WIDTH_MAX,
+    MASCOT_WIDTH_MIN,
+    SCALE_WIDTHS,
+    AppConfig,
+)
 from sisters_mascot.sisters_loader import SisterProfile, has_custom_or_generated_sprite
-from sisters_mascot.sprites.renderer import render_sister_pixmap
+from sisters_mascot.sprites.renderer import find_animated_sprite_path, render_sister_pixmap
 from sisters_mascot.ui.widgets import ToastBubble
 
-
-_PAD_X = 22
-_PAD_TOP = 38
+_PAD_X = 28
+_PAD_TOP = 42
 _PAD_BOTTOM = 44
+
+_SIZE_PRESETS: tuple[tuple[str, int], ...] = (
+    ("極小 (130px)", 130),
+    ("小 (165px)", 165),
+    ("中 (210px)", 210),
+    ("大 (275px)", 275),
+    ("特大 (340px)", 340),
+)
 
 _MENU_QSS = """
 QMenu {
@@ -62,6 +82,41 @@ QMenu::separator {
 """
 
 
+@dataclass(slots=True)
+class _Particle:
+    x: float
+    y: float
+    vx: float
+    vy: float
+    life: float
+    max_life: float
+    size: float
+    kind: str  # "star" | "heart" | "dot"
+    color: QColor
+    rot: float
+    vrot: float
+
+
+@dataclass(slots=True)
+class _AmbientMote:
+    x_norm: float
+    y_norm: float
+    speed: float
+    phase: float
+    size: float
+    twinkle_speed: float
+
+
+@dataclass(slots=True)
+class _Ripple:
+    radius: float
+    max_radius: float
+    alpha: float
+    speed: float
+    color: QColor
+    width: float
+
+
 def _short_name(display_name: str) -> str:
     name = (display_name or "").strip()
     if "(" in name:
@@ -69,6 +124,67 @@ def _short_name(display_name: str) -> str:
     if "（" in name:
         name = name.split("（", 1)[0].strip()
     return name or display_name
+
+
+def _clamp_mascot_width(width: int) -> int:
+    return max(MASCOT_WIDTH_MIN, min(MASCOT_WIDTH_MAX, int(width)))
+
+
+def _draw_four_point_star(
+    painter: QPainter,
+    center: QPointF,
+    radius: float,
+    color: QColor,
+    rotation_deg: float = 0.0,
+) -> None:
+    if radius <= 0.4 or color.alpha() <= 2:
+        return
+    inner = radius * 0.28
+    path = QPainterPath()
+    path.moveTo(0.0, -radius)
+    path.lineTo(inner, -inner)
+    path.lineTo(radius, 0.0)
+    path.lineTo(inner, inner)
+    path.lineTo(0.0, radius)
+    path.lineTo(-inner, inner)
+    path.lineTo(-radius, 0.0)
+    path.lineTo(-inner, -inner)
+    path.closeSubpath()
+
+    painter.save()
+    painter.translate(center)
+    if abs(rotation_deg) > 0.1:
+        painter.rotate(rotation_deg)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(color)
+    painter.drawPath(path)
+    painter.restore()
+
+
+def _draw_heart(
+    painter: QPainter,
+    center: QPointF,
+    size: float,
+    color: QColor,
+    rotation_deg: float = 0.0,
+) -> None:
+    if size <= 0.6 or color.alpha() <= 2:
+        return
+    s = size * 0.55
+    path = QPainterPath()
+    path.moveTo(0.0, s * 0.95)
+    path.cubicTo(-s * 1.45, s * 0.10, -s * 1.10, -s * 1.05, 0.0, -s * 0.35)
+    path.cubicTo(s * 1.10, -s * 1.05, s * 1.45, s * 0.10, 0.0, s * 0.95)
+    path.closeSubpath()
+
+    painter.save()
+    painter.translate(center)
+    if abs(rotation_deg) > 0.1:
+        painter.rotate(rotation_deg)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(color)
+    painter.drawPath(path)
+    painter.restore()
 
 
 class MascotWindow(QWidget):
@@ -83,6 +199,7 @@ class MascotWindow(QWidget):
     always_on_top_toggled = pyqtSignal(bool)
     position_changed = pyqtSignal(int, int)
     moved_geometry = pyqtSignal(QRect)
+    size_changed = pyqtSignal(int)
     mascot_clicked_line = pyqtSignal(str)
     quit_requested = pyqtSignal()
 
@@ -103,14 +220,57 @@ class MascotWindow(QWidget):
         self._activity_kind: str = "idle"
         self._status_text: str = ""
         self._temp_sprite_state: str | None = None
+        self._animation_mode: str = (
+            config.animation_mode if config.animation_mode in ANIMATION_MODES else "rich"
+        )
+        self._config.mascot_width = _clamp_mascot_width(
+            getattr(config, "mascot_width", SCALE_WIDTHS.get(config.mascot_scale, 210))
+        )
 
-        # Animation state
+        # Sprite / animated GIF state
+        self._pixmap = QPixmap()
+        self._sprite_w: int = self._config.mascot_width
+        self._sprite_h: int = round(self._config.mascot_width * 1.24)
+        self._movie: QMovie | None = None
+        self._movie_path: Path | None = None
+
+        # Core animation physics state
         self._anim_phase: float = 0.0
+        self._last_tick_ts: float = time.monotonic()
         self._bounce_vel: float = 0.0
         self._bounce_y: float = 0.0
+        self._squash_x: float = 1.0
+        self._squash_y: float = 1.0
+        self._squash_vx: float = 0.0
+        self._squash_vy: float = 0.0
+
+        # Tilt & pendulum drag physics
         self._tilt_angle: float = 0.0
+        self._tilt_vel: float = 0.0
         self._target_tilt: float = 0.0
+
+        # Hover cursor lean & friendly zoom
         self._hovered: bool = False
+        self._hover_lean_angle: float = 0.0
+        self._hover_zoom: float = 1.0
+
+        # Sister switch entrance pop
+        self._entrance_scale: float = 1.0
+        self._entrance_vel: float = 0.0
+        self._entrance_opacity: float = 1.0
+
+        # Autonomous idle quirks
+        self._quirk_tilt: float = 0.0
+        self._quirk_tilt_target: float = 0.0
+        self._quirk_tilt_remaining: float = 0.0
+        self._quirk_hop_y: float = 0.0
+        self._quirk_hop_vel: float = 0.0
+
+        # Particles, ambient motes, and activity ripples
+        self._particles: list[_Particle] = []
+        self._ripples: list[_Ripple] = []
+        self._ripple_cooldown: float = 0.0
+        self._ambient_motes: list[_AmbientMote] = self._make_ambient_motes(5)
 
         # Drag state
         self._pressing: bool = False
@@ -119,6 +279,9 @@ class MascotWindow(QWidget):
         self._press_global_pos = QPoint()
         self._win_start_pos = QPoint()
         self._last_drag_x: int = 0
+
+        # Size pill overlay
+        self._size_pill_text: str = ""
 
         # Line anti-repeat tracking
         self._last_click_line: str = ""
@@ -135,13 +298,16 @@ class MascotWindow(QWidget):
         self._rebuild_geometry_and_pixmap()
         self._restore_or_dock_position()
 
-        # 50ms animation timer (breathing float, spring bounce, drag tilt decay)
+        # Primary animation timer (configured by animation_mode)
         self._anim_timer = QTimer(self)
-        self._anim_timer.setInterval(50)
         self._anim_timer.timeout.connect(self._on_anim_tick)
-        self._anim_timer.start()
 
-        # Temporary expression reset timer (happy after click)
+        # Autonomous idle quirk timer (7-13s in rich mode)
+        self._quirk_timer = QTimer(self)
+        self._quirk_timer.setSingleShot(True)
+        self._quirk_timer.timeout.connect(self._trigger_idle_quirk)
+
+        # Temporary expression reset timer (happy after click / dragged)
         self._temp_state_timer = QTimer(self)
         self._temp_state_timer.setSingleShot(True)
         self._temp_state_timer.timeout.connect(self._clear_temp_state)
@@ -152,11 +318,50 @@ class MascotWindow(QWidget):
         self._hover_leave_timer.setInterval(180)
         self._hover_leave_timer.timeout.connect(self._check_hover_leave)
 
-        # Debounced position persistence (especially useful on Wayland startSystemMove)
+        # Debounced position persistence
         self._pos_save_timer = QTimer(self)
         self._pos_save_timer.setSingleShot(True)
         self._pos_save_timer.setInterval(260)
         self._pos_save_timer.timeout.connect(self._emit_position_changed)
+
+        # Wheel resize pill display timer
+        self._size_pill_timer = QTimer(self)
+        self._size_pill_timer.setSingleShot(True)
+        self._size_pill_timer.timeout.connect(self._clear_size_pill)
+
+        # Debounced wheel resize signal emission (300ms)
+        self._size_save_timer = QTimer(self)
+        self._size_save_timer.setSingleShot(True)
+        self._size_save_timer.setInterval(300)
+        self._size_save_timer.timeout.connect(self._emit_size_changed)
+
+        self.set_animation_mode(self._animation_mode)
+
+    @staticmethod
+    def _make_ambient_motes(count: int) -> list[_AmbientMote]:
+        rng = random.Random(42)
+        motes: list[_AmbientMote] = []
+        for idx in range(count):
+            motes.append(
+                _AmbientMote(
+                    x_norm=0.14 + 0.72 * ((idx + 0.35 + rng.random() * 0.3) / max(1, count)),
+                    y_norm=rng.random(),
+                    speed=0.07 + rng.random() * 0.06,
+                    phase=rng.random() * math.tau,
+                    size=3.2 + rng.random() * 2.6,
+                    twinkle_speed=1.6 + rng.random() * 1.4,
+                )
+            )
+        return motes
+
+    def _sister_colors(self) -> tuple[QColor, QColor]:
+        accent = QColor(self._sister.accent_color or "#818cf8")
+        secondary = QColor(self._sister.secondary_color or "#38bdf8")
+        if not accent.isValid():
+            accent = QColor("#818cf8")
+        if not secondary.isValid():
+            secondary = QColor("#38bdf8")
+        return accent, secondary
 
     def _apply_window_flags(self, *, initial: bool = False) -> None:
         flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
@@ -257,18 +462,71 @@ class MascotWindow(QWidget):
             return "happy"
         return "idle"
 
+    def _stop_movie(self) -> None:
+        if self._movie is not None:
+            try:
+                self._movie.frameChanged.disconnect(self._on_movie_frame)
+            except (TypeError, RuntimeError):
+                pass
+            self._movie.stop()
+            self._movie.deleteLater()
+            self._movie = None
+            self._movie_path = None
+
+    def _on_movie_frame(self, _frame_number: int) -> None:
+        self.update()
+
+    def _sync_movie_playback(self) -> None:
+        if self._movie is None:
+            return
+        if self._animation_mode == "off":
+            self._movie.stop()
+            self._movie.jumpToFrame(0)
+        else:
+            if self._movie.state() != QMovie.MovieState.Running:
+                self._movie.start()
+
     def _rebuild_geometry_and_pixmap(self) -> None:
         dpr = self.devicePixelRatioF() if hasattr(self, "devicePixelRatioF") else 1.0
-        target_width = SCALE_WIDTHS.get(self._config.mascot_scale, SCALE_WIDTHS["medium"])
-        self._pixmap = render_sister_pixmap(
-            self._sister,
-            self._sprite_state_for_render(),
-            target_width,
-            dpr,
-        )
-        dpr_val = max(1.0, self._pixmap.devicePixelRatio())
-        self._sprite_w = int(round(self._pixmap.width() / dpr_val))
-        self._sprite_h = int(round(self._pixmap.height() / dpr_val))
+        target_width = _clamp_mascot_width(self._config.mascot_width)
+        self._config.mascot_width = target_width
+        state = self._sprite_state_for_render()
+
+        gif_path = find_animated_sprite_path(self._sister.id, state)
+        if gif_path is not None:
+            reader = QImageReader(str(gif_path))
+            raw_size = reader.size()
+            if raw_size.isValid() and raw_size.width() > 0:
+                aspect = min(2.2, raw_size.height() / raw_size.width())
+            else:
+                aspect = 1.24
+            self._sprite_w = target_width
+            self._sprite_h = max(64, int(round(target_width * aspect)))
+
+            if self._movie is None or self._movie_path != gif_path:
+                self._stop_movie()
+                movie = QMovie(str(gif_path), parent=self)
+                movie.setCacheMode(QMovie.CacheMode.CacheAll)
+                movie.frameChanged.connect(self._on_movie_frame)
+                self._movie = movie
+                self._movie_path = gif_path
+
+            phys_w = max(1, int(round(self._sprite_w * max(1.0, dpr))))
+            phys_h = max(1, int(round(self._sprite_h * max(1.0, dpr))))
+            self._movie.setScaledSize(QSize(phys_w, phys_h))
+            self._sync_movie_playback()
+            self._pixmap = QPixmap()
+        else:
+            self._stop_movie()
+            self._pixmap = render_sister_pixmap(
+                self._sister,
+                state,
+                target_width,
+                dpr,
+            )
+            dpr_val = max(1.0, self._pixmap.devicePixelRatio())
+            self._sprite_w = int(round(self._pixmap.width() / dpr_val))
+            self._sprite_h = int(round(self._pixmap.height() / dpr_val))
 
         win_w = max(196, self._sprite_w + _PAD_X * 2)
         win_h = self._sprite_h + _PAD_TOP + _PAD_BOTTOM
@@ -318,6 +576,19 @@ class MascotWindow(QWidget):
         self._sister = sister
         self._update_minibar_text()
         self._rebuild_geometry_and_pixmap()
+        if self._animation_mode == "off":
+            self._entrance_scale = 1.0
+            self._entrance_vel = 0.0
+            self._entrance_opacity = 1.0
+            self.update()
+            return
+        # Celebratory entrance pop (0.84 -> ~1.05 -> 1.00) + fade-in + sparkle burst
+        self._entrance_scale = 0.84
+        self._entrance_vel = 2.4
+        self._entrance_opacity = 0.0
+        burst_count = 9 if self._animation_mode == "rich" else 4
+        self._spawn_burst_particles(burst_count, include_hearts=True)
+        self.update()
 
     def set_agent_id(self, agent_id: str) -> None:
         self._agent_id = agent_id
@@ -332,20 +603,84 @@ class MascotWindow(QWidget):
             self._config.always_on_top = enabled
         self._apply_window_flags()
 
-    def set_scale(self, scale: str) -> None:
-        if scale not in SCALE_WIDTHS:
-            return
+    def set_mascot_width(self, width: int, *, emit_signal: bool = False) -> None:
+        """Resize mascot cleanly to `width` (clamped 100..420), anchoring bottom-right."""
+        clamped_w = _clamp_mascot_width(width)
         old_bottom_right = self.frameGeometry().bottomRight()
-        self._config.mascot_scale = scale
+        self._config.mascot_width = clamped_w
         self._rebuild_geometry_and_pixmap()
         new_pos = QPoint(
             old_bottom_right.x() - self.width() + 1,
             old_bottom_right.y() - self.height() + 1,
         )
-        clamped = self._clamp_pos_to_screen(new_pos)
-        self.move(clamped)
+        clamped_pos = self._clamp_pos_to_screen(new_pos)
+        self.move(clamped_pos)
+        self._toast.reposition_near(self.frameGeometry())
         self.moved_geometry.emit(self.frameGeometry())
-        self.position_changed.emit(clamped.x(), clamped.y())
+        if emit_signal:
+            self._pos_save_timer.stop()
+            self.position_changed.emit(clamped_pos.x(), clamped_pos.y())
+            self.size_changed.emit(clamped_w)
+
+    def set_scale(self, scale: str) -> None:
+        if scale not in SCALE_WIDTHS:
+            return
+        self._config.mascot_scale = scale
+        self.set_mascot_width(SCALE_WIDTHS[scale], emit_signal=False)
+        self._pos_save_timer.stop()
+        self.position_changed.emit(self.x(), self.y())
+
+    def set_animation_mode(self, mode: str) -> None:
+        """Switch animation fidelity between 'rich', 'subtle', and 'off'."""
+        safe_mode = mode if mode in ANIMATION_MODES else "rich"
+        self._animation_mode = safe_mode
+        self._config.animation_mode = safe_mode
+        self._last_tick_ts = time.monotonic()
+
+        if safe_mode == "off":
+            self._anim_timer.stop()
+            self._quirk_timer.stop()
+            self._snap_animations_neutral()
+        elif safe_mode == "subtle":
+            self._anim_timer.setInterval(55)
+            self._anim_timer.start()
+            self._quirk_timer.stop()
+            self._quirk_tilt = 0.0
+            self._quirk_tilt_target = 0.0
+            self._quirk_tilt_remaining = 0.0
+            self._quirk_hop_y = 0.0
+            self._quirk_hop_vel = 0.0
+            self._hover_lean_angle = 0.0
+        else:
+            self._anim_timer.setInterval(33)
+            self._anim_timer.start()
+            self._schedule_next_quirk()
+
+        self._sync_movie_playback()
+        self.update()
+
+    def _snap_animations_neutral(self) -> None:
+        self._bounce_y = 0.0
+        self._bounce_vel = 0.0
+        self._squash_x = 1.0
+        self._squash_y = 1.0
+        self._squash_vx = 0.0
+        self._squash_vy = 0.0
+        self._tilt_angle = 0.0
+        self._tilt_vel = 0.0
+        self._target_tilt = 0.0
+        self._hover_lean_angle = 0.0
+        self._hover_zoom = 1.0
+        self._entrance_scale = 1.0
+        self._entrance_vel = 0.0
+        self._entrance_opacity = 1.0
+        self._quirk_tilt = 0.0
+        self._quirk_tilt_target = 0.0
+        self._quirk_tilt_remaining = 0.0
+        self._quirk_hop_y = 0.0
+        self._quirk_hop_vel = 0.0
+        self._particles.clear()
+        self._ripples.clear()
 
     def refresh_sprite(self) -> None:
         """Re-render sprite (e.g. after importing or resetting custom sprite)."""
@@ -366,6 +701,9 @@ class MascotWindow(QWidget):
             if self._activity_kind == "listening"
             else ""
         )
+        self._ripple_cooldown = 0.0
+        if self._activity_kind == "idle":
+            self._ripples.clear()
         self._rebuild_geometry_and_pixmap()
 
     def show_toast(
@@ -387,15 +725,34 @@ class MascotWindow(QWidget):
         )
 
     def trigger_bounce(self) -> None:
-        self._bounce_vel = -5.6
         self._temp_sprite_state = "happy"
         self._temp_state_timer.start(1600)
         self._rebuild_geometry_and_pixmap()
+
+        if self._animation_mode == "off":
+            return
+
+        # Elastic jump with anticipation/landing squash-stretch + particle burst
+        self._bounce_vel = -185.0
+        self._squash_x = 1.09
+        self._squash_y = 0.90
+        self._squash_vx = -0.8
+        self._squash_vy = 1.1
+        count = random.randint(7, 10) if self._animation_mode == "rich" else 3
+        self._spawn_burst_particles(count, include_hearts=True)
 
     def _clear_temp_state(self) -> None:
         if self._temp_sprite_state is not None:
             self._temp_sprite_state = None
             self._rebuild_geometry_and_pixmap()
+
+    def _clear_size_pill(self) -> None:
+        if self._size_pill_text:
+            self._size_pill_text = ""
+            self.update()
+
+    def _emit_size_changed(self) -> None:
+        self.size_changed.emit(self._config.mascot_width)
 
     def _pick_line(self, lines: list[str], last_line: str, fallback: str) -> str:
         pool = [ln.strip() for ln in (lines or []) if ln and ln.strip()]
@@ -405,25 +762,223 @@ class MascotWindow(QWidget):
             pool = [ln for ln in pool if ln != last_line]
         return random.choice(pool)
 
+    # Particle & Quirk Helpers
+    def _schedule_next_quirk(self) -> None:
+        if self._animation_mode == "rich":
+            self._quirk_timer.start(random.randint(7000, 13000))
+
+    def _trigger_idle_quirk(self) -> None:
+        if self._animation_mode != "rich":
+            return
+        if self._activity_kind == "idle" and not self._dragging and not self._pressing:
+            choice = random.choice(("hop", "tilt", "sparkle"))
+            if choice == "hop":
+                self._quirk_hop_vel = -105.0
+                self._squash_x = 0.96
+                self._squash_y = 1.06
+            elif choice == "tilt":
+                self._quirk_tilt_target = random.choice((-5.5, 5.5))
+                self._quirk_tilt_remaining = 1.3
+            else:
+                self._spawn_burst_particles(5, include_hearts=False)
+        self._schedule_next_quirk()
+
+    def _spawn_burst_particles(self, count: int, *, include_hearts: bool = True) -> None:
+        if self._animation_mode == "off" or count <= 0:
+            return
+        accent, secondary = self._sister_colors()
+        cx = self.width() * 0.5
+        cy = _PAD_TOP + self._sprite_h * 0.42
+        spread_x = max(24.0, self._sprite_w * 0.34)
+        spread_y = max(20.0, self._sprite_h * 0.25)
+
+        for idx in range(count):
+            angle = -math.pi * 0.5 + random.uniform(-1.15, 1.15)
+            speed = random.uniform(36.0, 92.0)
+            color = QColor(accent if idx % 2 == 0 else secondary)
+            if idx % 3 == 2:
+                color = color.lighter(130)
+            kind = "heart" if (include_hearts and idx % 3 == 0) else "star"
+            self._particles.append(
+                _Particle(
+                    x=cx + random.uniform(-spread_x, spread_x),
+                    y=cy + random.uniform(-spread_y, spread_y * 0.6),
+                    vx=math.cos(angle) * speed,
+                    vy=math.sin(angle) * speed - random.uniform(10.0, 32.0),
+                    life=0.0,
+                    max_life=random.uniform(0.75, 1.25),
+                    size=random.uniform(5.0, 8.8),
+                    kind=kind,
+                    color=color,
+                    rot=random.uniform(-25.0, 25.0),
+                    vrot=random.uniform(-90.0, 90.0),
+                )
+            )
+        if len(self._particles) > 28:
+            self._particles = self._particles[-28:]
+
+    def _spawn_activity_ripple(self) -> None:
+        accent, _ = self._sister_colors()
+        if self._activity_kind == "speaking":
+            color = QColor("#a78bfa")
+            speed = 46.0
+            max_r = max(self._sprite_w, self._sprite_h) * 0.62
+            start_r = max(22.0, self._sprite_w * 0.24)
+        elif self._activity_kind == "listening":
+            color = QColor("#fb7185")
+            speed = 54.0
+            max_r = max(self._sprite_w, self._sprite_h) * 0.66
+            start_r = max(20.0, self._sprite_w * 0.22)
+        else:
+            color = QColor(accent)
+            speed = 42.0
+            max_r = max(self._sprite_w, self._sprite_h) * 0.58
+            start_r = max(20.0, self._sprite_w * 0.22)
+
+        self._ripples.append(
+            _Ripple(
+                radius=start_r,
+                max_radius=max_r,
+                alpha=0.68,
+                speed=speed,
+                color=color,
+                width=2.0,
+            )
+        )
+        if len(self._ripples) > 6:
+            self._ripples = self._ripples[-6:]
+
     # Animation & Paint
     def _on_anim_tick(self) -> None:
-        self._anim_phase = (self._anim_phase + 0.14) % (math.tau * 100.0)
+        if self._animation_mode == "off":
+            return
 
-        # Spring physics for click bounce
-        if abs(self._bounce_y) > 0.05 or abs(self._bounce_vel) > 0.05:
-            self._bounce_vel += (-self._bounce_y) * 0.28
-            self._bounce_vel *= 0.72
-            self._bounce_y += self._bounce_vel
+        now = time.monotonic()
+        nominal_dt = max(0.016, self._anim_timer.interval() / 1000.0)
+        raw_dt = now - self._last_tick_ts
+        self._last_tick_ts = now
+        # Fallback to nominal_dt when called programmatically in tight loops
+        dt = nominal_dt if raw_dt < 0.005 else min(0.08, raw_dt)
+
+        self._anim_phase = (self._anim_phase + dt * 2.8) % (math.tau * 100.0)
+
+        # Bounce spring physics
+        if abs(self._bounce_y) > 0.05 or abs(self._bounce_vel) > 0.5:
+            prev_y = self._bounce_y
+            self._bounce_vel += (-self._bounce_y * 165.0 - self._bounce_vel * 11.5) * dt
+            self._bounce_y += self._bounce_vel * dt
+            # Trigger subtle landing squish when passing bottom
+            if prev_y < -2.0 and self._bounce_y >= 0.0 and self._bounce_vel > 30.0:
+                self._squash_x = max(self._squash_x, 1.055)
+                self._squash_y = min(self._squash_y, 0.945)
         else:
             self._bounce_y = 0.0
             self._bounce_vel = 0.0
 
-        # Smooth tilt interpolation
+        # Quirk hop spring physics
+        if abs(self._quirk_hop_y) > 0.05 or abs(self._quirk_hop_vel) > 0.5:
+            self._quirk_hop_vel += (-self._quirk_hop_y * 190.0 - self._quirk_hop_vel * 13.0) * dt
+            self._quirk_hop_y += self._quirk_hop_vel * dt
+        else:
+            self._quirk_hop_y = 0.0
+            self._quirk_hop_vel = 0.0
+
+        # Squash & stretch spring recovery toward (1.0, 1.0)
+        if (
+            abs(self._squash_x - 1.0) > 0.002
+            or abs(self._squash_y - 1.0) > 0.002
+            or abs(self._squash_vx) > 0.01
+            or abs(self._squash_vy) > 0.01
+        ):
+            self._squash_vx += ((1.0 - self._squash_x) * 140.0 - self._squash_vx * 12.0) * dt
+            self._squash_vy += ((1.0 - self._squash_y) * 140.0 - self._squash_vy * 12.0) * dt
+            self._squash_x = max(0.80, min(1.22, self._squash_x + self._squash_vx * dt))
+            self._squash_y = max(0.80, min(1.22, self._squash_y + self._squash_vy * dt))
+        else:
+            self._squash_x = 1.0
+            self._squash_y = 1.0
+            self._squash_vx = 0.0
+            self._squash_vy = 0.0
+
+        # Entrance pop spring (0.84 -> ~1.05 -> 1.00) + opacity fade-in
+        if abs(self._entrance_scale - 1.0) > 0.002 or abs(self._entrance_vel) > 0.01:
+            self._entrance_vel += ((1.0 - self._entrance_scale) * 170.0 - self._entrance_vel * 10.5) * dt
+            self._entrance_scale = max(0.75, min(1.12, self._entrance_scale + self._entrance_vel * dt))
+        else:
+            self._entrance_scale = 1.0
+            self._entrance_vel = 0.0
+        if self._entrance_opacity < 1.0:
+            self._entrance_opacity = min(1.0, self._entrance_opacity + dt * 4.4)
+
+        # Pendulum drag swing spring
         if not self._dragging:
             self._target_tilt = 0.0
-        self._tilt_angle += (self._target_tilt - self._tilt_angle) * 0.28
-        if abs(self._tilt_angle) < 0.05 and not self._dragging:
+        self._tilt_vel += ((self._target_tilt - self._tilt_angle) * 130.0 - self._tilt_vel * 10.5) * dt
+        self._tilt_angle += self._tilt_vel * dt
+        if not self._dragging and abs(self._tilt_angle) < 0.04 and abs(self._tilt_vel) < 0.15:
             self._tilt_angle = 0.0
+            self._tilt_vel = 0.0
+
+        # Hover cursor lean & zoom
+        target_lean = 0.0
+        target_zoom = 1.0
+        if self._hovered and not self._dragging:
+            if self._animation_mode == "rich":
+                local_x = self.mapFromGlobal(QCursor.pos()).x()
+                half_w = max(1.0, self._sprite_w * 0.5)
+                rel = max(-1.0, min(1.0, (local_x - self.width() * 0.5) / half_w))
+                target_lean = rel * 3.5
+                target_zoom = 1.03
+            else:
+                target_zoom = 1.015
+
+        lerp = min(1.0, dt * 10.0)
+        self._hover_lean_angle += (target_lean - self._hover_lean_angle) * lerp
+        self._hover_zoom += (target_zoom - self._hover_zoom) * lerp
+
+        # Autonomous quirk head tilt decay
+        if self._quirk_tilt_remaining > 0.0:
+            self._quirk_tilt_remaining = max(0.0, self._quirk_tilt_remaining - dt)
+            if self._quirk_tilt_remaining <= 0.0:
+                self._quirk_tilt_target = 0.0
+        self._quirk_tilt += (self._quirk_tilt_target - self._quirk_tilt) * min(1.0, dt * 8.0)
+
+        # Ambient starlight motes drift
+        mote_count = 5 if self._animation_mode == "rich" else 2
+        for mote in self._ambient_motes[:mote_count]:
+            mote.y_norm -= mote.speed * dt
+            if mote.y_norm < -0.08:
+                mote.y_norm = 1.06
+
+        # Update burst particles
+        if self._particles:
+            alive: list[_Particle] = []
+            for p in self._particles:
+                p.life += dt
+                if p.life < p.max_life:
+                    p.x += p.vx * dt
+                    p.y += p.vy * dt
+                    p.vx *= max(0.0, 1.0 - 1.6 * dt)
+                    p.vy -= 18.0 * dt  # gentle buoyant drift upward
+                    p.rot += p.vrot * dt
+                    alive.append(p)
+            self._particles = alive
+
+        # Activity ripples (speaking / listening)
+        if self._animation_mode == "rich" and self._activity_kind in ("speaking", "listening"):
+            self._ripple_cooldown -= dt
+            if self._ripple_cooldown <= 0.0:
+                self._spawn_activity_ripple()
+                self._ripple_cooldown = 0.58 if self._activity_kind == "speaking" else 0.72
+        if self._ripples:
+            alive_ripples: list[_Ripple] = []
+            for r in self._ripples:
+                r.radius += r.speed * dt
+                progress = r.radius / max(1.0, r.max_radius)
+                r.alpha = max(0.0, 0.70 * (1.0 - progress))
+                if r.radius < r.max_radius:
+                    alive_ripples.append(r)
+            self._ripples = alive_ripples
 
         self.update()
 
@@ -432,20 +987,59 @@ class MascotWindow(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
-        float_y = math.sin(self._anim_phase) * 2.5
-        cx = self.width() * 0.5
-        cy = _PAD_TOP + self._sprite_h * 0.5 + float_y + self._bounce_y
+        accent, secondary = self._sister_colors()
+        is_off = self._animation_mode == "off"
+        is_rich = self._animation_mode == "rich"
+
+        # Breathing, float, and activity secondary motion
+        if is_off:
+            breath_sx = 1.0
+            breath_sy = 1.0
+            float_y = 0.0
+            idle_sway = 0.0
+            act_sway = 0.0
+            act_bounce = 0.0
+            act_scale = 1.0
+        else:
+            breath = math.sin(self._anim_phase)
+            breath_sx = 1.0 - 0.007 * breath
+            breath_sy = 1.0 + 0.015 * breath
+            float_amp = 5.0 if (is_rich and self._activity_kind == "thinking") else 2.5
+            float_y = math.sin(self._anim_phase * 0.9) * float_amp
+            sway_factor = 1.0 if is_rich else 0.45
+            idle_sway = sway_factor * (
+                1.05 * math.sin(self._anim_phase * 0.65)
+                + 0.45 * math.sin(self._anim_phase * 1.35 + 0.7)
+            )
+            act_sway = 0.0
+            act_bounce = 0.0
+            act_scale = 1.0
+            if self._activity_kind == "speaking" and is_rich:
+                act_sway = 2.2 * math.sin(self._anim_phase * 2.8)
+                act_bounce = -abs(math.sin(self._anim_phase * 3.2)) * 3.5
+            elif self._activity_kind == "listening":
+                act_scale = 1.035
+
+        drag_sx = 0.97 if (self._dragging and not is_off) else 1.0
+        drag_sy = 1.04 if (self._dragging and not is_off) else 1.0
+
+        total_sx = breath_sx * self._squash_x * self._hover_zoom * self._entrance_scale * drag_sx * act_scale
+        total_sy = breath_sy * self._squash_y * self._hover_zoom * self._entrance_scale * drag_sy * act_scale
+        total_tilt = (
+            self._tilt_angle
+            + self._hover_lean_angle
+            + self._quirk_tilt
+            + (idle_sway if self._activity_kind == "idle" else 0.0)
+            + act_sway
+        )
+
+        pivot_x = self.width() * 0.5
+        pivot_y = float(_PAD_TOP + self._sprite_h) + float_y + self._bounce_y + self._quirk_hop_y + act_bounce
+        aura_cy = pivot_y - self._sprite_h * 0.5
 
         # Glowing aura behind sprite when active or hovered
-        accent = QColor(self._sister.accent_color or "#818cf8")
-        secondary = QColor(self._sister.secondary_color or "#38bdf8")
-        if not accent.isValid():
-            accent = QColor("#818cf8")
-        if not secondary.isValid():
-            secondary = QColor("#38bdf8")
-
         if self._activity_kind != "idle" or self._hovered:
-            pulse = 0.75 + 0.25 * math.sin(self._anim_phase * 1.8)
+            pulse = 1.0 if is_off else (0.75 + 0.25 * math.sin(self._anim_phase * 1.8))
             glow_color = QColor(accent)
             if self._activity_kind == "tool":
                 glow_color = QColor("#38bdf8")
@@ -454,55 +1048,177 @@ class MascotWindow(QWidget):
             elif self._activity_kind == "speaking":
                 glow_color = QColor("#a78bfa")
 
-            radius = max(self._sprite_w, self._sprite_h) * 0.55
-            aura = QRadialGradient(QPointF(cx, cy), radius)
+            radius = max(self._sprite_w, self._sprite_h) * 0.56
+            aura = QRadialGradient(QPointF(pivot_x, aura_cy), radius)
             c0 = QColor(glow_color)
-            c0.setAlpha(int((95 if self._activity_kind != "idle" else 52) * pulse))
+            c0.setAlpha(int((96 if self._activity_kind != "idle" else 54) * pulse))
             c1 = QColor(secondary)
             c1.setAlpha(int(36 * pulse))
             aura.setColorAt(0.0, c0)
-            aura.setColorAt(0.55, c1)
+            aura.setColorAt(0.56, c1)
             aura.setColorAt(1.0, QColor(0, 0, 0, 0))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(aura)
-            painter.drawEllipse(QPointF(cx, cy), radius, radius)
+            painter.drawEllipse(QPointF(pivot_x, aura_cy), radius, radius)
 
-        # Draw tilted / floating sprite
+        # Activity rings behind sprite (soundwave / listening ripples & Playwright cyan halos)
+        if is_rich:
+            for r in self._ripples:
+                rc = QColor(r.color)
+                rc.setAlpha(int(255 * r.alpha))
+                painter.setPen(QPen(rc, r.width))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(QPointF(pivot_x, aura_cy), r.radius, r.radius)
+
+            if self._activity_kind == "tool":
+                self._paint_tool_halos(painter, pivot_x, aura_cy)
+
+        # Draw sprite anchored at bottom-center pivot so her feet stay grounded
         painter.save()
-        painter.translate(cx, cy)
-        if abs(self._tilt_angle) > 0.05:
-            painter.rotate(self._tilt_angle)
+        if self._entrance_opacity < 0.999:
+            painter.setOpacity(self._entrance_opacity)
+        painter.translate(pivot_x, pivot_y)
+        if abs(total_tilt) > 0.02:
+            painter.rotate(total_tilt)
+        if abs(total_sx - 1.0) > 0.001 or abs(total_sy - 1.0) > 0.001:
+            painter.scale(total_sx, total_sy)
+
         target_rect = QRectF(
             -self._sprite_w * 0.5,
-            -self._sprite_h * 0.5,
+            -float(self._sprite_h),
             float(self._sprite_w),
             float(self._sprite_h),
         )
-        painter.drawPixmap(target_rect.toRect(), self._pixmap)
+        if self._movie is not None:
+            frame_img = self._movie.currentImage()
+            if not frame_img.isNull():
+                painter.drawImage(target_rect, frame_img)
+        elif not self._pixmap.isNull():
+            painter.drawPixmap(target_rect, self._pixmap, QRectF(self._pixmap.rect()))
         painter.restore()
 
-        # Draw top status pill when active
-        if self._activity_kind != "idle" and self._status_text:
-            font = QFont("Noto Sans JP", 9, QFont.Weight.Bold)
-            painter.setFont(font)
-            fm = painter.fontMetrics()
-            text_w = fm.horizontalAdvance(self._status_text)
-            pill_w = min(float(self.width() - 8), float(text_w + 26))
-            pill_h = 24.0
-            pill_rect = QRectF((self.width() - pill_w) * 0.5, 4.0, pill_w, pill_h)
+        # Ambient starlight motes & orbiting thinking motes
+        if not is_off:
+            self._paint_ambient_motes(painter, accent, secondary)
+            if is_rich and self._activity_kind == "thinking":
+                self._paint_thinking_orbit_motes(painter, pivot_x, aura_cy, accent, secondary)
+            if is_rich and self._activity_kind == "tool":
+                self._paint_tool_motes(painter, pivot_x, aura_cy)
 
-            bg_grad = QLinearGradient(pill_rect.topLeft(), pill_rect.bottomRight())
-            bg_grad.setColorAt(0.0, QColor(15, 20, 38, 232))
-            bg_grad.setColorAt(1.0, QColor(28, 34, 62, 232))
-            painter.setBrush(bg_grad)
-            painter.setPen(QPen(accent.lighter(125), 1.2))
-            painter.drawRoundedRect(pill_rect, 12.0, 12.0)
+        # Burst particles (stars & hearts)
+        if self._particles:
+            for p in self._particles:
+                t = p.life / max(0.01, p.max_life)
+                alpha = int(max(0.0, min(1.0, (1.0 - t) * 1.15)) * 235)
+                col = QColor(p.color)
+                col.setAlpha(alpha)
+                sz = p.size * (0.75 + 0.35 * math.sin(t * math.pi))
+                if p.kind == "heart":
+                    _draw_heart(painter, QPointF(p.x, p.y), sz, col, p.rot)
+                else:
+                    _draw_four_point_star(painter, QPointF(p.x, p.y), sz, col, p.rot)
 
-            elided = fm.elidedText(self._status_text, Qt.TextElideMode.ElideRight, int(pill_w - 14))
-            painter.setPen(QColor(248, 250, 252))
-            painter.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, elided)
+        # Top pill overlay (size badge temporarily overrides status pill cleanly)
+        top_pill_text = self._size_pill_text or (
+            self._status_text if self._activity_kind != "idle" else ""
+        )
+        if top_pill_text:
+            pill_accent = QColor("#38bdf8") if self._size_pill_text else accent
+            self._paint_top_pill(painter, top_pill_text, pill_accent)
 
-    # Hover handling
+    def _paint_top_pill(self, painter: QPainter, text: str, accent: QColor) -> None:
+        font = QFont("Noto Sans JP", 9, QFont.Weight.Bold)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        text_w = fm.horizontalAdvance(text)
+        pill_w = min(float(self.width() - 8), float(text_w + 26))
+        pill_h = 24.0
+        pill_rect = QRectF((self.width() - pill_w) * 0.5, 4.0, pill_w, pill_h)
+
+        bg_grad = QLinearGradient(pill_rect.topLeft(), pill_rect.bottomRight())
+        bg_grad.setColorAt(0.0, QColor(15, 20, 38, 234))
+        bg_grad.setColorAt(1.0, QColor(28, 34, 62, 234))
+        painter.setBrush(bg_grad)
+        painter.setPen(QPen(accent.lighter(125), 1.2))
+        painter.drawRoundedRect(pill_rect, 12.0, 12.0)
+
+        elided = fm.elidedText(text, Qt.TextElideMode.ElideRight, int(pill_w - 14))
+        painter.setPen(QColor(248, 250, 252))
+        painter.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, elided)
+
+    def _paint_ambient_motes(self, painter: QPainter, accent: QColor, secondary: QColor) -> None:
+        count = 5 if self._animation_mode == "rich" else 2
+        base_x = (self.width() - self._sprite_w) * 0.5
+        base_y = float(_PAD_TOP)
+        for idx, mote in enumerate(self._ambient_motes[:count]):
+            twinkle = 0.25 + 0.75 * (0.5 + 0.5 * math.sin(self._anim_phase * mote.twinkle_speed + mote.phase))
+            fade_edge = math.sin(max(0.0, min(1.0, mote.y_norm)) * math.pi)
+            alpha = int(165 * twinkle * fade_edge)
+            if alpha <= 4:
+                continue
+            col = QColor(secondary if idx % 2 == 0 else accent).lighter(135)
+            col.setAlpha(alpha)
+            mx = base_x + mote.x_norm * self._sprite_w + math.sin(self._anim_phase + mote.phase) * 5.0
+            my = base_y + mote.y_norm * self._sprite_h
+            _draw_four_point_star(painter, QPointF(mx, my), mote.size, col, self._anim_phase * 12.0)
+
+    def _paint_thinking_orbit_motes(
+        self,
+        painter: QPainter,
+        cx: float,
+        cy: float,
+        accent: QColor,
+        secondary: QColor,
+    ) -> None:
+        rx = self._sprite_w * 0.48
+        ry = self._sprite_h * 0.34
+        for idx in range(4):
+            theta = self._anim_phase * 1.1 + idx * (math.tau / 4.0)
+            mx = cx + math.cos(theta) * rx
+            my = cy + math.sin(theta) * ry - self._sprite_h * 0.08
+            twinkle = 0.55 + 0.45 * math.sin(self._anim_phase * 2.4 + idx * 1.4)
+            col = QColor(secondary if idx % 2 else accent).lighter(140)
+            col.setAlpha(int(220 * twinkle))
+            _draw_four_point_star(painter, QPointF(mx, my), 4.5 + 1.8 * twinkle, col, theta * 18.0)
+
+    def _paint_tool_halos(self, painter: QPainter, cx: float, cy: float) -> None:
+        r_outer = max(self._sprite_w, self._sprite_h) * 0.48
+        r_inner = r_outer * 0.84
+        deg1 = (self._anim_phase * 38.0) % 360.0
+        deg2 = (-self._anim_phase * 52.0) % 360.0
+
+        painter.save()
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        pen1 = QPen(QColor(56, 189, 248, 175), 2.0, Qt.PenStyle.DashLine)
+        pen1.setDashPattern([10.0, 7.0])
+        painter.setPen(pen1)
+        painter.translate(cx, cy)
+        painter.rotate(deg1)
+        painter.drawEllipse(QRectF(-r_outer, -r_outer, r_outer * 2, r_outer * 2))
+        painter.restore()
+
+        painter.save()
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        pen2 = QPen(QColor(34, 211, 238, 150), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen2)
+        painter.translate(cx, cy)
+        painter.rotate(deg2)
+        arc_rect = QRectF(-r_inner, -r_inner, r_inner * 2, r_inner * 2)
+        painter.drawArc(arc_rect, 15 * 16, 110 * 16)
+        painter.drawArc(arc_rect, 195 * 16, 110 * 16)
+        painter.restore()
+
+    def _paint_tool_motes(self, painter: QPainter, cx: float, cy: float) -> None:
+        radius = max(self._sprite_w, self._sprite_h) * 0.48
+        for idx in range(3):
+            theta = self._anim_phase * 1.7 + idx * (math.tau / 3.0)
+            mx = cx + math.cos(theta) * radius
+            my = cy + math.sin(theta) * radius
+            col = QColor(103, 232, 249, 220)
+            _draw_four_point_star(painter, QPointF(mx, my), 5.0, col, theta * 25.0)
+
+    # Hover & Wheel Resize handling
     def enterEvent(self, event) -> None:  # noqa: ANN001
         self._hover_leave_timer.stop()
         if not self._hovered:
@@ -522,6 +1238,23 @@ class MascotWindow(QWidget):
             self._hovered = False
             self._minibar.hide()
             self.update()
+
+    def wheelEvent(self, event) -> None:  # noqa: ANN001
+        delta_y = event.angleDelta().y()
+        if delta_y == 0:
+            delta_y = event.pixelDelta().y()
+        if delta_y == 0:
+            super().wheelEvent(event)
+            return
+
+        step = 14 if delta_y > 0 else -14
+        new_w = _clamp_mascot_width(self._config.mascot_width + step)
+        self.set_mascot_width(new_w, emit_signal=False)
+        self._size_pill_text = f"📏 {new_w}px"
+        self._size_pill_timer.start(900)
+        self._size_save_timer.start(300)
+        self.update()
+        event.accept()
 
     # Mouse & Drag (XCB + Wayland fallback)
     def mousePressEvent(self, event) -> None:  # noqa: ANN001
@@ -573,7 +1306,7 @@ class MascotWindow(QWidget):
         if self._dragging:
             dx = global_pos.x() - self._last_drag_x
             self._last_drag_x = global_pos.x()
-            self._target_tilt = max(-6.0, min(6.0, dx * 0.7))
+            self._target_tilt = max(-14.0, min(14.0, dx * 1.15))
 
             target_pos = self._clamp_pos_to_screen(self._win_start_pos + delta)
             self.move(target_pos)
@@ -594,6 +1327,9 @@ class MascotWindow(QWidget):
             if was_dragging:
                 self._pos_save_timer.stop()
                 self._temp_state_timer.start(350)
+                if self._animation_mode != "off":
+                    self._squash_x = 1.07
+                    self._squash_y = 0.93
                 clamped = self._clamp_pos_to_screen(self.pos())
                 if clamped != self.pos():
                     self.move(clamped)
@@ -652,6 +1388,36 @@ class MascotWindow(QWidget):
             act.triggered.connect(lambda _checked=False, a=aid: self.agent_selected.emit(a))
             agents_menu.addAction(act)
 
+        size_menu = menu.addMenu("📏 サイズ変更")
+        size_menu.setStyleSheet(_MENU_QSS)
+        current_w = _clamp_mascot_width(self._config.mascot_width)
+        for label, preset_w in _SIZE_PRESETS:
+            act = QAction(label, size_menu)
+            act.setCheckable(True)
+            act.setChecked(current_w == preset_w)
+            act.triggered.connect(
+                lambda _checked=False, w=preset_w: self.set_mascot_width(w, emit_signal=True)
+            )
+            size_menu.addAction(act)
+        size_menu.addSeparator()
+        grow_act = QAction("拡大 (+25px)", size_menu)
+        grow_act.setEnabled(current_w < MASCOT_WIDTH_MAX)
+        grow_act.triggered.connect(
+            lambda _checked=False, w=_clamp_mascot_width(current_w + 25): self.set_mascot_width(
+                w, emit_signal=True
+            )
+        )
+        size_menu.addAction(grow_act)
+
+        shrink_act = QAction("縮小 (-25px)", size_menu)
+        shrink_act.setEnabled(current_w > MASCOT_WIDTH_MIN)
+        shrink_act.triggered.connect(
+            lambda _checked=False, w=_clamp_mascot_width(current_w - 25): self.set_mascot_width(
+                w, emit_signal=True
+            )
+        )
+        size_menu.addAction(shrink_act)
+
         menu.addSeparator()
 
         voice_act = QAction("🔊 音声読み上げ (ON/OFF)", menu)
@@ -680,8 +1446,12 @@ class MascotWindow(QWidget):
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         self._anim_timer.stop()
+        self._quirk_timer.stop()
         self._temp_state_timer.stop()
         self._hover_leave_timer.stop()
         self._pos_save_timer.stop()
+        self._size_pill_timer.stop()
+        self._size_save_timer.stop()
+        self._stop_movie()
         self._toast.close()
         super().closeEvent(event)

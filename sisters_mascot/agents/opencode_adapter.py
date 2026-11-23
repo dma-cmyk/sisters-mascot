@@ -8,7 +8,13 @@ import shutil
 import subprocess
 from typing import Any
 
-from sisters_mascot.agents.base import AgentSpec, BaseAgentAdapter, StreamEvent, make_tool_event
+from sisters_mascot.agents.base import (
+    AgentSpec,
+    BaseAgentAdapter,
+    ModelChoice,
+    StreamEvent,
+    make_tool_event,
+)
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -34,8 +40,8 @@ class OpenCodeAdapter(BaseAgentAdapter):
     def reset_state(self) -> None:
         self._last_part_text.clear()
 
-    def discover_models(self) -> list[str]:
-        fallback = list(self.spec.default_models)
+    def discover_model_choices(self) -> list[ModelChoice]:
+        fallback = [ModelChoice(id=m, label=m) for m in self.spec.default_models]
         if not self.is_available():
             return fallback
 
@@ -44,7 +50,7 @@ class OpenCodeAdapter(BaseAgentAdapter):
                 [self.resolved_binary(), "models"],
                 capture_output=True,
                 text=True,
-                timeout=6,
+                timeout=12,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError):
@@ -53,22 +59,25 @@ class OpenCodeAdapter(BaseAgentAdapter):
         if proc.returncode != 0 or not proc.stdout.strip():
             return fallback
 
-        discovered: list[str] = []
+        discovered: list[ModelChoice] = []
+        seen: set[str] = set()
         for raw_line in proc.stdout.splitlines():
             clean = _ANSI_RE.sub("", raw_line).strip()
             if not clean or "/" not in clean:
                 continue
-            token = clean.split()[0]
-            if "/" in token:
-                discovered.append(token)
+            token = clean.split()[0].strip().rstrip(",")
+            if "/" not in token or token.startswith(("/", "http://", "https://")):
+                continue
+            provider, model_name = token.split("/", 1)
+            if not provider or not model_name or token in seen:
+                continue
+            seen.add(token)
+            discovered.append(ModelChoice(id=token, label=token))
 
-        seen: set[str] = set()
-        merged: list[str] = []
-        for item in [*discovered, *fallback]:
-            if item and item not in seen:
-                seen.add(item)
-                merged.append(item)
-        return merged
+        return discovered if discovered else fallback
+
+    def discover_models(self) -> list[str]:
+        return [choice.id for choice in self.discover_model_choices()]
 
     def build_command(
         self,

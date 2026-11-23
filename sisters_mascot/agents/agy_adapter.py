@@ -9,10 +9,17 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from sisters_mascot.agents.base import AgentSpec, BaseAgentAdapter, StreamEvent, make_tool_event
+from sisters_mascot.agents.base import (
+    AgentSpec,
+    BaseAgentAdapter,
+    ModelChoice,
+    StreamEvent,
+    make_tool_event,
+)
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _MODEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,}$")
+_SKIP_PREFIXES = ("fetching", "loading", "available", "models", "usage", "#", "-", "=")
 
 
 def _default_agy_binary() -> str:
@@ -20,17 +27,6 @@ def _default_agy_binary() -> str:
     if preferred.is_file():
         return str(preferred)
     return shutil.which("agy") or str(preferred)
-
-
-def _merge_unique(primary: list[str], fallback: list[str]) -> list[str]:
-    seen: set[str] = set()
-    merged: list[str] = []
-    for item in [*primary, *fallback]:
-        cleaned = item.strip()
-        if cleaned and cleaned not in seen:
-            seen.add(cleaned)
-            merged.append(cleaned)
-    return merged
 
 
 class AgyAdapter(BaseAgentAdapter):
@@ -56,8 +52,8 @@ class AgyAdapter(BaseAgentAdapter):
         self._saw_stream_delta = False
         self._emitted_any_text = False
 
-    def discover_models(self) -> list[str]:
-        fallback = list(self.spec.default_models)
+    def discover_model_choices(self) -> list[ModelChoice]:
+        fallback = [ModelChoice(id=m, label=m) for m in self.spec.default_models]
         if not self.is_available():
             return fallback
 
@@ -66,7 +62,7 @@ class AgyAdapter(BaseAgentAdapter):
                 [self.resolved_binary(), "models"],
                 capture_output=True,
                 text=True,
-                timeout=6,
+                timeout=15,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError):
@@ -75,15 +71,42 @@ class AgyAdapter(BaseAgentAdapter):
         if proc.returncode != 0 or not proc.stdout.strip():
             return fallback
 
-        discovered: list[str] = []
+        discovered: list[ModelChoice] = []
+        seen: set[str] = set()
         for raw_line in proc.stdout.splitlines():
             clean = _ANSI_RE.sub("", raw_line).strip()
-            if not clean or clean.startswith(("#", "-", "=", "Available", "Models", "Usage")):
+            if not clean:
                 continue
-            token = clean.lstrip("*•- ").split()[0].rstrip(",")
-            if _MODEL_TOKEN_RE.match(token) and token.lower() not in {"name", "model", "id", "alias"}:
-                discovered.append(token)
-        return _merge_unique(discovered, fallback)
+            lowered = clean.lower()
+            if lowered.startswith(_SKIP_PREFIXES) or clean.endswith("..."):
+                continue
+
+            if "\t" in clean:
+                parts = [p.strip() for p in clean.split("\t") if p.strip()]
+                model_id = parts[0]
+                display = parts[1] if len(parts) >= 2 else ""
+            else:
+                parts = clean.lstrip("*•- ").split()
+                if len(parts) != 1:
+                    continue
+                model_id = parts[0].rstrip(",")
+                display = ""
+
+            if (
+                not _MODEL_TOKEN_RE.match(model_id)
+                or model_id.lower() in {"name", "model", "id", "alias"}
+                or model_id in seen
+            ):
+                continue
+
+            seen.add(model_id)
+            label = f"{display} ({model_id})" if display and display != model_id else model_id
+            discovered.append(ModelChoice(id=model_id, label=label))
+
+        return discovered if discovered else fallback
+
+    def discover_models(self) -> list[str]:
+        return [choice.id for choice in self.discover_model_choices()]
 
     def build_command(
         self,
