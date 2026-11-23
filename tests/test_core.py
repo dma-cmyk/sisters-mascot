@@ -48,6 +48,7 @@ from sisters_mascot.config import (  # noqa: E402
 )
 from sisters_mascot.sisters_loader import (  # noqa: E402
     get_sister_map,
+    has_custom_or_generated_sprite,
     load_all_sisters,
 )
 from sisters_mascot.sprites.renderer import render_sister_pixmap  # noqa: E402
@@ -75,20 +76,7 @@ EXPECTED_SISTER_IDS = [
     "homura",
 ]
 
-ILLUSTRATED_SISTER_IDS = [
-    "aoi",
-    "ruri",
-    "kohaku",
-    "sumire",
-    "akari",
-    "shion",
-    "hiiro",
-    "mashiro",
-    "yui",
-    "ritsu",
-    "nagi",
-    "akane",
-]
+ILLUSTRATED_SISTER_IDS = list(EXPECTED_SISTER_IDS)
 
 
 _QAPP: QApplication | None = None
@@ -587,7 +575,8 @@ class TestSpeechSanitizer(unittest.TestCase):
 
 
 class TestGeneratedSprites(unittest.TestCase):
-    def test_all_12_sprites_are_clean_rgba_with_transparent_corners(self) -> None:
+    def test_all_17_sprites_are_clean_rgba_with_transparent_corners(self) -> None:
+        self.assertEqual(len(ILLUSTRATED_SISTER_IDS), 17)
         for sister_id in ILLUSTRATED_SISTER_IDS:
             sprite_path = SPRITES_DIR / sister_id / "idle.png"
             self.assertTrue(sprite_path.is_file(), f"Missing generated sprite: {sprite_path}")
@@ -617,14 +606,15 @@ class TestGeneratedSprites(unittest.TestCase):
                         opaque_center += 1
             self.assertGreater(opaque_center, 25, f"{sister_id} center lacks opaque pixels")
 
-    def test_medallion_fallback_sisters_render(self) -> None:
+    def test_all_17_sisters_render_standing_sprites(self) -> None:
         _ensure_qapp()
         sister_map = get_sister_map()
-        for sid in ("kokonoe", "towa", "aya", "kanon", "homura"):
+        for sid in EXPECTED_SISTER_IDS:
+            self.assertTrue(has_custom_or_generated_sprite(sid), f"{sid} should have bundled sprite")
             pm = render_sister_pixmap(sister_map[sid], "idle", 210, 1.0)
-            self.assertFalse(pm.isNull(), f"Medallion render failed for {sid}")
+            self.assertFalse(pm.isNull(), f"Sprite render failed for {sid}")
             self.assertGreater(pm.width(), 100)
-            self.assertGreater(pm.height(), 100)
+            self.assertGreater(pm.height(), 200)
 
 
 class TestHeadlessUI(unittest.TestCase):
@@ -651,7 +641,7 @@ class TestHeadlessUI(unittest.TestCase):
             )
             self.assertTrue(toast.isVisible())
 
-            # Switch between illustrated and medallion-fallback sisters: aoi -> nagi -> homura
+            # Switch across sisters including newly illustrated sprites: aoi -> nagi -> homura
             for sid in ("nagi", "homura"):
                 cfg.sister_id = sid
                 mascot.set_sister(sister_map[sid])

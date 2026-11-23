@@ -1436,7 +1436,7 @@ class BubblePanel(QWidget):
         elif find_sprite_path(self._sister.id, state) is not None:
             self._sprite_status_lbl.setText("🎨 標準画像")
         else:
-            self._sprite_status_lbl.setText("💠 メダル表示")
+            self._sprite_status_lbl.setText("🖼️ 画像なし")
 
     def _on_import_sprite(self) -> None:
         state = str(self._sprite_state_combo.currentData() or "idle")

@@ -39,10 +39,15 @@ DEFAULT_SPRITE_IDS = (
     "shion",
     "hiiro",
     "mashiro",
+    "kokonoe",
+    "towa",
     "yui",
+    "aya",
     "ritsu",
     "nagi",
+    "kanon",
     "akane",
+    "homura",
 )
 MAX_TOTAL_HEIGHT = 540
 PADDING_PX = 12
@@ -263,7 +268,31 @@ def remove_green_background(
             else:
                 buf[off + 1] = min(g, int(cap + excess * 0.25))
 
-    # Find tight bounding box of visible foreground pixels.
+    keyed_img = QImage(bytes(buf), w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
+    return _crop_scale_and_save(
+        keyed_img,
+        output_path,
+        source_desc=str(input_path),
+        max_height=max_height,
+        padding=padding,
+    )
+
+
+def _crop_scale_and_save(
+    rgba_img: QImage,
+    output_path: Path,
+    *,
+    source_desc: str,
+    max_height: int = MAX_TOTAL_HEIGHT,
+    padding: int = PADDING_PX,
+) -> tuple[int, int]:
+    """Crop tight alpha bounds, scale proportionally, pad, and save RGBA PNG."""
+    w, h = rgba_img.width(), rgba_img.height()
+    n_bytes = rgba_img.sizeInBytes()
+    ptr = rgba_img.bits()
+    ptr.setsize(n_bytes)
+    buf = bytes(ptr)
+
     min_x, min_y = w, h
     max_x, max_y = -1, -1
     for y in range(h):
@@ -280,12 +309,9 @@ def remove_green_background(
                     max_y = y
 
     if max_x < min_x or max_y < min_y:
-        raise ValueError(f"No foreground pixels left after keying: {input_path}")
+        raise ValueError(f"No foreground pixels left after keying: {source_desc}")
 
-    keyed = QImage(bytes(buf), w, h, w * 4, QImage.Format.Format_RGBA8888).copy(
-        min_x, min_y, max_x - min_x + 1, max_y - min_y + 1
-    )
-
+    keyed = rgba_img.copy(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
     target_content_h = max(1, max_height - (padding * 2))
     if keyed.height() > target_content_h:
         keyed = keyed.scaledToHeight(target_content_h, Qt.TransformationMode.SmoothTransformation)
@@ -304,6 +330,56 @@ def remove_green_background(
     if not canvas.save(str(output_path), "PNG"):
         raise OSError(f"Failed to write output PNG: {output_path}")
     return out_w, out_h
+
+
+def _corners_are_transparent(rgba_img: QImage, threshold: int = 8) -> bool:
+    w, h = rgba_img.width(), rgba_img.height()
+    if w <= 0 or h <= 0 or not rgba_img.hasAlphaChannel():
+        return False
+    return all(
+        rgba_img.pixelColor(cx, cy).alpha() <= threshold
+        for cx, cy in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1))
+    )
+
+
+def normalize_transparent_sprite(
+    input_path: Path,
+    output_path: Path,
+    *,
+    max_height: int = MAX_TOTAL_HEIGHT,
+    padding: int = PADDING_PX,
+) -> tuple[int, int]:
+    """Normalize an already-transparent RGBA sprite, or chroma-key if corners are green."""
+    src = QImage(str(input_path))
+    if src.isNull():
+        raise ValueError(f"Failed to read input image: {input_path}")
+
+    rgba = src.convertToFormat(QImage.Format.Format_RGBA8888)
+    if _corners_are_transparent(rgba):
+        return _crop_scale_and_save(
+            rgba,
+            output_path,
+            source_desc=str(input_path),
+            max_height=max_height,
+            padding=padding,
+        )
+
+    w, h = rgba.width(), rgba.height()
+    n_bytes = rgba.sizeInBytes()
+    ptr = rgba.bits()
+    ptr.setsize(n_bytes)
+    buf = bytearray(ptr)
+    bg_r, bg_g, bg_b = _sample_corner_green(buf, w, h)
+    if _is_border_green(bg_r, bg_g, bg_b, bg_r, bg_g, bg_b):
+        return remove_green_background(
+            input_path,
+            output_path,
+            max_height=max_height,
+            padding=padding,
+        )
+    raise ValueError(
+        f"Image corners are neither transparent nor chroma-green (median corner RGB=({bg_r},{bg_g},{bg_b})): {input_path}"
+    )
 
 
 def generate_app_icon(output_path: Path = APP_ICON_PATH, size: int = 256) -> Path:
@@ -408,10 +484,15 @@ def main() -> int:
     app = QGuiApplication.instance() or QGuiApplication([])
     _ = app
 
-    parser = argparse.ArgumentParser(description="Remove chroma-green background from Sisters sprites.")
+    parser = argparse.ArgumentParser(description="Remove chroma-green background or normalize transparent Sisters sprites.")
     parser.add_argument("input", nargs="?", type=Path, help="Input image path")
     parser.add_argument("output", nargs="?", type=Path, help="Output RGBA PNG path")
     parser.add_argument("--icon-only", action="store_true", help="Only generate assets/app-icon.png")
+    parser.add_argument(
+        "--normalize",
+        action="store_true",
+        help="Normalize transparent PNG (or chroma-key green if opaque corners)",
+    )
     args = parser.parse_args()
 
     if args.icon_only:
@@ -420,15 +501,27 @@ def main() -> int:
         return 0
 
     if args.input and args.output:
-        w, h = remove_green_background(args.input, args.output)
+        fn = normalize_transparent_sprite if args.normalize else remove_green_background
+        w, h = fn(args.input, args.output)
         print(f"Processed {args.input} -> {args.output} ({w}x{h})")
         return 0
 
     for sister_id in DEFAULT_SPRITE_IDS:
-        src = RAW_DIR / f"{sister_id}.jpg"
         dst = SPRITES_DIR / sister_id / "idle.png"
-        w, h = remove_green_background(src, dst)
-        print(f"Processed {sister_id}: {src.name} -> {dst} ({w}x{h})")
+        codex_raw = RAW_DIR / f"{sister_id}_codex.png"
+        jpg_raw = RAW_DIR / f"{sister_id}.jpg"
+        png_raw = RAW_DIR / f"{sister_id}.png"
+        if codex_raw.is_file():
+            w, h = normalize_transparent_sprite(codex_raw, dst)
+            print(f"Processed {sister_id}: {codex_raw.name} -> {dst} ({w}x{h})")
+        elif png_raw.is_file():
+            w, h = normalize_transparent_sprite(png_raw, dst)
+            print(f"Processed {sister_id}: {png_raw.name} -> {dst} ({w}x{h})")
+        elif jpg_raw.is_file():
+            w, h = remove_green_background(jpg_raw, dst)
+            print(f"Processed {sister_id}: {jpg_raw.name} -> {dst} ({w}x{h})")
+        else:
+            print(f"Skipped {sister_id}: no raw file found in {RAW_DIR}")
 
     icon = generate_app_icon()
     print(f"Generated app icon: {icon}")
