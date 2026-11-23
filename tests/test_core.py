@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -17,8 +19,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from PyQt6.QtCore import QPointF, QRect, Qt  # noqa: E402
-from PyQt6.QtGui import QImage, QWheelEvent  # noqa: E402
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QRect, QSize, Qt  # noqa: E402
+from PyQt6.QtGui import (  # noqa: E402
+    QFocusEvent,
+    QGuiApplication,
+    QImage,
+    QInputMethodEvent,
+    QKeyEvent,
+    QWheelEvent,
+)
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 from sisters_mascot import PROJECT_ROOT as PKG_PROJECT_ROOT, SPRITES_DIR  # noqa: E402
@@ -54,7 +63,8 @@ from sisters_mascot.sisters_loader import (  # noqa: E402
 from sisters_mascot.sprites.renderer import render_sister_pixmap  # noqa: E402
 from sisters_mascot.ui.bubble_panel import BubblePanel  # noqa: E402
 from sisters_mascot.ui.mascot_window import MascotWindow  # noqa: E402
-from sisters_mascot.ui.widgets import LauncherItemDialog, ToastBubble  # noqa: E402
+from sisters_mascot.ui.platform import supports_window_positioning  # noqa: E402
+from sisters_mascot.ui.widgets import ChatInputEdit, LauncherItemDialog, ToastBubble  # noqa: E402
 
 EXPECTED_SISTER_IDS = [
     "aoi",
@@ -90,6 +100,15 @@ def _ensure_qapp() -> QApplication:
         return app
     _QAPP = QApplication([])
     return _QAPP
+
+
+def _make_ui(cfg: AppConfig) -> tuple[MascotWindow, BubblePanel]:
+    """Build a mascot + panel pair sharing `cfg` for headless positioning tests."""
+    sisters = load_all_sisters()
+    aoi = next(s for s in sisters if s.id == "aoi")
+    mascot = MascotWindow(sisters, aoi, cfg)
+    panel = BubblePanel(sisters, aoi, cfg, AgentRouter(), VoiceRecorder())
+    return mascot, panel
 
 
 class TestSistersLoader(unittest.TestCase):
@@ -160,6 +179,8 @@ class TestConfigPersistence(unittest.TestCase):
                 mascot_x=120,
                 mascot_y=240,
                 mascot_scale="large",
+                panel_x=64,
+                panel_y=48,
                 always_on_top=False,
                 tts_engine="voicevox",
                 tts_volume=65,
@@ -199,6 +220,8 @@ class TestConfigPersistence(unittest.TestCase):
             self.assertEqual(loaded.mascot_x, 120)
             self.assertEqual(loaded.mascot_y, 240)
             self.assertEqual(loaded.mascot_scale, "large")
+            self.assertEqual(loaded.panel_x, 64)
+            self.assertEqual(loaded.panel_y, 48)
             self.assertFalse(loaded.always_on_top)
             self.assertEqual(loaded.tts_engine, "voicevox")
             self.assertEqual(loaded.tts_volume, 65)
@@ -235,7 +258,7 @@ class TestConfigPersistence(unittest.TestCase):
                     {
                         "mascot_width": 999,
                         "panel_width": 120,
-                        "panel_height": 2000,
+                        "panel_height": 99999,
                         "animation_mode": "invalid",
                     }
                 ),
@@ -244,8 +267,17 @@ class TestConfigPersistence(unittest.TestCase):
             loaded_extreme = load_config(extreme)
             self.assertEqual(loaded_extreme.mascot_width, 420)
             self.assertEqual(loaded_extreme.panel_width, 360)
-            self.assertEqual(loaded_extreme.panel_height, 920)
+            self.assertEqual(loaded_extreme.panel_height, 4320)
             self.assertEqual(loaded_extreme.animation_mode, "rich")
+
+            # Large-but-valid panel sizes are no longer capped at the old 820x920.
+            large = Path(tmpdir) / "large.json"
+            large.write_text(json.dumps({"panel_width": 1200, "panel_height": 1000}), encoding="utf-8")
+            loaded_large = load_config(large)
+            self.assertEqual((loaded_large.panel_width, loaded_large.panel_height), (1200, 1000))
+
+            self.assertIsNone(AppConfig().panel_x)
+            self.assertIsNone(AppConfig().panel_y)
 
 
 class TestAgentAdapters(unittest.TestCase):
@@ -748,6 +780,340 @@ class TestHeadlessUI(unittest.TestCase):
             panel.close()
             mascot.close()
             app.processEvents()
+
+
+class TestWindowIndependence(unittest.TestCase):
+    """Mascot and chat panel must move/resize independently (offscreen platform)."""
+
+    def _make_controller(self, cfg: AppConfig):
+        from sisters_mascot.main import MascotAppController
+
+        app = _ensure_qapp()
+        with (
+            patch("sisters_mascot.main.load_config", return_value=cfg),
+            patch("sisters_mascot.main.save_config", return_value=Path("/nonexistent/config.json")),
+            patch.object(BubblePanel, "ensure_models_discovered", lambda self, *a, **k: None),
+            patch.object(MascotAppController, "_setup_single_instance_server", lambda self: None),
+        ):
+            return MascotAppController(app)
+
+    def _cleanup_controller(self, controller) -> None:
+        app = _ensure_qapp()
+        try:
+            app.aboutToQuit.disconnect(controller.shutdown)
+        except (TypeError, RuntimeError):
+            pass
+        controller.shutdown()
+        controller.panel.close()
+        controller.mascot.close()
+        app.processEvents()
+
+    def test_mascot_move_does_not_drag_panel(self) -> None:
+        app = _ensure_qapp()
+        cfg = AppConfig(tts_engine="off")
+        controller = self._make_controller(cfg)
+        try:
+            mascot, panel = controller.mascot, controller.panel
+            mascot.move(480, 380)
+            app.processEvents()
+            panel.show_for_mascot(mascot.frameGeometry())
+            app.processEvents()
+            self.assertTrue(panel.isVisible())
+            panel_pos = panel.pos()
+            self.assertLess(panel_pos.x(), mascot.x())  # first show anchors beside mascot
+
+            mascot.move(40, 40)
+            app.processEvents()
+            self.assertEqual(panel.pos(), panel_pos)
+            mascot.reset_to_corner(save=True)
+            app.processEvents()
+            self.assertEqual(panel.pos(), panel_pos)
+
+            controller._toggle_panel()
+            self.assertFalse(panel.isVisible())
+            controller._toggle_panel()
+            self.assertTrue(panel.isVisible())
+            self.assertEqual(panel.pos(), panel_pos)  # re-show never re-anchors
+
+            mascot.move(100, 120)
+            mascot._emit_position_changed()
+            self.assertEqual((cfg.mascot_x, cfg.mascot_y), (100, 120))
+        finally:
+            self._cleanup_controller(controller)
+
+    def test_panel_position_persisted_and_restored(self) -> None:
+        app = _ensure_qapp()
+        cfg = AppConfig(tts_engine="off")
+        mascot, panel = _make_ui(cfg)
+        try:
+            mascot.show()
+            mascot.move(480, 380)
+            app.processEvents()
+            panel.show_for_mascot(mascot.frameGeometry())
+            app.processEvents()
+
+            panel.move(120, 90)
+            app.processEvents()
+            panel._emit_position_changed()
+            self.assertEqual((cfg.panel_x, cfg.panel_y), (120, 90))
+
+            panel.hide()
+            mascot.move(300, 200)
+            app.processEvents()
+            panel.show_for_mascot(mascot.frameGeometry())
+            app.processEvents()
+            self.assertEqual(panel.pos(), QPoint(120, 90))
+        finally:
+            panel.close()
+            mascot.close()
+            app.processEvents()
+
+    def test_wayland_does_not_save_or_restore_positions(self) -> None:
+        app = _ensure_qapp()
+        cfg = AppConfig(tts_engine="off")
+        controller = self._make_controller(cfg)
+        try:
+            panel = controller.panel
+            panel.show_for_mascot(controller.mascot.frameGeometry())
+            app.processEvents()
+            panel._move_save_timer.stop()  # clear the pending offscreen placement save
+            with patch.object(QGuiApplication, "platformName", return_value="wayland"):
+                self.assertFalse(supports_window_positioning())
+
+                controller._on_mascot_position_changed(11, 22)
+                self.assertIsNone(cfg.mascot_x)
+                self.assertIsNone(cfg.mascot_y)
+
+                panel.move(150, 160)
+                app.processEvents()
+                self.assertFalse(panel._move_save_timer.isActive())
+                panel._emit_position_changed()
+                self.assertIsNone(cfg.panel_x)
+
+                cfg.panel_x, cfg.panel_y = 300, 300
+                panel.hide()
+                panel.move(10, 10)
+                app.processEvents()
+                before = panel.pos()
+                panel.show_for_mascot(controller.mascot.frameGeometry())
+                app.processEvents()
+                self.assertEqual(panel.pos(), before)  # no restore move on Wayland
+        finally:
+            self._cleanup_controller(controller)
+
+    def test_panel_resize_grows_to_screen(self) -> None:
+        app = _ensure_qapp()
+        cfg = AppConfig(tts_engine="off")
+        mascot, panel = _make_ui(cfg)
+        try:
+            fake_screen = SimpleNamespace(availableGeometry=lambda: QRect(0, 0, 2560, 1440))
+            with patch.object(panel, "screen", return_value=fake_screen):
+                panel._update_maximum_size()
+            self.assertEqual((panel.maximumWidth(), panel.maximumHeight()), (2560, 1440))
+            self.assertEqual((panel.minimumWidth(), panel.minimumHeight()), (360, 440))
+
+            panel.resize(1200, 1000)
+            panel._on_resize_save_timeout()
+            self.assertEqual((cfg.panel_width, cfg.panel_height), (1200, 1000))
+            self.assertEqual(panel._size_grip.size(), QSize(22, 22))
+        finally:
+            panel.close()
+            mascot.close()
+            app.processEvents()
+
+
+class TestChatInputIME(unittest.TestCase):
+    """Enter must send only when the IME is not converting/confirming."""
+
+    def setUp(self) -> None:
+        self.app = _ensure_qapp()
+        self.edit = ChatInputEdit()
+        self.sent: list[str] = []
+        self.edit.send_requested.connect(lambda: self.sent.append(self.edit.toPlainText()))
+
+    def tearDown(self) -> None:
+        self.edit.close()
+        self.edit.deleteLater()
+        self.app.processEvents()
+
+    @staticmethod
+    def _enter(mods: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier) -> QKeyEvent:
+        return QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return, mods, "\r")
+
+    @staticmethod
+    def _preedit(text: str) -> QInputMethodEvent:
+        return QInputMethodEvent(text, [])
+
+    @staticmethod
+    def _commit(text: str) -> QInputMethodEvent:
+        ev = QInputMethodEvent("", [])
+        ev.setCommitString(text, 0, 0)
+        return ev
+
+    def test_plain_enter_sends(self) -> None:
+        self.edit.setPlainText("こんにちは")
+        self.edit.keyPressEvent(self._enter())
+        self.assertEqual(self.sent, ["こんにちは"])
+
+    def test_shift_enter_inserts_newline_without_send(self) -> None:
+        self.edit.setPlainText("一行目")
+        self.edit.keyPressEvent(self._enter(Qt.KeyboardModifier.ShiftModifier))
+        self.assertEqual(self.sent, [])
+        self.assertIn("\n", self.edit.toPlainText())
+
+    def test_preedit_enter_confirms_without_send(self) -> None:
+        self.edit.inputMethodEvent(self._preedit("にほん"))
+        self.assertTrue(self.edit._composing)
+        self.edit.keyPressEvent(self._enter())
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.edit.toPlainText(), "")  # no stray newline either
+
+    def test_commit_then_enter_in_same_pass_does_not_send(self) -> None:
+        self.edit.inputMethodEvent(self._preedit("にほん"))
+        self.edit.inputMethodEvent(self._commit("日本語"))
+        self.assertEqual(self.edit.toPlainText(), "日本語")
+        self.assertFalse(self.edit._composing)
+        self.assertTrue(self.edit._commit_guard)
+
+        self.edit.keyPressEvent(self._enter())  # trailing confirmation key
+        self.assertEqual(self.sent, [])
+
+        self.app.processEvents()  # event loop drains -> guard clears
+        self.assertFalse(self.edit._commit_guard)
+        self.edit.keyPressEvent(self._enter())  # deliberate send
+        self.assertEqual(self.sent, ["日本語"])
+
+    def test_focus_out_resets_composition(self) -> None:
+        self.edit.inputMethodEvent(self._preedit("にほん"))
+        self.edit.focusOutEvent(QFocusEvent(QEvent.Type.FocusOut))
+        self.assertFalse(self.edit._composing)
+        self.edit.setPlainText("確定済み")
+        self.edit.keyPressEvent(self._enter())
+        self.assertEqual(self.sent, ["確定済み"])
+
+
+class TestQtPlatformSelection(unittest.TestCase):
+    """Wayland-first platform choice and IM-module handling (run.sh + main.py)."""
+
+    def test_configure_qt_environment_wayland_preferred(self) -> None:
+        from sisters_mascot.main import _configure_qt_environment
+
+        env = {"WAYLAND_DISPLAY": "wayland-1", "DISPLAY": ":0", "QT_IM_MODULE": "fcitx"}
+        with patch.dict(os.environ, env, clear=True):
+            _configure_qt_environment()
+            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "wayland")
+            self.assertNotIn("QT_IM_MODULE", os.environ)
+
+    def test_configure_qt_environment_x11_keeps_im_module(self) -> None:
+        from sisters_mascot.main import _configure_qt_environment
+
+        env = {"DISPLAY": ":0", "QT_IM_MODULE": "fcitx"}
+        with patch.dict(os.environ, env, clear=True):
+            _configure_qt_environment()
+            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "xcb")
+            self.assertEqual(os.environ["QT_IM_MODULE"], "fcitx")
+
+    def test_configure_qt_environment_explicit_override(self) -> None:
+        from sisters_mascot.main import _configure_qt_environment
+
+        env = {"WAYLAND_DISPLAY": "wayland-1", "SISTERS_MASCOT_PLATFORM": "xcb", "QT_IM_MODULE": "ibus"}
+        with patch.dict(os.environ, env, clear=True):
+            _configure_qt_environment()
+            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "xcb")
+            self.assertEqual(os.environ["QT_IM_MODULE"], "ibus")
+
+    def test_configure_qt_environment_keep_im_module_escape_hatch(self) -> None:
+        from sisters_mascot.main import _configure_qt_environment
+
+        env = {"WAYLAND_DISPLAY": "wayland-1", "QT_IM_MODULE": "fcitx", "SISTERS_MASCOT_KEEP_IM_MODULE": "1"}
+        with patch.dict(os.environ, env, clear=True):
+            _configure_qt_environment()
+            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "wayland")
+            self.assertEqual(os.environ["QT_IM_MODULE"], "fcitx")
+
+    def test_configure_qt_environment_respects_existing_platform(self) -> None:
+        from sisters_mascot.main import _configure_qt_environment
+
+        env = {"QT_QPA_PLATFORM": "offscreen", "WAYLAND_DISPLAY": "wayland-1"}
+        with patch.dict(os.environ, env, clear=True):
+            _configure_qt_environment()
+            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "offscreen")
+
+    def test_run_script_selects_platform_and_im_module(self) -> None:
+        cases = [
+            ({"WAYLAND_DISPLAY": "wayland-1", "DISPLAY": ":0", "QT_IM_MODULE": "fcitx"}, "wayland", None),
+            ({"DISPLAY": ":0", "QT_IM_MODULE": "fcitx"}, "xcb", "fcitx"),
+            ({"WAYLAND_DISPLAY": "wayland-1", "SISTERS_MASCOT_PLATFORM": "xcb", "QT_IM_MODULE": "fcitx"}, "xcb", "fcitx"),
+            ({"WAYLAND_DISPLAY": "wayland-1", "QT_IM_MODULE": "fcitx", "SISTERS_MASCOT_KEEP_IM_MODULE": "1"}, "wayland", "fcitx"),
+            ({"QT_QPA_PLATFORM": "offscreen", "WAYLAND_DISPLAY": "wayland-1"}, "offscreen", None),
+        ]
+        strip = {
+            "QT_QPA_PLATFORM", "QT_IM_MODULE", "WAYLAND_DISPLAY", "DISPLAY",
+            "SISTERS_MASCOT_PLATFORM", "SISTERS_MASCOT_KEEP_IM_MODULE",
+        }
+        base_env = {k: v for k, v in os.environ.items() if k not in strip}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            shutil.copy(PROJECT_ROOT / "run.sh", root / "run.sh")
+            stub_dir = root / ".venv" / "bin"
+            stub_dir.mkdir(parents=True)
+            stub = stub_dir / "python"
+            stub.write_text("#!/usr/bin/env bash\nenv\n")
+            stub.chmod(0o755)
+            for overrides, want_platform, want_im in cases:
+                env = dict(base_env)
+                env.update(overrides)
+                proc = subprocess.run(
+                    ["bash", str(root / "run.sh")], env=env, capture_output=True, text=True, timeout=30
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                got = dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+                self.assertEqual(got.get("QT_QPA_PLATFORM"), want_platform, overrides)
+                self.assertEqual(got.get("QT_IM_MODULE"), want_im, overrides)
+
+
+class TestOpenCodeBinaryResolution(unittest.TestCase):
+    """opencode must be found even when GUI launch PATH omits ~/.opencode/bin."""
+
+    def _fake_home_with_opencode(self, tmpdir: str) -> Path:
+        fake_home = Path(tmpdir)
+        oc_dir = fake_home / ".opencode" / "bin"
+        oc_dir.mkdir(parents=True)
+        exe = oc_dir / "opencode"
+        exe.write_text("#!/bin/sh\nexit 0\n")
+        exe.chmod(0o755)
+        return exe
+
+    def test_fallback_to_opencode_install_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exe = self._fake_home_with_opencode(tmpdir)
+            with (
+                patch("pathlib.Path.home", return_value=Path(tmpdir)),
+                patch("sisters_mascot.agents.base.shutil.which", return_value=None),
+            ):
+                adapter = OpenCodeAdapter()
+                self.assertEqual(adapter.resolved_binary(), str(exe))
+                self.assertTrue(adapter.is_available())
+
+    def test_discovery_uses_fallback_binary_and_parses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exe = self._fake_home_with_opencode(tmpdir)
+            stdout = "opencode/beam-free\nopencode/big-pickle\nsurplus/claude-sonnet-5\n"
+            with (
+                patch("pathlib.Path.home", return_value=Path(tmpdir)),
+                patch("sisters_mascot.agents.base.shutil.which", return_value=None),
+                patch("sisters_mascot.agents.opencode_adapter.subprocess.run") as mock_run,
+            ):
+                mock_run.return_value = subprocess.CompletedProcess(
+                    args=[str(exe), "models"], returncode=0, stdout=stdout, stderr=""
+                )
+                adapter = OpenCodeAdapter()
+                choices = adapter.discover_model_choices()
+            self.assertEqual(
+                [c.id for c in choices],
+                ["opencode/beam-free", "opencode/big-pickle", "surplus/claude-sonnet-5"],
+            )
+            self.assertEqual(mock_run.call_args[0][0], [str(exe), "models"])
 
 
 if __name__ == "__main__":

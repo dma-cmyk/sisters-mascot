@@ -198,7 +198,6 @@ class MascotWindow(QWidget):
     mute_toggle_requested = pyqtSignal()
     always_on_top_toggled = pyqtSignal(bool)
     position_changed = pyqtSignal(int, int)
-    moved_geometry = pyqtSignal(QRect)
     size_changed = pyqtSignal(int)
     mascot_clicked_line = pyqtSignal(str)
     quit_requested = pyqtSignal()
@@ -564,7 +563,6 @@ class MascotWindow(QWidget):
         y = max(avail.top(), avail.bottom() - self.height() - 24)
         self.move(x, y)
         self._toast.reposition_near(self.frameGeometry())
-        self.moved_geometry.emit(self.frameGeometry())
         if save:
             self.position_changed.emit(x, y)
 
@@ -616,7 +614,6 @@ class MascotWindow(QWidget):
         clamped_pos = self._clamp_pos_to_screen(new_pos)
         self.move(clamped_pos)
         self._toast.reposition_near(self.frameGeometry())
-        self.moved_geometry.emit(self.frameGeometry())
         if emit_signal:
             self._pos_save_timer.stop()
             self.position_changed.emit(clamped_pos.x(), clamped_pos.y())
@@ -1311,7 +1308,6 @@ class MascotWindow(QWidget):
             target_pos = self._clamp_pos_to_screen(self._win_start_pos + delta)
             self.move(target_pos)
             self._toast.reposition_near(self.frameGeometry())
-            self.moved_geometry.emit(self.frameGeometry())
             event.accept()
             return
 
@@ -1334,7 +1330,6 @@ class MascotWindow(QWidget):
                 if clamped != self.pos():
                     self.move(clamped)
                 self._toast.reposition_near(self.frameGeometry())
-                self.moved_geometry.emit(self.frameGeometry())
                 self.position_changed.emit(self.x(), self.y())
             else:
                 self.trigger_bounce()
@@ -1354,7 +1349,6 @@ class MascotWindow(QWidget):
     def moveEvent(self, event) -> None:  # noqa: ANN001
         super().moveEvent(event)
         self._toast.reposition_near(self.frameGeometry())
-        self.moved_geometry.emit(self.frameGeometry())
         self._pos_save_timer.start()
 
     def _emit_position_changed(self) -> None:

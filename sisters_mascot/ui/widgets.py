@@ -13,6 +13,7 @@ from PyQt6.QtGui import (
     QColor,
     QFont,
     QGuiApplication,
+    QInputMethodEvent,
     QKeyEvent,
     QPainter,
     QPainterPath,
@@ -436,7 +437,14 @@ class ToastBubble(QWidget):
 
 
 class ChatInputEdit(QPlainTextEdit):
-    """Multi-line chat composer: Enter sends, Shift+Enter inserts newline."""
+    """Multi-line chat composer: Enter sends, Shift+Enter inserts newline.
+
+    IME (Mozc etc.) safety: QKeyEvent has no isComposing flag in Qt, so the
+    preedit string is tracked via QInputMethodEvent. While a preedit is
+    active, Enter belongs to the IME. Some IMEs also deliver the confirming
+    Enter key *after* the commit event, so a short guard keeps that key from
+    sending the message as well.
+    """
 
     send_requested = pyqtSignal()
 
@@ -444,11 +452,33 @@ class ChatInputEdit(QPlainTextEdit):
         super().__init__(parent)
         self.setPlaceholderText("メッセージを入力… (Enterで送信 / Shift+Enterで改行)")
         self.setTabChangesFocus(True)
+        self._composing = False
+        self._commit_guard = False
+        self._commit_guard_timer = QTimer(self)
+        self._commit_guard_timer.setSingleShot(True)
+        self._commit_guard_timer.setInterval(0)
+        self._commit_guard_timer.timeout.connect(self._clear_commit_guard)
+
+    def inputMethodEvent(self, event: QInputMethodEvent) -> None:
+        self._composing = bool(event.preeditString())
+        if event.commitString():
+            # Swallow a trailing Enter until the event loop drains; a real
+            # user send always arrives in a later event-loop pass.
+            self._commit_guard = True
+            self._commit_guard_timer.start()
+        super().inputMethodEvent(event)
+
+    def _clear_commit_guard(self) -> None:
+        self._commit_guard = False
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         key = event.key()
         mods = event.modifiers()
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self._composing or self._commit_guard:
+                # IME conversion/confirmation key: neither send nor newline.
+                event.accept()
+                return
             if mods & Qt.KeyboardModifier.ShiftModifier:
                 super().keyPressEvent(event)
                 return
@@ -456,6 +486,12 @@ class ChatInputEdit(QPlainTextEdit):
             self.send_requested.emit()
             return
         super().keyPressEvent(event)
+
+    def focusOutEvent(self, event) -> None:  # noqa: ANN001
+        self._composing = False
+        self._commit_guard = False
+        self._commit_guard_timer.stop()
+        super().focusOutEvent(event)
 
 
 class AppChooserDialog(QDialog):

@@ -63,6 +63,22 @@ def make_tool_event(tool_name: str, payload: Any = None) -> StreamEvent:
     )
 
 
+# Common install dirs searched when a CLI is not found on PATH (GUI launches).
+_COMMON_BIN_DIRS = (".opencode/bin", ".local/bin", "bin")
+_SYSTEM_BIN_DIRS = ("/usr/local/bin", "/usr/bin", "/bin")
+
+
+def _fallback_binary(name: str) -> str | None:
+    """Return an executable `name` found in common install dirs, else None."""
+    home = Path.home()
+    candidates = [home / rel / name for rel in _COMMON_BIN_DIRS]
+    candidates += [Path(d) / name for d in _SYSTEM_BIN_DIRS]
+    for cand in candidates:
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
+
+
 class BaseAgentAdapter:
     """Common interface implemented by all CLI agent adapters."""
 
@@ -72,14 +88,23 @@ class BaseAgentAdapter:
         """Reset per-turn stream deduplication state before starting a new turn."""
 
     def resolved_binary(self) -> str:
-        """Resolve the configured CLI binary via absolute path or PATH."""
+        """Resolve the configured CLI binary via absolute path or PATH.
+
+        Falls back to common user/system install directories when PATH lookup
+        fails: GUI launchers (e.g. the KDE menu) often start apps with a minimal
+        PATH that omits dirs like ``~/.opencode/bin``, which would otherwise make
+        an installed CLI look unavailable and hide its real model list.
+        """
         configured = self.spec.binary
         if os.sep in configured or "/" in configured:
             p = Path(configured)
             if p.is_file():
                 return str(p)
-        found = shutil.which(Path(configured).name)
-        return found or configured
+        name = Path(configured).name
+        found = shutil.which(name)
+        if found:
+            return found
+        return _fallback_binary(name) or configured
 
     def is_available(self) -> bool:
         """Return True if the underlying CLI binary is installed and executable."""

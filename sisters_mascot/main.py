@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import signal
 import sys
 
@@ -17,10 +18,35 @@ from sisters_mascot.config import AppConfig, load_config, save_config
 from sisters_mascot.sisters_loader import SisterProfile, get_sister_map, load_all_sisters
 from sisters_mascot.ui.bubble_panel import BubblePanel
 from sisters_mascot.ui.mascot_window import MascotWindow
+from sisters_mascot.ui.platform import supports_window_positioning
 from sisters_mascot.ui.tray import SistersTrayIcon
 
 
 _SINGLETON_NAME = "sisters-mascot-singleton"
+
+
+def _configure_qt_environment() -> None:
+    """Pick the Qt platform and IM module before QApplication exists.
+
+    Mirrors run.sh for direct ``python -m sisters_mascot.main`` launches:
+    Wayland sessions prefer the native Wayland backend so IME (Mozc via
+    fcitx5/ibus) works through Qt's text-input protocol; a leftover X11
+    QT_IM_MODULE breaks Japanese input there and is unset. Pure X11 keeps
+    xcb and its IM module. Explicit overrides always win.
+    """
+    override = os.environ.get("SISTERS_MASCOT_PLATFORM")
+    if override:
+        os.environ["QT_QPA_PLATFORM"] = override
+    platform = os.environ.get("QT_QPA_PLATFORM", "")
+    if not platform:
+        if os.environ.get("WAYLAND_DISPLAY"):
+            platform = "wayland"
+        elif os.environ.get("DISPLAY"):
+            platform = "xcb"
+        if platform:
+            os.environ["QT_QPA_PLATFORM"] = platform
+    if platform.startswith("wayland") and not os.environ.get("SISTERS_MASCOT_KEEP_IM_MODULE"):
+        os.environ.pop("QT_IM_MODULE", None)
 
 
 def _try_activate_existing() -> bool:
@@ -129,7 +155,6 @@ class MascotAppController(QObject):
         self.mascot.mute_toggle_requested.connect(self.toggle_mute)
         self.mascot.always_on_top_toggled.connect(self._on_always_on_top_toggled)
         self.mascot.position_changed.connect(self._on_mascot_position_changed)
-        self.mascot.moved_geometry.connect(self._on_mascot_moved_geometry)
         self.mascot.mascot_clicked_line.connect(self._on_mascot_click_line)
         if hasattr(self.mascot, "size_changed"):
             self.mascot.size_changed.connect(self._on_mascot_size_changed)
@@ -230,13 +255,13 @@ class MascotAppController(QObject):
         self._save_config_safe()
 
     def _on_mascot_position_changed(self, x: int, y: int) -> None:
+        # Wayland coordinates are compositor-owned and unreliable; keep the
+        # last trustworthy position instead of saving bogus values.
+        if not supports_window_positioning():
+            return
         self.config.mascot_x = x
         self.config.mascot_y = y
         self._save_config_safe()
-
-    def _on_mascot_moved_geometry(self, rect) -> None:  # noqa: ANN001
-        if self.panel.isVisible():
-            self.panel.reposition_near_mascot(rect)
 
     def _on_mascot_click_line(self, line: str) -> None:
         if (
@@ -382,6 +407,7 @@ class MascotAppController(QObject):
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_qt_environment()
     app = QApplication(argv if argv is not None else sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)

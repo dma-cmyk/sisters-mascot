@@ -37,6 +37,10 @@ from sisters_mascot import USER_SPRITES_DIR
 from sisters_mascot.agents.base import ModelChoice
 from sisters_mascot.agents.router import AGENT_IDS, AgentRouter
 from sisters_mascot.config import (
+    PANEL_HEIGHT_MAX,
+    PANEL_HEIGHT_MIN,
+    PANEL_WIDTH_MAX,
+    PANEL_WIDTH_MIN,
     SCALE_WIDTHS,
     AppConfig,
     AppItem,
@@ -53,6 +57,7 @@ from sisters_mascot.sisters_loader import (
     reset_user_sprite,
 )
 from sisters_mascot.sprites.renderer import clear_sprite_cache
+from sisters_mascot.ui.platform import supports_window_positioning
 from sisters_mascot.ui.widgets import (
     ChatInputEdit,
     LauncherItemDialog,
@@ -226,11 +231,12 @@ class BubblePanel(QWidget):
         self._discovered_choices: dict[str, list[ModelChoice]] = {}
         self._manual_refresh_pending: set[str] = set()
         self._header_drag_pos: QPoint | None = None
+        self._ever_shown: bool = False
 
-        self.setMinimumSize(360, 440)
-        self.setMaximumSize(820, 920)
-        init_w = max(360, min(820, int(getattr(self._config, "panel_width", 440) or 440)))
-        init_h = max(440, min(920, int(getattr(self._config, "panel_height", 600) or 600)))
+        self.setMinimumSize(PANEL_WIDTH_MIN, PANEL_HEIGHT_MIN)
+        self._update_maximum_size()
+        init_w = max(PANEL_WIDTH_MIN, min(PANEL_WIDTH_MAX, int(getattr(self._config, "panel_width", 440) or 440)))
+        init_h = max(PANEL_HEIGHT_MIN, min(PANEL_HEIGHT_MAX, int(getattr(self._config, "panel_height", 600) or 600)))
         self.resize(init_w, init_h)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self._apply_window_flags(initial=True)
@@ -245,10 +251,21 @@ class BubblePanel(QWidget):
         self._resize_save_timer.setInterval(300)
         self._resize_save_timer.timeout.connect(self._on_resize_save_timeout)
 
+        self._move_save_timer = QTimer(self)
+        self._move_save_timer.setSingleShot(True)
+        self._move_save_timer.setInterval(260)
+        self._move_save_timer.timeout.connect(self._emit_position_changed)
+
         self._build_ui()
         self._ui_ready = True
         self.sync_from_config(self._sister)
         self._append_system_or_greeting()
+
+    def _update_maximum_size(self) -> None:
+        """Let the panel grow up to the current screen's available area."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+        self.setMaximumSize(max(PANEL_WIDTH_MIN, avail.width()), max(PANEL_HEIGHT_MIN, avail.height()))
 
     def _apply_window_flags(self, *, initial: bool = False) -> None:
         flags = Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
@@ -347,10 +364,10 @@ class BubblePanel(QWidget):
         grip_row.setContentsMargins(0, 0, 0, 0)
         grip_row.addStretch(1)
         self._size_grip = QSizeGrip(self._frame)
-        self._size_grip.setFixedSize(16, 16)
-        self._size_grip.setToolTip("ドラッグしてサイズ変更")
+        self._size_grip.setFixedSize(22, 22)
+        self._size_grip.setToolTip("ドラッグしてサイズ変更（画面いっぱいまで拡大できます）")
         self._size_grip.setStyleSheet(
-            "QSizeGrip { background: transparent; width: 16px; height: 16px; }"
+            "QSizeGrip { background: transparent; width: 22px; height: 22px; }"
         )
         grip_row.addWidget(
             self._size_grip,
@@ -839,14 +856,39 @@ class BubblePanel(QWidget):
         y = max(avail.top() + 8, min(y, avail.bottom() - h - 8))
         self.move(x, y)
 
+    def _clamp_pos_to_screen(self, pos: QPoint) -> QPoint:
+        center = QPoint(pos.x() + self.width() // 2, pos.y() + self.height() // 2)
+        screen = QGuiApplication.screenAt(center) or QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+        x = max(avail.left() + 8, min(pos.x(), avail.right() - self.width() - 8))
+        y = max(avail.top() + 8, min(pos.y(), avail.bottom() - self.height() - 8))
+        return QPoint(x, y)
+
+    def _place_for_show(self, mascot_rect: QRect) -> None:
+        """Restore the panel's own saved position, independent of the mascot.
+
+        Only the very first show (no saved position yet) anchors the panel
+        beside the mascot; re-showing never re-anchors it. On native Wayland
+        the compositor owns placement, so no move is attempted there.
+        """
+        if not supports_window_positioning():
+            return
+        if self._config.panel_x is not None and self._config.panel_y is not None:
+            self.move(self._clamp_pos_to_screen(QPoint(self._config.panel_x, self._config.panel_y)))
+            return
+        if not self._ever_shown:
+            self.reposition_near_mascot(mascot_rect)
+
     def show_for_mascot(self, mascot_rect: QRect, *, tab_index: int | None = None) -> None:
         self.ensure_models_discovered(self._config.agent_id)
-        self.reposition_near_mascot(mascot_rect)
+        self._update_maximum_size()
+        self._place_for_show(mascot_rect)
         if tab_index is not None:
             self._tabs.setCurrentIndex(tab_index)
         self.show()
         self.raise_()
         self.activateWindow()
+        self._ever_shown = True
         if self._tabs.currentIndex() == 0:
             self._chat_input.setFocus()
 
@@ -881,6 +923,21 @@ class BubblePanel(QWidget):
     def mouseReleaseEvent(self, event) -> None:  # noqa: ANN001
         self._header_drag_pos = None
         super().mouseReleaseEvent(event)
+
+    def moveEvent(self, event) -> None:  # noqa: ANN001
+        super().moveEvent(event)
+        # Wayland positions are compositor-owned and unreliable; skip saving.
+        if supports_window_positioning():
+            self._move_save_timer.start()
+
+    def _emit_position_changed(self) -> None:
+        if not supports_window_positioning():
+            return
+        x, y = self.x(), self.y()
+        if self._config.panel_x != x or self._config.panel_y != y:
+            self._config.panel_x = x
+            self._config.panel_y = y
+            self.config_updated.emit()
 
     # Chat & Router handling
     def _append_system_or_greeting(self) -> None:
@@ -1553,8 +1610,8 @@ class BubblePanel(QWidget):
             self._resize_save_timer.start()
 
     def _on_resize_save_timeout(self) -> None:
-        w = max(360, min(820, self.width()))
-        h = max(440, min(920, self.height()))
+        w = max(PANEL_WIDTH_MIN, min(self.maximumWidth(), self.width()))
+        h = max(PANEL_HEIGHT_MIN, min(self.maximumHeight(), self.height()))
         if (
             getattr(self._config, "panel_width", None) != w
             or getattr(self._config, "panel_height", None) != h
@@ -1566,4 +1623,5 @@ class BubblePanel(QWidget):
     def closeEvent(self, event) -> None:  # noqa: ANN001
         self._stream_flush_timer.stop()
         self._resize_save_timer.stop()
+        self._move_save_timer.stop()
         super().closeEvent(event)

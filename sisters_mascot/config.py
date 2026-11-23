@@ -26,9 +26,11 @@ SCALE_WIDTHS: dict[str, int] = {
 MASCOT_WIDTH_MIN = 100
 MASCOT_WIDTH_MAX = 420
 PANEL_WIDTH_MIN = 360
-PANEL_WIDTH_MAX = 820
+# Generous sanity bounds for persisted JSON; at runtime the panel is clamped
+# to the current screen's available geometry (see BubblePanel._update_maximum_size).
+PANEL_WIDTH_MAX = 7680
 PANEL_HEIGHT_MIN = 440
-PANEL_HEIGHT_MAX = 920
+PANEL_HEIGHT_MAX = 4320
 ANIMATION_MODES = ("rich", "subtle", "off")
 
 
@@ -173,6 +175,8 @@ class AppConfig:
     mascot_y: int | None = None
     mascot_scale: str = "medium"
     mascot_width: int = 210
+    panel_x: int | None = None
+    panel_y: int | None = None
     panel_width: int = 440
     panel_height: int = 600
     animation_mode: str = "rich"
@@ -240,6 +244,8 @@ def load_config(path: Path | None = None) -> AppConfig:
         "mascot_y",
         "mascot_scale",
         "mascot_width",
+        "panel_x",
+        "panel_y",
         "panel_width",
         "panel_height",
         "animation_mode",
