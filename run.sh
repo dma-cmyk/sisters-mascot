@@ -5,16 +5,18 @@ SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 # Platform selection: explicit override > existing QT_QPA_PLATFORM > autodetect.
-# Wayland sessions (e.g. KDE Plasma) prefer the native Wayland backend so IME
-# (Mozc via fcitx5/ibus) works through Qt's text-input protocol. Pure X11 keeps
-# xcb for free dragging and coordinate persistence.
+# X11/XWayland (DISPLAY set) prefers xcb: the mascot needs X11-style window
+# management for always-on-top, free positioning and toast anchoring, which
+# native Wayland compositors do not let clients control. Pure Wayland (no
+# DISPLAY) falls back to the wayland backend. Japanese IME on xcb is enabled by
+# main._ensure_system_qt_plugins (system fcitx5/ibus Qt plugin discovery).
 if [[ -n "${SISTERS_MASCOT_PLATFORM:-}" ]]; then
     export QT_QPA_PLATFORM="$SISTERS_MASCOT_PLATFORM"
 elif [[ -z "${QT_QPA_PLATFORM:-}" ]]; then
-    if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
-        export QT_QPA_PLATFORM="wayland"
-    elif [[ -n "${DISPLAY:-}" ]]; then
+    if [[ -n "${DISPLAY:-}" ]]; then
         export QT_QPA_PLATFORM="xcb"
+    elif [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+        export QT_QPA_PLATFORM="wayland"
     fi
 fi
 

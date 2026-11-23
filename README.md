@@ -50,9 +50,11 @@
   メニューから **`Sisters Mascot`** を検索して起動できます（`~/.local/share/applications/sisters-mascot.desktop`）。
 
 > **KDE Plasma Wayland / XWayland について**:
-> `run.sh` は Wayland セッション（`WAYLAND_DISPLAY` あり）では **ネイティブ Wayland を優先**します。Mozc などの日本語 IME は Qt の text-input プロトコルで動作するため、X11 用の `QT_IM_MODULE`（fcitx / ibus）は Wayland 起動時に自動で解除されます（維持したい場合は `SISTERS_MASCOT_KEEP_IM_MODULE=1`）。純粋な X11 環境では従来どおり `xcb` と既存の IM モジュールを使います。明示指定は `SISTERS_MASCOT_PLATFORM=wayland|xcb` または `QT_QPA_PLATFORM` で常に優先されます。
+> `run.sh` は `DISPLAY` が有効な環境（X11 / XWayland）では **`xcb` を優先**します。デスクトップマスコットに必要な「常に最前面・自由な位置配置・吹き出しの位置合わせ」は X11 系のウィンドウ管理機能で、ネイティブ Wayland ではコンポジターの制限によりクライアントから制御できないためです。`DISPLAY` が無い純粋な Wayland セッションでは `wayland` にフォールバックします。明示指定は `SISTERS_MASCOT_PLATFORM=wayland|xcb` または `QT_QPA_PLATFORM` で常に優先されます。
 >
-> Wayland ではウィンドウ位置はコンポジター管理のため、**座標の保存・復元は行いません**（ドラッグは `startSystemMove` によるシステム移動で動作）。X11 / Windows / macOS ではマスコット・パネルそれぞれの位置とサイズを保存・復元します。
+> **日本語入力（Mozc / fcitx5）**: pip 版 PyQt6 は独自の Qt プラグインを同梱しており、システムの fcitx5 プラグインを検索しないため、そのままでは xcb で日本語入力できません。本アプリは起動時にシステムの Qt6 プラグインディレクトリを `QT_PLUGIN_PATH` へ追加し（`main._ensure_system_qt_plugins`）、`QT_IM_MODULE=fcitx` で fcitx5 の Mozc が動作するようにしています。ネイティブ Wayland 起動時は Qt の text-input プロトコルを使うため `QT_IM_MODULE` を自動解除します（維持したい場合は `SISTERS_MASCOT_KEEP_IM_MODULE=1`）。
+>
+> **Wayland の制限**: ネイティブ Wayland ではウィンドウ位置はコンポジター管理のため、**座標の保存・復元や吹き出しの精密な位置合わせは行いません**（ドラッグは `startSystemMove` で動作）。最前面・位置・吹き出しを完全に使うには XWayland（`xcb`）起動を推奨します。X11 / Windows / macOS ではマスコット・パネルそれぞれの位置とサイズを保存・復元します。
 
 ### マウス・ドラッグ・ホイール・右クリック操作
 - **左クリック**: 姉妹が弾性バウンス＆星やハートのパーティクルとともに挨拶し、チャット＆ランチャーパネルを開閉します。

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
+import subprocess
 import sys
+from pathlib import Path
 
 from PyQt6.QtCore import QObject, QTimer
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
@@ -25,28 +28,78 @@ from sisters_mascot.ui.tray import SistersTrayIcon
 _SINGLETON_NAME = "sisters-mascot-singleton"
 
 
+def _system_qt_plugin_dir() -> str | None:
+    """Locate the system Qt6 plugin directory (holds IM plugins like fcitx5)."""
+    for tool, args in (
+        ("qtpaths6", ["--plugin-dir"]),
+        ("qmake6", ["-query", "QT_INSTALL_PLUGINS"]),
+    ):
+        exe = shutil.which(tool)
+        if not exe:
+            continue
+        try:
+            out = subprocess.run(
+                [exe, *args], capture_output=True, text=True, timeout=5, check=False
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out and Path(out).is_dir():
+            return out
+    for cand in (
+        "/usr/lib/qt6/plugins",
+        "/usr/lib64/qt6/plugins",
+        "/usr/lib/x86_64-linux-gnu/qt6/plugins",
+    ):
+        if Path(cand).is_dir():
+            return cand
+    return None
+
+
+def _ensure_system_qt_plugins() -> None:
+    """Make system Qt6 IM plugins discoverable by PyQt6's bundled Qt.
+
+    The pip PyQt6 wheel bundles its own Qt plugins (compose/ibus only) and does
+    not search the system plugin dir, so ``QT_IM_MODULE=fcitx`` silently fails to
+    load the fcitx5 Mozc frontend on X11/XWayland. Adding the system plugin dir to
+    ``QT_PLUGIN_PATH`` restores Japanese input there.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    if os.environ.get("QT_IM_MODULE", "") not in ("fcitx", "fcitx5", "ibus"):
+        return
+    plugin_dir = _system_qt_plugin_dir()
+    if not plugin_dir:
+        return
+    parts = [p for p in os.environ.get("QT_PLUGIN_PATH", "").split(os.pathsep) if p]
+    if plugin_dir not in parts:
+        parts.append(plugin_dir)
+        os.environ["QT_PLUGIN_PATH"] = os.pathsep.join(parts)
+
+
 def _configure_qt_environment() -> None:
     """Pick the Qt platform and IM module before QApplication exists.
 
-    Mirrors run.sh for direct ``python -m sisters_mascot.main`` launches:
-    Wayland sessions prefer the native Wayland backend so IME (Mozc via
-    fcitx5/ibus) works through Qt's text-input protocol; a leftover X11
-    QT_IM_MODULE breaks Japanese input there and is unset. Pure X11 keeps
-    xcb and its IM module. Explicit overrides always win.
+    Mirrors run.sh for direct ``python -m sisters_mascot.main`` launches.
+    X11/XWayland (``DISPLAY`` set) prefers ``xcb``: the desktop mascot needs
+    X11-style window management for always-on-top, free positioning and toast
+    anchoring, which native Wayland compositors do not allow clients to control.
+    Pure Wayland (no ``DISPLAY``) falls back to ``wayland`` with the text-input
+    protocol. Explicit overrides always win.
     """
     override = os.environ.get("SISTERS_MASCOT_PLATFORM")
     if override:
         os.environ["QT_QPA_PLATFORM"] = override
     platform = os.environ.get("QT_QPA_PLATFORM", "")
     if not platform:
-        if os.environ.get("WAYLAND_DISPLAY"):
-            platform = "wayland"
-        elif os.environ.get("DISPLAY"):
+        if os.environ.get("DISPLAY"):
             platform = "xcb"
+        elif os.environ.get("WAYLAND_DISPLAY"):
+            platform = "wayland"
         if platform:
             os.environ["QT_QPA_PLATFORM"] = platform
     if platform.startswith("wayland") and not os.environ.get("SISTERS_MASCOT_KEEP_IM_MODULE"):
         os.environ.pop("QT_IM_MODULE", None)
+    _ensure_system_qt_plugins()
 
 
 def _try_activate_existing() -> bool:

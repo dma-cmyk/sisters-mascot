@@ -993,56 +993,56 @@ class TestChatInputIME(unittest.TestCase):
 
 
 class TestQtPlatformSelection(unittest.TestCase):
-    """Wayland-first platform choice and IM-module handling (run.sh + main.py)."""
+    """XWayland-first platform choice and IM-module handling (run.sh + main.py)."""
 
-    def test_configure_qt_environment_wayland_preferred(self) -> None:
+    def _configure(self, env: dict) -> dict:
         from sisters_mascot.main import _configure_qt_environment
 
-        env = {"WAYLAND_DISPLAY": "wayland-1", "DISPLAY": ":0", "QT_IM_MODULE": "fcitx"}
-        with patch.dict(os.environ, env, clear=True):
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("sisters_mascot.main._ensure_system_qt_plugins"),
+        ):
             _configure_qt_environment()
-            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "wayland")
-            self.assertNotIn("QT_IM_MODULE", os.environ)
+            return dict(os.environ)
 
-    def test_configure_qt_environment_x11_keeps_im_module(self) -> None:
-        from sisters_mascot.main import _configure_qt_environment
+    def test_xwayland_prefers_xcb_and_keeps_im_module(self) -> None:
+        got = self._configure({"WAYLAND_DISPLAY": "wayland-1", "DISPLAY": ":0", "QT_IM_MODULE": "fcitx"})
+        self.assertEqual(got["QT_QPA_PLATFORM"], "xcb")
+        self.assertEqual(got["QT_IM_MODULE"], "fcitx")
 
-        env = {"DISPLAY": ":0", "QT_IM_MODULE": "fcitx"}
-        with patch.dict(os.environ, env, clear=True):
-            _configure_qt_environment()
-            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "xcb")
-            self.assertEqual(os.environ["QT_IM_MODULE"], "fcitx")
+    def test_pure_wayland_unsets_im_module(self) -> None:
+        got = self._configure({"WAYLAND_DISPLAY": "wayland-1", "QT_IM_MODULE": "fcitx"})
+        self.assertEqual(got["QT_QPA_PLATFORM"], "wayland")
+        self.assertNotIn("QT_IM_MODULE", got)
 
-    def test_configure_qt_environment_explicit_override(self) -> None:
-        from sisters_mascot.main import _configure_qt_environment
+    def test_x11_keeps_im_module(self) -> None:
+        got = self._configure({"DISPLAY": ":0", "QT_IM_MODULE": "fcitx"})
+        self.assertEqual(got["QT_QPA_PLATFORM"], "xcb")
+        self.assertEqual(got["QT_IM_MODULE"], "fcitx")
 
-        env = {"WAYLAND_DISPLAY": "wayland-1", "SISTERS_MASCOT_PLATFORM": "xcb", "QT_IM_MODULE": "ibus"}
-        with patch.dict(os.environ, env, clear=True):
-            _configure_qt_environment()
-            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "xcb")
-            self.assertEqual(os.environ["QT_IM_MODULE"], "ibus")
+    def test_explicit_override_wins(self) -> None:
+        got = self._configure(
+            {"WAYLAND_DISPLAY": "wayland-1", "DISPLAY": ":0", "SISTERS_MASCOT_PLATFORM": "wayland", "QT_IM_MODULE": "fcitx"}
+        )
+        self.assertEqual(got["QT_QPA_PLATFORM"], "wayland")
+        self.assertNotIn("QT_IM_MODULE", got)
 
-    def test_configure_qt_environment_keep_im_module_escape_hatch(self) -> None:
-        from sisters_mascot.main import _configure_qt_environment
+    def test_keep_im_module_escape_hatch(self) -> None:
+        got = self._configure(
+            {"WAYLAND_DISPLAY": "wayland-1", "QT_IM_MODULE": "fcitx", "SISTERS_MASCOT_KEEP_IM_MODULE": "1"}
+        )
+        self.assertEqual(got["QT_QPA_PLATFORM"], "wayland")
+        self.assertEqual(got["QT_IM_MODULE"], "fcitx")
 
-        env = {"WAYLAND_DISPLAY": "wayland-1", "QT_IM_MODULE": "fcitx", "SISTERS_MASCOT_KEEP_IM_MODULE": "1"}
-        with patch.dict(os.environ, env, clear=True):
-            _configure_qt_environment()
-            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "wayland")
-            self.assertEqual(os.environ["QT_IM_MODULE"], "fcitx")
-
-    def test_configure_qt_environment_respects_existing_platform(self) -> None:
-        from sisters_mascot.main import _configure_qt_environment
-
-        env = {"QT_QPA_PLATFORM": "offscreen", "WAYLAND_DISPLAY": "wayland-1"}
-        with patch.dict(os.environ, env, clear=True):
-            _configure_qt_environment()
-            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "offscreen")
+    def test_respects_existing_platform(self) -> None:
+        got = self._configure({"QT_QPA_PLATFORM": "offscreen", "WAYLAND_DISPLAY": "wayland-1"})
+        self.assertEqual(got["QT_QPA_PLATFORM"], "offscreen")
 
     def test_run_script_selects_platform_and_im_module(self) -> None:
         cases = [
-            ({"WAYLAND_DISPLAY": "wayland-1", "DISPLAY": ":0", "QT_IM_MODULE": "fcitx"}, "wayland", None),
+            ({"WAYLAND_DISPLAY": "wayland-1", "DISPLAY": ":0", "QT_IM_MODULE": "fcitx"}, "xcb", "fcitx"),
             ({"DISPLAY": ":0", "QT_IM_MODULE": "fcitx"}, "xcb", "fcitx"),
+            ({"WAYLAND_DISPLAY": "wayland-1", "QT_IM_MODULE": "fcitx"}, "wayland", None),
             ({"WAYLAND_DISPLAY": "wayland-1", "SISTERS_MASCOT_PLATFORM": "xcb", "QT_IM_MODULE": "fcitx"}, "xcb", "fcitx"),
             ({"WAYLAND_DISPLAY": "wayland-1", "QT_IM_MODULE": "fcitx", "SISTERS_MASCOT_KEEP_IM_MODULE": "1"}, "wayland", "fcitx"),
             ({"QT_QPA_PLATFORM": "offscreen", "WAYLAND_DISPLAY": "wayland-1"}, "offscreen", None),
@@ -1070,6 +1070,44 @@ class TestQtPlatformSelection(unittest.TestCase):
                 got = dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
                 self.assertEqual(got.get("QT_QPA_PLATFORM"), want_platform, overrides)
                 self.assertEqual(got.get("QT_IM_MODULE"), want_im, overrides)
+
+
+class TestQtPluginPath(unittest.TestCase):
+    """System Qt6 IM plugins must be discoverable by PyQt6's bundled Qt on xcb."""
+
+    def test_fcitx_adds_system_plugin_dir(self) -> None:
+        from sisters_mascot.main import _ensure_system_qt_plugins
+
+        with (
+            patch.dict(os.environ, {"QT_IM_MODULE": "fcitx"}, clear=True),
+            patch("sisters_mascot.main.sys.platform", "linux"),
+            patch("sisters_mascot.main._system_qt_plugin_dir", return_value="/usr/lib/qt6/plugins"),
+        ):
+            _ensure_system_qt_plugins()
+            self.assertIn("/usr/lib/qt6/plugins", os.environ.get("QT_PLUGIN_PATH", ""))
+
+    def test_existing_plugin_path_not_duplicated(self) -> None:
+        from sisters_mascot.main import _ensure_system_qt_plugins
+
+        env = {"QT_IM_MODULE": "fcitx", "QT_PLUGIN_PATH": "/usr/lib/qt6/plugins"}
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("sisters_mascot.main.sys.platform", "linux"),
+            patch("sisters_mascot.main._system_qt_plugin_dir", return_value="/usr/lib/qt6/plugins"),
+        ):
+            _ensure_system_qt_plugins()
+            self.assertEqual(os.environ["QT_PLUGIN_PATH"], "/usr/lib/qt6/plugins")
+
+    def test_no_im_module_skips_plugin_path(self) -> None:
+        from sisters_mascot.main import _ensure_system_qt_plugins
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("sisters_mascot.main.sys.platform", "linux"),
+            patch("sisters_mascot.main._system_qt_plugin_dir", return_value="/usr/lib/qt6/plugins"),
+        ):
+            _ensure_system_qt_plugins()
+            self.assertNotIn("QT_PLUGIN_PATH", os.environ)
 
 
 class TestOpenCodeBinaryResolution(unittest.TestCase):
