@@ -26,6 +26,23 @@ _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _URL_RE = re.compile(r"https?://\S+")
 _MD_DECOR_RE = re.compile(r"(^|\n)\s{0,3}(?:#{1,6}\s*|>\s*|[-*+]\s+|\d+\.\s+)")
 
+SUPPORTED_EDGE_JA_VOICES: tuple[str, ...] = ("ja-JP-NanamiNeural", "ja-JP-KeitaNeural")
+DEFAULT_EDGE_VOICE = "ja-JP-NanamiNeural"
+
+
+def _normalize_pitch(pitch: str) -> str:
+    match = re.match(r"^\s*([+-]?\d+)\s*(?:Hz)?\s*$", pitch or "+0Hz", flags=re.IGNORECASE)
+    val = int(match.group(1)) if match else 0
+    clamped = max(-50, min(50, val))
+    return f"{clamped:+d}Hz"
+
+
+def _resolve_edge_voice(voice_name: str) -> str:
+    cleaned = (voice_name or "").strip()
+    if cleaned in SUPPORTED_EDGE_JA_VOICES:
+        return cleaned
+    return DEFAULT_EDGE_VOICE
+
 
 def clean_text_for_speech(text: str, *, skip_code: bool = True, max_chars: int = 220) -> str:
     """Sanitize Markdown/code text for natural spoken TTS playback."""
@@ -181,14 +198,25 @@ class TTSManager(QObject):
                 fd, name = tempfile.mkstemp(prefix="sisters-tts-", suffix=".mp3")
                 os.close(fd)
                 tmp_path = Path(name)
+                voice = _resolve_edge_voice(sister.voice_name)
+                pitch = _normalize_pitch(sister.voice_pitch)
                 rate = _combine_rate(sister.voice_rate, config.tts_rate_offset)
-                comm = edge_tts.Communicate(
-                    text,
-                    voice=sister.voice_name,
-                    pitch=sister.voice_pitch,
-                    rate=rate,
-                )
-                asyncio.run(comm.save(str(tmp_path)))
+
+                async def _synthesize(v: str, p: str, r: str) -> None:
+                    comm = edge_tts.Communicate(text, voice=v, pitch=p, rate=r)
+                    await comm.save(str(tmp_path))
+
+                try:
+                    asyncio.run(_synthesize(voice, pitch, rate))
+                    if not tmp_path.is_file() or tmp_path.stat().st_size <= 0:
+                        raise RuntimeError("Empty audio received from Edge-TTS")
+                except Exception:
+                    if not self._is_current(gen):
+                        return
+                    if (voice, pitch, rate) == (DEFAULT_EDGE_VOICE, "+0Hz", "+0%"):
+                        raise
+                    tmp_path.unlink(missing_ok=True)
+                    asyncio.run(_synthesize(DEFAULT_EDGE_VOICE, "+0Hz", "+0%"))
 
             elif engine == "voicevox":
                 base_url = (config.voicevox_url or "http://127.0.0.1:50021").rstrip("/")
@@ -228,6 +256,10 @@ class TTSManager(QObject):
 
             if not self._is_current(gen) or tmp_path is None:
                 return
+            if not tmp_path.is_file() or tmp_path.stat().st_size <= 0:
+                if self._is_current(gen):
+                    self.error_occurred.emit("音声データが生成されませんでした（0バイト）。")
+                return
 
             player_kind, player_bin = player
             volume = max(0, min(100, int(config.tts_volume)))
@@ -240,14 +272,19 @@ class TTSManager(QObject):
                 cmd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
             with self._lock:
                 if self._generation != gen:
                     proc.terminate()
                     return
                 self._player_proc = proc
-            proc.wait()
+            _, err_bytes = proc.communicate()
+            if proc.returncode not in (0, -15, -9) and self._is_current(gen):
+                err_txt = (err_bytes or b"").decode("utf-8", errors="replace").strip()
+                self.error_occurred.emit(
+                    f"音声再生プレイヤー ({player_kind}) が失敗しました (code {proc.returncode}): {err_txt or '不明なエラー'}"
+                )
 
         except urllib.error.URLError as exc:
             if self._is_current(gen):

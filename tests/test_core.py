@@ -29,7 +29,14 @@ from sisters_mascot.agents.codex_adapter import CodexAdapter  # noqa: E402
 from sisters_mascot.agents.opencode_adapter import OpenCodeAdapter  # noqa: E402
 from sisters_mascot.agents.router import AGENT_IDS, AgentRouter  # noqa: E402
 from sisters_mascot.audio.stt import VoiceRecorder  # noqa: E402
-from sisters_mascot.audio.tts import clean_text_for_speech  # noqa: E402
+from sisters_mascot.audio.tts import (  # noqa: E402
+    DEFAULT_EDGE_VOICE,
+    SUPPORTED_EDGE_JA_VOICES,
+    TTSManager,
+    _normalize_pitch,
+    _resolve_edge_voice,
+    clean_text_for_speech,
+)
 from sisters_mascot.config import (  # noqa: E402
     AppConfig,
     AppItem,
@@ -501,6 +508,59 @@ class TestSpeechSanitizer(unittest.TestCase):
         truncated = clean_text_for_speech(long_text, max_chars=45)
         self.assertLessEqual(len(truncated), 45)
         self.assertTrue(truncated.endswith("。"))
+
+    def test_all_17_sisters_use_supported_edge_voices_and_fallback(self) -> None:
+        sisters = load_all_sisters()
+        for sister in sisters:
+            self.assertIn(
+                sister.voice_name,
+                SUPPORTED_EDGE_JA_VOICES,
+                f"{sister.id} has unsupported Edge-TTS voice {sister.voice_name}",
+            )
+            self.assertRegex(sister.voice_pitch, r"^[+-]\d+Hz$")
+
+        self.assertEqual(_resolve_edge_voice("ja-JP-AoiNeural"), DEFAULT_EDGE_VOICE)
+        self.assertEqual(_resolve_edge_voice("ja-JP-ShioriNeural"), DEFAULT_EDGE_VOICE)
+        self.assertEqual(_resolve_edge_voice("ja-JP-KeitaNeural"), "ja-JP-KeitaNeural")
+        self.assertEqual(_normalize_pitch("8Hz"), "+8Hz")
+        self.assertEqual(_normalize_pitch("-12Hz"), "-12Hz")
+        self.assertEqual(_normalize_pitch("bad"), "+0Hz")
+
+        # Verify TTSManager retries/falls back cleanly when given an unsupported voice
+        _ensure_qapp()
+        cfg = AppConfig(tts_engine="edge")
+        sister_bad = load_all_sisters()[0]
+        sister_bad.voice_name = "ja-JP-AoiNeural"
+        seen_calls: list[tuple[str, str, str]] = []
+
+        class FakeComm:
+            def __init__(self, text: str, voice: str, pitch: str, rate: str) -> None:
+                seen_calls.append((voice, pitch, rate))
+
+            async def save(self, out_path: str) -> None:
+                Path(out_path).write_bytes(b"ID3fake-mp3-bytes")
+
+        fake_edge_mod = type("edge_tts", (), {"Communicate": FakeComm})
+        fake_proc = type(
+            "FakeProc",
+            (),
+            {"returncode": 0, "poll": lambda self: 0, "communicate": lambda self: (b"", b""), "terminate": lambda self: None},
+        )()
+
+        tts = TTSManager()
+        errors: list[str] = []
+        tts.error_occurred.connect(errors.append)
+        with (
+            patch.dict(sys.modules, {"edge_tts": fake_edge_mod}),
+            patch("sisters_mascot.audio.tts._resolve_audio_player", return_value=("mpv", "/usr/bin/mpv")),
+            patch("sisters_mascot.audio.tts.subprocess.Popen", return_value=fake_proc),
+        ):
+            tts._generation = 1
+            tts._speaking = True
+            tts._speak_worker(1, "テスト", sister_bad, cfg, "edge")
+        self.assertEqual(errors, [])
+        self.assertEqual(len(seen_calls), 1)
+        self.assertTrue(all(v == DEFAULT_EDGE_VOICE for v, _, _ in seen_calls))
 
 
 class TestGeneratedSprites(unittest.TestCase):
