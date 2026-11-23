@@ -79,7 +79,7 @@ class AgentRouter(QObject):
         return (
             f"{sister.persona_prompt}\n\n"
             "【デスクトップ・マスコットとしての対話環境】\n"
-            "- あなたは現在、美緒ちゃん（マスター）のLinuxデスクトップ上のマスコットランチャーから話しかけられています。\n"
+            "- あなたは現在、美緒ちゃん（マスター）のデスクトップ上のマスコットランチャーから話しかけられています。\n"
             "- キャラクターの口調と温かさを保ちつつ、簡潔でわかりやすい日本語で応答してください。\n"
             "- Webページの調査・操作やGoogle Chromeでの確認を求められた場合は、利用可能な Playwright / Chrome MCP ツール（`browser_*` 等）を優先して使用してください。"
         )
@@ -91,7 +91,7 @@ class AgentRouter(QObject):
         *,
         sister: SisterProfile,
         model: str = "",
-        cwd: str = "/home/dma",
+        cwd: str = "",
         auto_approve: bool = True,
     ) -> None:
         """Start an asynchronous streaming agent turn."""
@@ -128,19 +128,20 @@ class AgentRouter(QObject):
                     f"<user_message>\n{prompt}\n</user_message>"
                 )
 
+        effective_cwd = cwd.strip() or str(Path.home())
         adapter.reset_state()
         cmd, stdin_text = adapter.build_command(
             effective_prompt,
             model=model,
             session_id=session_id,
-            cwd=cwd,
+            cwd=effective_cwd,
             system_prompt=system_prompt_arg,
             auto_approve=auto_approve,
         )
 
         worker = threading.Thread(
             target=self._run_subprocess,
-            args=(agent_id, sister.id, adapter, cmd, stdin_text, cwd),
+            args=(agent_id, sister.id, adapter, cmd, stdin_text, effective_cwd),
             daemon=True,
         )
         worker.start()
@@ -154,26 +155,30 @@ class AgentRouter(QObject):
         stdin_text: str | None,
         cwd: str,
     ) -> None:
-        resolved_cwd = cwd if Path(cwd).is_dir() else "/home/dma"
+        resolved_cwd = cwd if (cwd and Path(cwd).is_dir()) else str(Path.home())
         full_text = ""
         saw_error = False
         stderr_lines: list[str] = []
 
         self.status_changed.emit("✨ 考え中...")
 
+        popen_kwargs: dict = {
+            "cwd": resolved_cwd,
+            "stdin": subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
+        }
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
+        else:
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
         try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=resolved_cwd,
-                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                start_new_session=True,
-            )
+            proc = subprocess.Popen(cmd, **popen_kwargs)
         except OSError as exc:
             with self._lock:
                 self._running = False
@@ -254,10 +259,16 @@ class AgentRouter(QObject):
             proc = self._process
 
         if proc is not None and proc.poll() is None:
-            try:
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGTERM)
-            except OSError:
+            if os.name == "posix" and hasattr(os, "killpg"):
+                try:
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGTERM)
+                except OSError:
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+            else:
                 try:
                     proc.terminate()
                 except OSError:
@@ -265,13 +276,16 @@ class AgentRouter(QObject):
 
             def _force_kill_if_stuck() -> None:
                 if proc.poll() is None:
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    except OSError:
+                    if os.name == "posix" and hasattr(os, "killpg"):
                         try:
-                            proc.kill()
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                            return
                         except OSError:
                             pass
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
 
             threading.Timer(1.5, _force_kill_if_stuck).start()
 

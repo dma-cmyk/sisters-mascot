@@ -25,7 +25,7 @@ from PyQt6.QtGui import (
     QRadialGradient,
 )
 
-PROJECT_ROOT = Path("/home/dma/プロジェクト/sisters-mascot")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RAW_DIR = PROJECT_ROOT / "assets" / "raw"
 SPRITES_DIR = PROJECT_ROOT / "assets" / "sprites"
 APP_ICON_PATH = PROJECT_ROOT / "assets" / "app-icon.png"

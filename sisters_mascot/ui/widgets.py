@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import re
 import uuid
+from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, pyqtSignal
@@ -613,7 +614,7 @@ class LauncherItemDialog(QDialog):
 
         elif kind == "folder":
             self._path_edit = QLineEdit(self)
-            self._path_edit.setPlaceholderText("/home/dma/...")
+            self._path_edit.setPlaceholderText(f"{Path.home()}/...")
             if item is not None:
                 self._path_edit.setText(getattr(item, "path", ""))
 
@@ -653,13 +654,11 @@ class LauncherItemDialog(QDialog):
                 self._label_edit.setText(entry.name)
 
     def _browse_folder(self) -> None:
-        start_dir = (self._path_edit.text().strip() if self._path_edit else "") or "/home/dma"
+        start_dir = (self._path_edit.text().strip() if self._path_edit else "") or str(Path.home())
         chosen = QFileDialog.getExistingDirectory(self, "フォルダを選択", start_dir)
         if chosen and self._path_edit is not None:
             self._path_edit.setText(chosen)
             if not self._label_edit.text().strip():
-                from pathlib import Path
-
                 self._label_edit.setText(Path(chosen).name or chosen)
 
     def _on_accept(self) -> None:

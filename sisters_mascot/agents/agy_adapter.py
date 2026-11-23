@@ -23,14 +23,15 @@ _SKIP_PREFIXES = ("fetching", "loading", "available", "models", "usage", "#", "-
 
 
 def _default_agy_binary() -> str:
-    preferred = Path("/home/dma/.local/bin/agy")
-    if preferred.is_file():
-        return str(preferred)
-    return shutil.which("agy") or str(preferred)
+    found = shutil.which("agy")
+    if found:
+        return found
+    preferred = Path.home() / ".local" / "bin" / "agy"
+    return str(preferred)
 
 
 class AgyAdapter(BaseAgentAdapter):
-    """Adapter for `/home/dma/.local/bin/agy` stream-json mode."""
+    """Adapter for Antigravity CLI (`agy`) stream-json mode."""
 
     def __init__(self) -> None:
         self.spec = AgentSpec(
@@ -114,7 +115,7 @@ class AgyAdapter(BaseAgentAdapter):
         *,
         model: str = "",
         session_id: str | None = None,
-        cwd: str = "/home/dma",
+        cwd: str = "",
         system_prompt: str = "",
         auto_approve: bool = True,
     ) -> tuple[list[str], str | None]:

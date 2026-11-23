@@ -25,7 +25,7 @@ class CodexAdapter(BaseAgentAdapter):
         self.spec = AgentSpec(
             id="codex",
             display_name="Codex CLI",
-            binary=shutil.which("codex") or "/usr/bin/codex",
+            binary=shutil.which("codex") or "codex",
             default_models=[
                 "gpt-5.4",
                 "gpt-5.3-codex",
@@ -118,13 +118,14 @@ class CodexAdapter(BaseAgentAdapter):
         *,
         model: str = "",
         session_id: str | None = None,
-        cwd: str = "/home/dma",
+        cwd: str = "",
         system_prompt: str = "",
         auto_approve: bool = True,
     ) -> tuple[list[str], str | None]:
         _ = system_prompt
         binary = self.resolved_binary()
         cleaned_model = model.strip()
+        effective_cwd = cwd.strip() or str(Path.home())
 
         if session_id:
             cmd = [binary, "exec", "resume", "--json", "--skip-git-repo-check"]
@@ -133,7 +134,7 @@ class CodexAdapter(BaseAgentAdapter):
             cmd.extend([session_id, "-"])
             return cmd, prompt
 
-        cmd = [binary, "exec", "--json", "--skip-git-repo-check", "-C", cwd]
+        cmd = [binary, "exec", "--json", "--skip-git-repo-check", "-C", effective_cwd]
         if cleaned_model:
             cmd.extend(["-m", cleaned_model])
         if auto_approve:

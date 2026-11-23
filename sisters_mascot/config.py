@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -100,7 +101,7 @@ def _default_quick_prompts() -> list[QuickPromptItem]:
             id="wiki-note",
             label="Wikiメモを作成",
             icon="📝",
-            prompt="/home/dma/sisters-wiki/docs/memory/ に今回の作業知見をMarkdownで整理する案を作ってください（タグ5つ以上・関連記事リンク3つ以上）。",
+            prompt="~/sisters-wiki/docs/memory/ に今回の作業知見をMarkdownで整理する案を作ってください（タグ5つ以上・関連記事リンク3つ以上）。",
             send_immediately=False,
         ),
         QuickPromptItem(
@@ -114,11 +115,12 @@ def _default_quick_prompts() -> list[QuickPromptItem]:
 
 
 def _default_apps() -> list[AppItem]:
+    chrome_fallback = "/usr/bin/google-chrome-stable" if sys.platform.startswith("linux") else "chrome"
     candidates = [
-        ("chrome", "Google Chrome", "🌐", ["google-chrome-stable", "google-chrome"], "/usr/bin/google-chrome-stable"),
+        ("chrome", "Google Chrome", "🌐", ["google-chrome-stable", "google-chrome", "chromium", "chrome"], chrome_fallback),
         ("vscode", "VS Code", "💻", ["code"], "code"),
-        ("konsole", "Konsole", "🖥️", ["konsole"], "konsole"),
-        ("dolphin", "Dolphin", "📁", ["dolphin"], "dolphin"),
+        ("konsole", "Konsole", "🖥️", ["konsole", "wt", "powershell"], "konsole"),
+        ("dolphin", "Dolphin", "📁", ["dolphin", "nautilus", "thunar"], "dolphin"),
         ("firefox", "Firefox", "🦊", ["firefox"], "firefox"),
         ("antigravity", "Antigravity CLI", "✨", ["agy"], "agy"),
     ]
@@ -127,19 +129,27 @@ def _default_apps() -> list[AppItem]:
         found = next((shutil.which(b) for b in bins if shutil.which(b)), None)
         if found:
             apps.append(AppItem(id=app_id, label=label, icon=icon, command=found))
-        elif app_id in ("chrome", "vscode"):
+        elif app_id in ("chrome", "vscode") and (not fallback_cmd.startswith("/") or Path(fallback_cmd).exists()):
             apps.append(AppItem(id=app_id, label=label, icon=icon, command=fallback_cmd))
     return apps
 
 
 def _default_folders() -> list[FolderItem]:
-    return [
-        FolderItem(id="home", label="ホーム", icon="🏠", path="/home/dma"),
-        FolderItem(id="projects", label="プロジェクト", icon="💻", path="/home/dma/プロジェクト"),
-        FolderItem(id="sisters-wiki", label="Sisters Wiki", icon="📚", path="/home/dma/sisters-wiki"),
-        FolderItem(id="downloads", label="ダウンロード", icon="📥", path="/home/dma/ダウンロード"),
-        FolderItem(id="shared", label="共有", icon="🤝", path="/home/dma/共有"),
+    home = Path.home()
+    folders: list[FolderItem] = [
+        FolderItem(id="home", label="ホーム", icon="🏠", path=str(home)),
     ]
+    optional_groups = [
+        ("projects", "プロジェクト", "💻", [home / "プロジェクト", home / "Projects", home / "projects"]),
+        ("sisters-wiki", "Sisters Wiki", "📚", [home / "sisters-wiki"]),
+        ("downloads", "ダウンロード", "📥", [home / "ダウンロード", home / "Downloads"]),
+        ("shared", "共有", "🤝", [home / "共有", home / "Documents"]),
+    ]
+    for fid, label, icon, candidates in optional_groups:
+        existing = next((c for c in candidates if c.is_dir()), None)
+        if existing is not None:
+            folders.append(FolderItem(id=fid, label=label, icon=icon, path=str(existing)))
+    return folders
 
 
 def _default_bookmarks() -> list[BookmarkItem]:
@@ -157,7 +167,7 @@ class AppConfig:
     sister_id: str = "aoi"
     agent_id: str = "agy"
     models_by_agent: dict[str, str] = field(default_factory=dict)
-    working_dir: str = "/home/dma"
+    working_dir: str = field(default_factory=lambda: str(Path.home()))
     auto_approve: bool = True
     mascot_x: int | None = None
     mascot_y: int | None = None

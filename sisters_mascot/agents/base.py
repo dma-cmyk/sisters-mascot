@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -73,7 +74,7 @@ class BaseAgentAdapter:
     def resolved_binary(self) -> str:
         """Resolve the configured CLI binary via absolute path or PATH."""
         configured = self.spec.binary
-        if "/" in configured:
+        if os.sep in configured or "/" in configured:
             p = Path(configured)
             if p.is_file():
                 return str(p)
@@ -102,7 +103,7 @@ class BaseAgentAdapter:
         *,
         model: str = "",
         session_id: str | None = None,
-        cwd: str = "/home/dma",
+        cwd: str = "",
         system_prompt: str = "",
         auto_approve: bool = True,
     ) -> tuple[list[str], str | None]:

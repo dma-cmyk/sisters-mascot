@@ -1,15 +1,18 @@
 """Sisters Mascot package constants and shared paths."""
 
+import os
 from pathlib import Path
 
 APP_NAME = "Sisters Mascot"
 APP_VERSION = "0.1.0"
-PROJECT_ROOT = Path("/home/dma/プロジェクト/sisters-mascot")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ASSETS_DIR = PROJECT_ROOT / "assets"
 SPRITES_DIR = ASSETS_DIR / "sprites"
 CONFIG_DIR = Path.home() / ".config" / "sisters-mascot"
 USER_SPRITES_DIR = CONFIG_DIR / "sprites"
-WIKI_AGENTS_DIR = Path("/home/dma/sisters-wiki/docs/agents")
+WIKI_AGENTS_DIR = Path(
+    os.environ.get("SISTERS_WIKI_AGENTS_DIR") or (Path.home() / "sisters-wiki" / "docs" / "agents")
+).expanduser()
 
 __all__ = [
     "APP_NAME",

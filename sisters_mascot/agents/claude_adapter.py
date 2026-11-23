@@ -38,7 +38,7 @@ class ClaudeAdapter(BaseAgentAdapter):
         self.spec = AgentSpec(
             id="claude",
             display_name="Claude Code",
-            binary=shutil.which("claude") or "/usr/bin/claude",
+            binary=shutil.which("claude") or "claude",
             default_models=[
                 "sonnet",
                 "opus",
@@ -125,7 +125,7 @@ class ClaudeAdapter(BaseAgentAdapter):
         *,
         model: str = "",
         session_id: str | None = None,
-        cwd: str = "/home/dma",
+        cwd: str = "",
         system_prompt: str = "",
         auto_approve: bool = True,
     ) -> tuple[list[str], str | None]:

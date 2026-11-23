@@ -1141,7 +1141,7 @@ class BubblePanel(QWidget):
 
         agent_id = self._config.agent_id
         model = (self._config.models_by_agent.get(agent_id, "") or "").strip()
-        cwd = (self._config.working_dir or "/home/dma").strip() or "/home/dma"
+        cwd = (self._config.working_dir or str(Path.home())).strip() or str(Path.home())
         self._router.send_message(
             agent_id,
             prompt,
@@ -1505,7 +1505,7 @@ class BubblePanel(QWidget):
         chosen = QFileDialog.getExistingDirectory(
             self,
             "デフォルト作業フォルダを選択",
-            self._cwd_edit.text().strip() or "/home/dma",
+            self._cwd_edit.text().strip() or str(Path.home()),
         )
         if chosen:
             self._cwd_edit.setText(chosen)
@@ -1540,7 +1540,7 @@ class BubblePanel(QWidget):
     def _on_display_setting_changed(self) -> None:
         if self._updating_controls:
             return
-        self._config.working_dir = self._cwd_edit.text().strip() or "/home/dma"
+        self._config.working_dir = self._cwd_edit.text().strip() or str(Path.home())
         self._config.animation_mode = str(self._anim_mode_combo.currentData() or "rich")
         self._config.auto_approve = self._auto_approve_check.isChecked()
         self._config.always_on_top = self._always_on_top_check.isChecked()

@@ -26,7 +26,7 @@ class OpenCodeAdapter(BaseAgentAdapter):
         self.spec = AgentSpec(
             id="opencode",
             display_name="OpenCode",
-            binary=shutil.which("opencode") or "/usr/bin/opencode",
+            binary=shutil.which("opencode") or "opencode",
             default_models=[
                 "opencode/big-pickle",
                 "opencode/deepseek-v4.1-flash-free",
@@ -85,7 +85,7 @@ class OpenCodeAdapter(BaseAgentAdapter):
         *,
         model: str = "",
         session_id: str | None = None,
-        cwd: str = "/home/dma",
+        cwd: str = "",
         system_prompt: str = "",
         auto_approve: bool = True,
     ) -> tuple[list[str], str | None]:

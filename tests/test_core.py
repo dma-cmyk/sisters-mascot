@@ -21,7 +21,7 @@ from PyQt6.QtCore import QPointF, QRect, Qt  # noqa: E402
 from PyQt6.QtGui import QImage, QWheelEvent  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
-from sisters_mascot import SPRITES_DIR  # noqa: E402
+from sisters_mascot import PROJECT_ROOT as PKG_PROJECT_ROOT, SPRITES_DIR  # noqa: E402
 from sisters_mascot.agents.agy_adapter import AgyAdapter  # noqa: E402
 from sisters_mascot.agents.base import ModelChoice  # noqa: E402
 from sisters_mascot.agents.claude_adapter import ClaudeAdapter  # noqa: E402
@@ -123,6 +123,16 @@ class TestSistersLoader(unittest.TestCase):
         sister_map = get_sister_map()
         self.assertEqual(list(sister_map.keys()), EXPECTED_SISTER_IDS)
 
+    def test_portability_without_sisters_wiki(self) -> None:
+        self.assertEqual(PKG_PROJECT_ROOT, PROJECT_ROOT)
+        sisters = load_all_sisters(agents_dir=Path("/nonexistent/sisters-wiki-agents"))
+        self.assertEqual(len(sisters), 17)
+        self.assertEqual([s.order for s in sisters], list(range(1, 18)))
+        self.assertEqual([s.id for s in sisters], EXPECTED_SISTER_IDS)
+        for sister in sisters:
+            self.assertTrue(sister.display_name.strip())
+            self.assertTrue(sister.persona_prompt.strip())
+
 
 class TestConfigPersistence(unittest.TestCase):
     def test_defaults_include_playwright_and_launcher_items(self) -> None:
@@ -136,6 +146,19 @@ class TestConfigPersistence(unittest.TestCase):
         self.assertGreater(len(cfg.folders), 0)
         self.assertGreater(len(cfg.bookmarks), 0)
 
+    def test_portable_defaults_follow_home_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_home = Path(tmpdir)
+            (fake_home / "Projects").mkdir()
+            (fake_home / "Downloads").mkdir()
+            with patch("pathlib.Path.home", return_value=fake_home):
+                cfg = AppConfig()
+        self.assertEqual(cfg.working_dir, str(fake_home))
+        folder_paths = [f.path for f in cfg.folders]
+        self.assertIn(str(fake_home), folder_paths)
+        self.assertIn(str(fake_home / "Projects"), folder_paths)
+        self.assertFalse(any("/home/dma" in p for p in folder_paths))
+
     def test_save_and_load_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg_path = Path(tmpdir) / "nested" / "config.json"
@@ -144,7 +167,7 @@ class TestConfigPersistence(unittest.TestCase):
                 sister_id="nagi",
                 agent_id="claude",
                 models_by_agent={"claude": "claude-sonnet-4-6", "agy": "gemini-2.5-pro"},
-                working_dir="/home/dma/プロジェクト",
+                working_dir=str(PROJECT_ROOT),
                 auto_approve=False,
                 mascot_x=120,
                 mascot_y=240,
@@ -172,7 +195,7 @@ class TestConfigPersistence(unittest.TestCase):
                     )
                 ],
                 apps=[AppItem(id="app1", label="Konsole", icon="🖥️", command="konsole")],
-                folders=[FolderItem(id="fld1", label="Home", icon="🏠", path="/home/dma")],
+                folders=[FolderItem(id="fld1", label="Home", icon="🏠", path=str(Path.home()))],
                 bookmarks=[BookmarkItem(id="bm1", label="Example", icon="🌐", url="https://example.com")],
             )
             saved = save_config(cfg, cfg_path)
@@ -183,7 +206,7 @@ class TestConfigPersistence(unittest.TestCase):
             self.assertEqual(loaded.sister_id, "nagi")
             self.assertEqual(loaded.agent_id, "claude")
             self.assertEqual(loaded.models_by_agent, {"claude": "claude-sonnet-4-6", "agy": "gemini-2.5-pro"})
-            self.assertEqual(loaded.working_dir, "/home/dma/プロジェクト")
+            self.assertEqual(loaded.working_dir, str(PROJECT_ROOT))
             self.assertFalse(loaded.auto_approve)
             self.assertEqual(loaded.mascot_x, 120)
             self.assertEqual(loaded.mascot_y, 240)
@@ -196,7 +219,7 @@ class TestConfigPersistence(unittest.TestCase):
             self.assertEqual(len(loaded.quick_prompts), 1)
             self.assertEqual(loaded.quick_prompts[0].preferred_agent, "codex")
             self.assertEqual(loaded.apps[0].command, "konsole")
-            self.assertEqual(loaded.folders[0].path, "/home/dma")
+            self.assertEqual(loaded.folders[0].path, str(Path.home()))
             self.assertEqual(loaded.bookmarks[0].url, "https://example.com")
 
     def test_load_corrupt_or_missing_returns_defaults(self) -> None:
@@ -320,7 +343,7 @@ class TestAgentAdapters(unittest.TestCase):
             "inspect page",
             model="gpt-5.4",
             session_id=None,
-            cwd="/home/dma/プロジェクト",
+            cwd=str(PROJECT_ROOT),
             auto_approve=True,
         )
         self.assertEqual(stdin_text, "inspect page")
