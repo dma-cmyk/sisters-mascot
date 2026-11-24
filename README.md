@@ -2,6 +2,8 @@
 
 美緒ちゃんをいつも隣で優しく支える「シスターズ（17姉妹）」がデスクトップに常駐し、複数の AI CLI エージェント（`agy` / `claude` / `codex` / `opencode`）との会話、Google Chrome のブラウザ操作（Playwright MCP）、音声対話（Edge-TTS / VOICEVOX / PipeWire 音声入力）、アプリ・フォルダ・Webブックマークのランチャーをひとつにまとめた **軽量 PyQt6 製デスクトップマスコットアプリ** です。
 
+![Sisters Mascot 実行画面スクリーンショット](docs/images/app-screenshot.png)
+
 ---
 
 ## ✨ 概要・アーキテクチャ
@@ -14,9 +16,15 @@
 
 ## 🎨 立ち絵（スプライト）とカスタム設定
 
-### 全17姉妹 透過PNG立ち絵を標準収録
-- **全17姉妹の立ち絵を同梱**:
-  長女・碧（`aoi`）から十七女・焔（`homura`）まで、全17姉妹それぞれのキャラクター特徴を反映した **透過済み PNG 立ち絵（最大高さ 540px）** を標準収録しています。ちびクレストカード表示は廃止し、全員が美しいアニメ立ち絵でデスクトップに常駐します。
+### 全17姉妹 × 5状態（計85枚）透過PNG立ち絵を標準収録
+- **全17姉妹・全5状態の立ち絵を同梱**:
+  長女・碧（`aoi`）から十七女・焔（`homura`）まで、全17姉妹それぞれの最新デザインによる **340×600px RGBA 透過 PNG 立ち絵（`idle` / `happy` / `thinking` / `talking` / `dragged` の5状態・計85枚）** を標準収録しています。
+- **自然な切り替え＆快適な操作性**:
+  状態切り替え時のキャラクター縮尺差や水平・足元基準を自動補正して位置ズレ・大きさの違和感を抑え、透過シルエットに基づいた当たり判定により透明余白での誤クリックを防ぎつつ快適にクリック・ドラッグできます。
+
+![全17姉妹キャラクター一覧](docs/images/sisters-gallery.png)
+
+![5状態アニメーション＆表情バリエーション](docs/images/states-showcase.png)
 
 ### カスタム立ち絵の追加・差し替え方法
 美緒ちゃんお気に入りの立ち絵（PNG / WebP / JPG）を簡単に設定できます。
@@ -160,14 +168,21 @@ python3 -m venv .venv
 sisters-mascot/
 ├── assets/
 │   ├── app-icon.png
-│   └── sprites/<sister_id>/idle.png
+│   └── sprites/<sister_id>/
+│       ├── idle.png
+│       ├── happy.png
+│       ├── thinking.png
+│       ├── talking.png
+│       └── dragged.png
+├── docs/
+│   └── images/          # README掲載スクリーンショット・17姉妹一覧画像
 ├── scripts/
 │   └── remove_bg.py
 ├── sisters_mascot/
 │   ├── agents/          # agy / claude / codex / opencode アダプタとルーター
 │   ├── audio/           # Edge-TTS / VOICEVOX / PipeWire録音・STT
 │   ├── launcher/        # .desktop 検出とアプリ/フォルダ/URL起動
-│   ├── sprites/         # 高DPI透過PNG立ち絵レンダラー
+│   ├── sprites/         # 状態別アライメント補正付き透過PNGレンダラー
 │   ├── ui/              # MascotWindow / BubblePanel / Toast / Tray
 │   ├── config.py        # ~/.config/sisters-mascot/config.json 管理
 │   ├── sisters_loader.py

@@ -60,7 +60,7 @@ from sisters_mascot.sisters_loader import (  # noqa: E402
     has_custom_or_generated_sprite,
     load_all_sisters,
 )
-from sisters_mascot.sprites.renderer import render_sister_pixmap  # noqa: E402
+from sisters_mascot.sprites.renderer import render_sister_pixmap, render_sister_sprite  # noqa: E402
 from sisters_mascot.ui.bubble_panel import BubblePanel  # noqa: E402
 from sisters_mascot.ui.mascot_window import MascotWindow  # noqa: E402
 from sisters_mascot.ui.platform import supports_window_positioning  # noqa: E402
@@ -87,6 +87,7 @@ EXPECTED_SISTER_IDS = [
 ]
 
 ILLUSTRATED_SISTER_IDS = list(EXPECTED_SISTER_IDS)
+SPRITE_STATES = ("idle", "happy", "thinking", "talking", "dragged")
 
 
 _QAPP: QApplication | None = None
@@ -610,43 +611,52 @@ class TestGeneratedSprites(unittest.TestCase):
     def test_all_17_sprites_are_clean_rgba_with_transparent_corners(self) -> None:
         self.assertEqual(len(ILLUSTRATED_SISTER_IDS), 17)
         for sister_id in ILLUSTRATED_SISTER_IDS:
-            sprite_path = SPRITES_DIR / sister_id / "idle.png"
-            self.assertTrue(sprite_path.is_file(), f"Missing generated sprite: {sprite_path}")
+            for state in SPRITE_STATES:
+                sprite_path = SPRITES_DIR / sister_id / f"{state}.png"
+                self.assertTrue(sprite_path.is_file(), f"Missing sprite: {sprite_path}")
 
-            img = QImage(str(sprite_path))
-            self.assertFalse(img.isNull(), f"Failed to load sprite: {sprite_path}")
-            self.assertTrue(img.hasAlphaChannel(), f"Sprite lacks alpha channel: {sprite_path}")
-            self.assertLessEqual(img.height(), 540, f"Sprite taller than 540px: {sprite_path}")
-            self.assertGreater(img.width(), 80)
+                img = QImage(str(sprite_path))
+                self.assertFalse(img.isNull(), f"Failed to load sprite: {sprite_path}")
+                self.assertTrue(img.hasAlphaChannel(), f"Sprite lacks alpha channel: {sprite_path}")
+                self.assertEqual(img.width(), 340, f"Unexpected width for {sprite_path}: {img.width()}")
+                self.assertLessEqual(img.height(), 600, f"Sprite taller than 600px: {sprite_path}")
+                self.assertEqual(img.height(), 600, f"Unexpected height for {sprite_path}: {img.height()}")
 
-            rgba = img.convertToFormat(QImage.Format.Format_RGBA8888)
-            w, h = rgba.width(), rgba.height()
+                rgba = img.convertToFormat(QImage.Format.Format_RGBA8888)
+                w, h = rgba.width(), rgba.height()
 
-            # All 4 corners must be fully transparent
-            for cx, cy in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)):
-                self.assertEqual(
-                    rgba.pixelColor(cx, cy).alpha(),
-                    0,
-                    f"{sister_id} corner ({cx},{cy}) is not transparent",
-                )
+                # All 4 corners must be fully transparent
+                for cx, cy in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)):
+                    self.assertEqual(
+                        rgba.pixelColor(cx, cy).alpha(),
+                        0,
+                        f"{sister_id}/{state} corner ({cx},{cy}) is not transparent",
+                    )
 
-            # Center region must contain opaque subject pixels
-            opaque_center = 0
-            for y in range(h // 3, (2 * h) // 3, 4):
-                for x in range(w // 3, (2 * w) // 3, 4):
-                    if rgba.pixelColor(x, y).alpha() >= 220:
-                        opaque_center += 1
-            self.assertGreater(opaque_center, 25, f"{sister_id} center lacks opaque pixels")
+                # Center region must contain opaque subject pixels
+                opaque_center = 0
+                for y in range(h // 3, (2 * h) // 3, 4):
+                    for x in range(w // 4, (3 * w) // 4, 4):
+                        if rgba.pixelColor(x, y).alpha() >= 220:
+                            opaque_center += 1
+                self.assertGreater(opaque_center, 25, f"{sister_id}/{state} center lacks opaque pixels")
 
     def test_all_17_sisters_render_standing_sprites(self) -> None:
         _ensure_qapp()
         sister_map = get_sister_map()
         for sid in EXPECTED_SISTER_IDS:
             self.assertTrue(has_custom_or_generated_sprite(sid), f"{sid} should have bundled sprite")
-            pm = render_sister_pixmap(sister_map[sid], "idle", 210, 1.0)
-            self.assertFalse(pm.isNull(), f"Sprite render failed for {sid}")
-            self.assertGreater(pm.width(), 100)
-            self.assertGreater(pm.height(), 200)
+            for state in SPRITE_STATES:
+                pm = render_sister_pixmap(sister_map[sid], state, 210, 1.0)
+                self.assertFalse(pm.isNull(), f"Sprite render failed for {sid}/{state}")
+                self.assertGreater(pm.width(), 100)
+                self.assertGreater(pm.height(), 200)
+                rendered = render_sister_sprite(sister_map[sid], state, 210, 1.0)
+                aspect = rendered.logical_h / max(1, rendered.logical_w)
+                self.assertAlmostEqual(aspect, 600.0 / 340.0, delta=0.02, msg=f"Aspect mismatch {sid}/{state}")
+                self.assertIsNotNone(rendered.hit_image)
+                if sid == "ritsu" and state == "dragged":
+                    self.assertGreater(rendered.logical_w, rendered.base_w)
 
 
 class TestHeadlessUI(unittest.TestCase):
@@ -1152,6 +1162,177 @@ class TestOpenCodeBinaryResolution(unittest.TestCase):
                 ["opencode/beam-free", "opencode/big-pickle", "surplus/claude-sonnet-5"],
             )
             self.assertEqual(mock_run.call_args[0][0], [str(exe), "models"])
+
+
+class TestSpriteAlignmentAndHitTesting(unittest.TestCase):
+    """All 17x5 sprite states keep stable geometry, zero clipping, and accurate hit-testing."""
+
+    def test_all_sisters_states_keep_window_size_and_avoid_clipping(self) -> None:
+        app = _ensure_qapp()
+        sisters = load_all_sisters()
+        for target_width in (100, 210, 340):
+            cfg = AppConfig(tts_engine="off", mascot_width=target_width, animation_mode="off")
+            mascot = MascotWindow(sisters, sisters[0], cfg)
+            try:
+                mascot.show()
+                app.processEvents()
+                expected_size = mascot.size()
+
+                for sister in sisters:
+                    mascot._temp_sprite_state = "happy"
+                    mascot.set_sister(sister)
+                    self.assertIsNone(mascot._temp_sprite_state)
+                    self.assertFalse(mascot._temp_state_timer.isActive())
+
+                    for st in SPRITE_STATES:
+                        mascot._temp_sprite_state = st if st in ("happy", "dragged") else None
+                        if st == "thinking":
+                            mascot.set_activity("thinking")
+                        elif st == "talking":
+                            mascot.set_activity("speaking")
+                        else:
+                            mascot.set_activity("idle")
+                        mascot._rebuild_geometry_and_pixmap()
+                        self.assertEqual(
+                            mascot.size(),
+                            expected_size,
+                            f"Window size changed on {sister.id}/{st} at width={target_width}",
+                        )
+
+                        ox, oy = mascot._sprite_draw_origin()
+                        cr = mascot._sprite_content_rect
+                        self.assertGreaterEqual(
+                            ox + cr.left(), 0.0, f"Left clip on {sister.id}/{st} at width={target_width}"
+                        )
+                        self.assertLessEqual(
+                            ox + cr.right(),
+                            float(mascot.width()),
+                            f"Right clip on {sister.id}/{st} at width={target_width}",
+                        )
+                        self.assertGreaterEqual(
+                            oy + cr.top(), 0.0, f"Top clip on {sister.id}/{st} at width={target_width}"
+                        )
+                        self.assertLessEqual(
+                            oy + cr.bottom(),
+                            float(mascot.height()),
+                            f"Bottom clip on {sister.id}/{st} at width={target_width}",
+                        )
+            finally:
+                mascot.close()
+                app.processEvents()
+
+    def test_hit_testing_and_drag_interaction(self) -> None:
+        from PyQt6.QtGui import QContextMenuEvent, QMouseEvent
+
+        app = _ensure_qapp()
+        sisters = load_all_sisters()
+        yui = next(s for s in sisters if s.id == "yui")
+        cfg = AppConfig(tts_engine="off", mascot_width=340, animation_mode="off")
+        mascot = MascotWindow(sisters, yui, cfg)
+        panel = BubblePanel(sisters, yui, cfg, AgentRouter(), VoiceRecorder())
+        toggles: list[bool] = []
+        mascot.toggle_panel_requested.connect(lambda: toggles.append(True))
+
+        try:
+            mascot.move(480, 260)
+            mascot.show()
+            panel.show_for_mascot(mascot.frameGeometry())
+            app.processEvents()
+            panel_pos_before = panel.pos()
+
+            # Far transparent horizontal margin must not trigger click or context menu
+            margin_pt = QPointF(10.0, float(mascot.height() // 2))
+            self.assertFalse(mascot._is_point_on_mascot(margin_pt))
+            press_margin = QMouseEvent(
+                QEvent.Type.MouseButtonPress,
+                margin_pt,
+                QPointF(mascot.mapToGlobal(margin_pt.toPoint())),
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+            mascot.mousePressEvent(press_margin)
+            self.assertFalse(press_margin.isAccepted())
+            self.assertFalse(mascot._pressing)
+            self.assertEqual(toggles, [])
+
+            ctx_margin = QContextMenuEvent(
+                QContextMenuEvent.Reason.Mouse,
+                margin_pt.toPoint(),
+                mascot.mapToGlobal(margin_pt.toPoint()),
+            )
+            mascot.contextMenuEvent(ctx_margin)
+            self.assertFalse(ctx_margin.isAccepted())
+
+            # Center character click must trigger happy bounce & toggle_panel_requested
+            center_pt = QPointF(float(mascot.width() // 2), float(mascot.height() // 2))
+            self.assertTrue(mascot._is_point_on_mascot(center_pt))
+            g_center = QPointF(mascot.mapToGlobal(center_pt.toPoint()))
+            mascot.mousePressEvent(
+                QMouseEvent(
+                    QEvent.Type.MouseButtonPress,
+                    center_pt,
+                    g_center,
+                    Qt.MouseButton.LeftButton,
+                    Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+            )
+            self.assertTrue(mascot._pressing)
+            mascot.mouseReleaseEvent(
+                QMouseEvent(
+                    QEvent.Type.MouseButtonRelease,
+                    center_pt,
+                    g_center,
+                    Qt.MouseButton.LeftButton,
+                    Qt.MouseButton.NoButton,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+            )
+            self.assertEqual(mascot._temp_sprite_state, "happy")
+            self.assertEqual(len(toggles), 1)
+
+            # Dragging from character center switches to dragged state, moves mascot, leaves panel alone
+            start_pos = mascot.pos()
+            drag_end_global = g_center + QPointF(40.0, 25.0)
+            mascot.mousePressEvent(
+                QMouseEvent(
+                    QEvent.Type.MouseButtonPress,
+                    center_pt,
+                    g_center,
+                    Qt.MouseButton.LeftButton,
+                    Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+            )
+            mascot.mouseMoveEvent(
+                QMouseEvent(
+                    QEvent.Type.MouseMove,
+                    center_pt + QPointF(40.0, 25.0),
+                    drag_end_global,
+                    Qt.MouseButton.NoButton,
+                    Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+            )
+            self.assertTrue(mascot._dragging)
+            self.assertEqual(mascot._temp_sprite_state, "dragged")
+            mascot.mouseReleaseEvent(
+                QMouseEvent(
+                    QEvent.Type.MouseButtonRelease,
+                    center_pt + QPointF(40.0, 25.0),
+                    drag_end_global,
+                    Qt.MouseButton.LeftButton,
+                    Qt.MouseButton.NoButton,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+            )
+            self.assertNotEqual(mascot.pos(), start_pos)
+            self.assertEqual(panel.pos(), panel_pos_before)
+        finally:
+            panel.close()
+            mascot.close()
+            app.processEvents()
 
 
 if __name__ == "__main__":

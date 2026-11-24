@@ -15,7 +15,9 @@ from PyQt6.QtGui import (
     QColor,
     QCursor,
     QFont,
+    QFontMetrics,
     QGuiApplication,
+    QImage,
     QImageReader,
     QLinearGradient,
     QMovie,
@@ -42,7 +44,11 @@ from sisters_mascot.config import (
     AppConfig,
 )
 from sisters_mascot.sisters_loader import SisterProfile, has_custom_or_generated_sprite
-from sisters_mascot.sprites.renderer import find_animated_sprite_path, render_sister_pixmap
+from sisters_mascot.sprites.renderer import (
+    find_animated_sprite_path,
+    render_sister_sprite,
+)
+from sisters_mascot.ui.platform import supports_window_positioning
 from sisters_mascot.ui.widgets import ToastBubble
 
 _PAD_X = 28
@@ -229,7 +235,14 @@ class MascotWindow(QWidget):
         # Sprite / animated GIF state
         self._pixmap = QPixmap()
         self._sprite_w: int = self._config.mascot_width
-        self._sprite_h: int = round(self._config.mascot_width * 1.24)
+        self._sprite_h: int = round(self._config.mascot_width * 1.76)
+        self._base_w: int = self._sprite_w
+        self._base_h: int = self._sprite_h
+        self._sprite_offset_x: float = 0.0
+        self._sprite_offset_y: float = 0.0
+        self._sprite_content_rect = QRectF()
+        self._hit_image: QImage | None = None
+        self._suppress_anchor_reposition: bool = False
         self._movie: QMovie | None = None
         self._movie_path: Path | None = None
 
@@ -498,9 +511,17 @@ class MascotWindow(QWidget):
             if raw_size.isValid() and raw_size.width() > 0:
                 aspect = min(2.2, raw_size.height() / raw_size.width())
             else:
-                aspect = 1.24
+                aspect = 1.76
             self._sprite_w = target_width
             self._sprite_h = max(64, int(round(target_width * aspect)))
+            self._base_w = self._sprite_w
+            self._base_h = self._sprite_h
+            self._sprite_offset_x = 0.0
+            self._sprite_offset_y = 0.0
+            self._sprite_content_rect = QRectF(
+                0.0, 0.0, float(self._sprite_w), float(self._sprite_h)
+            )
+            self._hit_image = None
 
             if self._movie is None or self._movie_path != gif_path:
                 self._stop_movie()
@@ -517,20 +538,37 @@ class MascotWindow(QWidget):
             self._pixmap = QPixmap()
         else:
             self._stop_movie()
-            self._pixmap = render_sister_pixmap(
+            rendered = render_sister_sprite(
                 self._sister,
                 state,
                 target_width,
                 dpr,
             )
-            dpr_val = max(1.0, self._pixmap.devicePixelRatio())
-            self._sprite_w = int(round(self._pixmap.width() / dpr_val))
-            self._sprite_h = int(round(self._pixmap.height() / dpr_val))
+            self._pixmap = rendered.pixmap
+            self._sprite_w = rendered.logical_w
+            self._sprite_h = rendered.logical_h
+            self._base_w = rendered.base_w
+            self._base_h = rendered.base_h
+            self._sprite_offset_x = rendered.offset_x
+            self._sprite_offset_y = rendered.offset_y
+            self._sprite_content_rect = rendered.content_rect
+            self._hit_image = rendered.hit_image
 
-        win_w = max(196, self._sprite_w + _PAD_X * 2)
-        win_h = self._sprite_h + _PAD_TOP + _PAD_BOTTOM
+        pad_x = max(_PAD_X, int(math.ceil(self._base_w * 0.24)))
+        win_w = max(196, self._base_w + pad_x * 2)
+        win_h = self._base_h + _PAD_TOP + _PAD_BOTTOM
         if self.size().width() != win_w or self.size().height() != win_h:
+            old_geo = self.frameGeometry()
+            was_shown = self.isVisible()
             self.setFixedSize(win_w, win_h)
+            if (
+                was_shown
+                and supports_window_positioning()
+                and not self._suppress_anchor_reposition
+            ):
+                new_x = old_geo.center().x() - win_w // 2
+                new_y = old_geo.bottom() - win_h + 1
+                self.move(self._clamp_pos_to_screen(QPoint(new_x, new_y)))
         self._layout_minibar()
         self.update()
 
@@ -572,6 +610,8 @@ class MascotWindow(QWidget):
 
     def set_sister(self, sister: SisterProfile) -> None:
         self._sister = sister
+        self._temp_state_timer.stop()
+        self._temp_sprite_state = None
         self._update_minibar_text()
         self._rebuild_geometry_and_pixmap()
         if self._animation_mode == "off":
@@ -606,7 +646,11 @@ class MascotWindow(QWidget):
         clamped_w = _clamp_mascot_width(width)
         old_bottom_right = self.frameGeometry().bottomRight()
         self._config.mascot_width = clamped_w
-        self._rebuild_geometry_and_pixmap()
+        self._suppress_anchor_reposition = True
+        try:
+            self._rebuild_geometry_and_pixmap()
+        finally:
+            self._suppress_anchor_reposition = False
         new_pos = QPoint(
             old_bottom_right.x() - self.width() + 1,
             old_bottom_right.y() - self.height() + 1,
@@ -785,9 +829,9 @@ class MascotWindow(QWidget):
             return
         accent, secondary = self._sister_colors()
         cx = self.width() * 0.5
-        cy = _PAD_TOP + self._sprite_h * 0.42
-        spread_x = max(24.0, self._sprite_w * 0.34)
-        spread_y = max(20.0, self._sprite_h * 0.25)
+        cy = _PAD_TOP + self._base_h * 0.42
+        spread_x = max(24.0, self._base_w * 0.34)
+        spread_y = max(20.0, self._base_h * 0.25)
 
         for idx in range(count):
             angle = -math.pi * 0.5 + random.uniform(-1.15, 1.15)
@@ -819,18 +863,18 @@ class MascotWindow(QWidget):
         if self._activity_kind == "speaking":
             color = QColor("#a78bfa")
             speed = 46.0
-            max_r = max(self._sprite_w, self._sprite_h) * 0.62
-            start_r = max(22.0, self._sprite_w * 0.24)
+            max_r = max(self._base_w, self._base_h) * 0.62
+            start_r = max(22.0, self._base_w * 0.24)
         elif self._activity_kind == "listening":
             color = QColor("#fb7185")
             speed = 54.0
-            max_r = max(self._sprite_w, self._sprite_h) * 0.66
-            start_r = max(20.0, self._sprite_w * 0.22)
+            max_r = max(self._base_w, self._base_h) * 0.66
+            start_r = max(20.0, self._base_w * 0.22)
         else:
             color = QColor(accent)
             speed = 42.0
-            max_r = max(self._sprite_w, self._sprite_h) * 0.58
-            start_r = max(20.0, self._sprite_w * 0.22)
+            max_r = max(self._base_w, self._base_h) * 0.58
+            start_r = max(20.0, self._base_w * 0.22)
 
         self._ripples.append(
             _Ripple(
@@ -922,7 +966,7 @@ class MascotWindow(QWidget):
         if self._hovered and not self._dragging:
             if self._animation_mode == "rich":
                 local_x = self.mapFromGlobal(QCursor.pos()).x()
-                half_w = max(1.0, self._sprite_w * 0.5)
+                half_w = max(1.0, self._base_w * 0.5)
                 rel = max(-1.0, min(1.0, (local_x - self.width() * 0.5) / half_w))
                 target_lean = rel * 3.5
                 target_zoom = 1.03
@@ -1031,8 +1075,8 @@ class MascotWindow(QWidget):
         )
 
         pivot_x = self.width() * 0.5
-        pivot_y = float(_PAD_TOP + self._sprite_h) + float_y + self._bounce_y + self._quirk_hop_y + act_bounce
-        aura_cy = pivot_y - self._sprite_h * 0.5
+        pivot_y = float(_PAD_TOP + self._base_h) + float_y + self._bounce_y + self._quirk_hop_y + act_bounce
+        aura_cy = pivot_y - self._base_h * 0.5
 
         # Glowing aura behind sprite when active or hovered
         if self._activity_kind != "idle" or self._hovered:
@@ -1045,7 +1089,7 @@ class MascotWindow(QWidget):
             elif self._activity_kind == "speaking":
                 glow_color = QColor("#a78bfa")
 
-            radius = max(self._sprite_w, self._sprite_h) * 0.56
+            radius = max(self._base_w, self._base_h) * 0.56
             aura = QRadialGradient(QPointF(pivot_x, aura_cy), radius)
             c0 = QColor(glow_color)
             c0.setAlpha(int((96 if self._activity_kind != "idle" else 54) * pulse))
@@ -1081,8 +1125,8 @@ class MascotWindow(QWidget):
             painter.scale(total_sx, total_sy)
 
         target_rect = QRectF(
-            -self._sprite_w * 0.5,
-            -float(self._sprite_h),
+            -self._sprite_w * 0.5 + self._sprite_offset_x,
+            -float(self._sprite_h) + self._sprite_offset_y,
             float(self._sprite_w),
             float(self._sprite_h),
         )
@@ -1123,14 +1167,18 @@ class MascotWindow(QWidget):
             pill_accent = QColor("#38bdf8") if self._size_pill_text else accent
             self._paint_top_pill(painter, top_pill_text, pill_accent)
 
+    def _top_pill_rect(self, text: str) -> QRectF:
+        font = QFont("Noto Sans JP", 9, QFont.Weight.Bold)
+        text_w = QFontMetrics(font).horizontalAdvance(text) if text else 0
+        pill_w = min(float(self.width() - 8), float(text_w + 26))
+        return QRectF((self.width() - pill_w) * 0.5, 4.0, pill_w, 24.0)
+
     def _paint_top_pill(self, painter: QPainter, text: str, accent: QColor) -> None:
         font = QFont("Noto Sans JP", 9, QFont.Weight.Bold)
         painter.setFont(font)
         fm = painter.fontMetrics()
-        text_w = fm.horizontalAdvance(text)
-        pill_w = min(float(self.width() - 8), float(text_w + 26))
-        pill_h = 24.0
-        pill_rect = QRectF((self.width() - pill_w) * 0.5, 4.0, pill_w, pill_h)
+        pill_rect = self._top_pill_rect(text)
+        pill_w = pill_rect.width()
 
         bg_grad = QLinearGradient(pill_rect.topLeft(), pill_rect.bottomRight())
         bg_grad.setColorAt(0.0, QColor(15, 20, 38, 234))
@@ -1145,7 +1193,7 @@ class MascotWindow(QWidget):
 
     def _paint_ambient_motes(self, painter: QPainter, accent: QColor, secondary: QColor) -> None:
         count = 5 if self._animation_mode == "rich" else 2
-        base_x = (self.width() - self._sprite_w) * 0.5
+        base_x = (self.width() - self._base_w) * 0.5
         base_y = float(_PAD_TOP)
         for idx, mote in enumerate(self._ambient_motes[:count]):
             twinkle = 0.25 + 0.75 * (0.5 + 0.5 * math.sin(self._anim_phase * mote.twinkle_speed + mote.phase))
@@ -1155,8 +1203,8 @@ class MascotWindow(QWidget):
                 continue
             col = QColor(secondary if idx % 2 == 0 else accent).lighter(135)
             col.setAlpha(alpha)
-            mx = base_x + mote.x_norm * self._sprite_w + math.sin(self._anim_phase + mote.phase) * 5.0
-            my = base_y + mote.y_norm * self._sprite_h
+            mx = base_x + mote.x_norm * self._base_w + math.sin(self._anim_phase + mote.phase) * 5.0
+            my = base_y + mote.y_norm * self._base_h
             _draw_four_point_star(painter, QPointF(mx, my), mote.size, col, self._anim_phase * 12.0)
 
     def _paint_thinking_orbit_motes(
@@ -1167,19 +1215,19 @@ class MascotWindow(QWidget):
         accent: QColor,
         secondary: QColor,
     ) -> None:
-        rx = self._sprite_w * 0.48
-        ry = self._sprite_h * 0.34
+        rx = self._base_w * 0.48
+        ry = self._base_h * 0.34
         for idx in range(4):
             theta = self._anim_phase * 1.1 + idx * (math.tau / 4.0)
             mx = cx + math.cos(theta) * rx
-            my = cy + math.sin(theta) * ry - self._sprite_h * 0.08
+            my = cy + math.sin(theta) * ry - self._base_h * 0.08
             twinkle = 0.55 + 0.45 * math.sin(self._anim_phase * 2.4 + idx * 1.4)
             col = QColor(secondary if idx % 2 else accent).lighter(140)
             col.setAlpha(int(220 * twinkle))
             _draw_four_point_star(painter, QPointF(mx, my), 4.5 + 1.8 * twinkle, col, theta * 18.0)
 
     def _paint_tool_halos(self, painter: QPainter, cx: float, cy: float) -> None:
-        r_outer = max(self._sprite_w, self._sprite_h) * 0.48
+        r_outer = max(self._base_w, self._base_h) * 0.48
         r_inner = r_outer * 0.84
         deg1 = (self._anim_phase * 38.0) % 360.0
         deg2 = (-self._anim_phase * 52.0) % 360.0
@@ -1207,13 +1255,72 @@ class MascotWindow(QWidget):
         painter.restore()
 
     def _paint_tool_motes(self, painter: QPainter, cx: float, cy: float) -> None:
-        radius = max(self._sprite_w, self._sprite_h) * 0.48
+        radius = max(self._base_w, self._base_h) * 0.48
         for idx in range(3):
             theta = self._anim_phase * 1.7 + idx * (math.tau / 3.0)
             mx = cx + math.cos(theta) * radius
             my = cy + math.sin(theta) * radius
             col = QColor(103, 232, 249, 220)
             _draw_four_point_star(painter, QPointF(mx, my), 5.0, col, theta * 25.0)
+
+    def _sprite_draw_origin(self) -> tuple[float, float]:
+        ox = self.width() * 0.5 - self._sprite_w * 0.5 + self._sprite_offset_x
+        oy = float(_PAD_TOP + self._base_h) - float(self._sprite_h) + self._sprite_offset_y
+        return ox, oy
+
+    def _is_point_on_mascot(self, pos: QPointF) -> bool:
+        """Hit-test against the visible mascot silhouette (plus generous margin) and controls."""
+        if self._minibar.isVisible() and self._minibar.geometry().contains(pos.toPoint()):
+            return True
+
+        top_pill_text = self._size_pill_text or (
+            self._status_text if self._activity_kind != "idle" else ""
+        )
+        if top_pill_text and self._top_pill_rect(top_pill_text).adjusted(-4, -4, 4, 4).contains(pos):
+            return True
+
+        ox, oy = self._sprite_draw_origin()
+        sx = pos.x() - ox
+        sy = pos.y() - oy
+        margin = 14.0
+        content = self._sprite_content_rect
+        if content.isNull() or content.isEmpty():
+            content = QRectF(0.0, 0.0, float(self._sprite_w), float(self._sprite_h))
+
+        if not content.adjusted(-margin, -margin, margin, margin).contains(sx, sy):
+            return False
+
+        if self._movie is not None or self._hit_image is None or self._hit_image.isNull():
+            return True
+
+        # Treat narrow central torso/leg-gap core as solid so clicks between ankles/arms still register.
+        core_half_w = min(content.width() * 0.24, self._base_w * 0.16)
+        core_cx = content.center().x()
+        if (
+            abs(sx - core_cx) <= core_half_w
+            and (content.top() + content.height() * 0.10) <= sy <= (content.bottom() - content.height() * 0.06)
+        ):
+            return True
+
+        hw = self._hit_image.width()
+        hh = self._hit_image.height()
+        cx = max(0, min(hw - 1, int(round(sx))))
+        cy = max(0, min(hh - 1, int(round(sy))))
+        if self._hit_image.pixelColor(cx, cy).alpha() > 20:
+            return True
+
+        ix0 = max(0, int(math.floor(sx - margin)))
+        ix1 = min(hw - 1, int(math.ceil(sx + margin)))
+        iy0 = max(0, int(math.floor(sy - margin)))
+        iy1 = min(hh - 1, int(math.ceil(sy + margin)))
+        r2 = margin * margin
+        for py in range(iy0, iy1 + 1, 3):
+            dy = py - sy
+            for px in range(ix0, ix1 + 1, 3):
+                dx = px - sx
+                if dx * dx + dy * dy <= r2 and self._hit_image.pixelColor(px, py).alpha() > 20:
+                    return True
+        return False
 
     # Hover & Wheel Resize handling
     def enterEvent(self, event) -> None:  # noqa: ANN001
@@ -1234,6 +1341,7 @@ class MascotWindow(QWidget):
         if not self.rect().contains(local_pos) and not self._pressing:
             self._hovered = False
             self._minibar.hide()
+            self.setCursor(Qt.CursorShape.ArrowCursor)
             self.update()
 
     def wheelEvent(self, event) -> None:  # noqa: ANN001
@@ -1256,6 +1364,9 @@ class MascotWindow(QWidget):
     # Mouse & Drag (XCB + Wayland fallback)
     def mousePressEvent(self, event) -> None:  # noqa: ANN001
         if event.button() == Qt.MouseButton.LeftButton:
+            if not self._is_point_on_mascot(event.position()):
+                event.ignore()
+                return
             self._pressing = True
             self._dragging = False
             self._drag_toast_shown = False
@@ -1268,6 +1379,10 @@ class MascotWindow(QWidget):
 
     def mouseMoveEvent(self, event) -> None:  # noqa: ANN001
         if not self._pressing or not (event.buttons() & Qt.MouseButton.LeftButton):
+            if self._is_point_on_mascot(event.position()):
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
             super().mouseMoveEvent(event)
             return
 
@@ -1275,6 +1390,7 @@ class MascotWindow(QWidget):
         delta = global_pos - self._press_global_pos
         if not self._dragging and delta.manhattanLength() > 6:
             self._dragging = True
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
             self._temp_sprite_state = "dragged"
             self._temp_state_timer.stop()
             self._rebuild_geometry_and_pixmap()
@@ -1295,6 +1411,7 @@ class MascotWindow(QWidget):
                 if handle is not None:
                     self._pressing = False
                     self._dragging = False
+                    self.setCursor(Qt.CursorShape.ArrowCursor)
                     self._temp_state_timer.start(900)
                     handle.startSystemMove()
                     event.accept()
@@ -1319,6 +1436,11 @@ class MascotWindow(QWidget):
             self._pressing = False
             self._dragging = False
             self._target_tilt = 0.0
+            self.setCursor(
+                Qt.CursorShape.OpenHandCursor
+                if self._is_point_on_mascot(event.position())
+                else Qt.CursorShape.ArrowCursor
+            )
 
             if was_dragging:
                 self._pos_save_timer.stop()
@@ -1356,6 +1478,9 @@ class MascotWindow(QWidget):
 
     # Context menu
     def contextMenuEvent(self, event) -> None:  # noqa: ANN001
+        if not self._is_point_on_mascot(QPointF(event.pos())):
+            event.ignore()
+            return
         menu = QMenu(self)
         menu.setStyleSheet(_MENU_QSS)
 
