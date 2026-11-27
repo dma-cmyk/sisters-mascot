@@ -29,6 +29,111 @@ _MD_DECOR_RE = re.compile(r"(^|\n)\s{0,3}(?:#{1,6}\s*|>\s*|[-*+]\s+|\d+\.\s+)")
 SUPPORTED_EDGE_JA_VOICES: tuple[str, ...] = ("ja-JP-NanamiNeural", "ja-JP-KeitaNeural")
 DEFAULT_EDGE_VOICE = "ja-JP-NanamiNeural"
 
+_ROMAN_SISTER_PAREN_RE = re.compile(
+    r"[（(]\s*(?:Aoi|Ruri|Kohaku|Sumire|Akari|Shion|Hiiro|Mashiro|Kokonoe|"
+    r"Towa|Yui|Aya|Ritsu|Nagi|Kanon|Akane|Homura)\s*[）)]",
+    re.IGNORECASE,
+)
+_RANK_DOT_RE = re.compile(
+    r"(十七女|十六女|十五女|十四女|十三女|十二女|十一女|十女|九女|八女|"
+    r"七女|六女|五女|四女|三女|次女|長女|秘書)[・·]+"
+)
+_RANK_READINGS: tuple[tuple[str, str], ...] = (
+    ("十七女", "じゅうななじょ"),
+    ("十六女", "じゅうろくじょ"),
+    ("十五女", "じゅうごじょ"),
+    ("十四女", "じゅうよんじょ"),
+    ("十三女", "じゅうさんじょ"),
+    ("十二女", "じゅうにじょ"),
+    ("十一女", "じゅういちじょ"),
+    ("十女", "じゅうじょ"),
+    ("九女", "きゅうじょ"),
+    ("八女", "はちじょ"),
+    ("七女", "ななじょ"),
+    ("六女", "ろくじょ"),
+    ("五女", "ごじょ"),
+    ("四女", "よんじょ"),
+    ("三女", "さんじょ"),
+    ("次女", "じじょ"),
+    ("長女", "ちょうじょ"),
+)
+_HONORIFIC_READINGS: tuple[tuple[str, str], ...] = (
+    ("姉さん", "ねえさん"),
+    ("姉ちゃん", "ねえちゃん"),
+)
+_SINGLE_KANJI_SISTER_HONORIFIC_RE = re.compile(r"(碧|菫|結|彩|律|凪|茜|焔)(様|殿)")
+_SINGLE_KANJI_HONORIFIC_MAP: dict[str, str] = {
+    "碧": "あおい",
+    "菫": "すみれ",
+    "結": "ゆい",
+    "彩": "あや",
+    "律": "りつ",
+    "凪": "なぎ",
+    "茜": "あかね",
+    "焔": "ほむら",
+}
+_SUFFIX_MAP: dict[str, str] = {"様": "さま", "殿": "どの"}
+_MULTI_KANJI_NAMES: tuple[tuple[str, str], ...] = (
+    ("美緒", "みお"),
+    ("瑠璃", "るり"),
+    ("琥珀", "こはく"),
+    ("朱莉", "あかり"),
+    ("紫音", "しおん"),
+    ("緋色", "ひいろ"),
+    ("真白", "ましろ"),
+    ("九重", "ここのえ"),
+    ("十和", "とわ"),
+    ("華音", "かのん"),
+)
+_CONTEXT_SINGLE_KANJI_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?<![\u4e00-\u9fff])碧(?![\u4e00-\u9fffい])"), "あおい"),
+    (re.compile(r"(?<![\u4e00-\u9fff])菫(?![\u4e00-\u9fff])"), "すみれ"),
+    (re.compile(r"(?<![\u4e00-\u9fff])結(?![\u4e00-\u9fffびぶべばわっん])"), "ゆい"),
+    (re.compile(r"(?<![\u4e00-\u9fff])彩(?![\u4e00-\u9fffりるれらっ])"), "あや"),
+    (re.compile(r"(?<![\u4e00-\u9fff])律(?![\u4e00-\u9fff])"), "りつ"),
+    (re.compile(r"(?<![\u4e00-\u9fff])凪(?![\u4e00-\u9fffぐぎげい])"), "なぎ"),
+    (re.compile(r"(?<![\u4e00-\u9fff])茜(?![\u4e00-\u9fff])"), "あかね"),
+    (re.compile(r"(?<![\u4e00-\u9fff])焔(?![\u4e00-\u9fff])"), "ほむら"),
+)
+
+
+def apply_speech_readings(
+    text: str,
+    custom_readings: dict[str, str] | None = None,
+) -> str:
+    """Normalize Mio's name, all 17 sisters' names, and birth-order ranks for TTS."""
+    if not text:
+        return ""
+    out = text
+
+    if custom_readings:
+        for src in sorted(custom_readings, key=len, reverse=True):
+            target = (custom_readings[src] or "").strip()
+            if src and target:
+                out = out.replace(src, target)
+
+    out = _ROMAN_SISTER_PAREN_RE.sub("", out)
+    out = _RANK_DOT_RE.sub(r"\1、", out)
+
+    for rank_kanji, rank_reading in _RANK_READINGS:
+        out = out.replace(rank_kanji, rank_reading)
+
+    for suffix_kanji, suffix_reading in _HONORIFIC_READINGS:
+        out = out.replace(suffix_kanji, suffix_reading)
+
+    out = _SINGLE_KANJI_SISTER_HONORIFIC_RE.sub(
+        lambda m: _SINGLE_KANJI_HONORIFIC_MAP[m.group(1)] + _SUFFIX_MAP[m.group(2)],
+        out,
+    )
+
+    for kanji_name, reading in _MULTI_KANJI_NAMES:
+        out = out.replace(kanji_name, reading)
+
+    for pattern, reading in _CONTEXT_SINGLE_KANJI_RULES:
+        out = pattern.sub(reading, out)
+
+    return re.sub(r"\s+", " ", out).strip()
+
 
 def _normalize_pitch(pitch: str) -> str:
     match = re.match(r"^\s*([+-]?\d+)\s*(?:Hz)?\s*$", pitch or "+0Hz", flags=re.IGNORECASE)
@@ -44,8 +149,14 @@ def _resolve_edge_voice(voice_name: str) -> str:
     return DEFAULT_EDGE_VOICE
 
 
-def clean_text_for_speech(text: str, *, skip_code: bool = True, max_chars: int = 220) -> str:
-    """Sanitize Markdown/code text for natural spoken TTS playback."""
+def clean_text_for_speech(
+    text: str,
+    *,
+    skip_code: bool = True,
+    max_chars: int = 220,
+    reading_overrides: dict[str, str] | None = None,
+) -> str:
+    """Sanitize Markdown/code text and normalize character readings for natural TTS."""
     if not text:
         return ""
 
@@ -64,12 +175,15 @@ def clean_text_for_speech(text: str, *, skip_code: bool = True, max_chars: int =
 
     if max_chars > 0 and len(cleaned) > max_chars:
         snippet = cleaned[:max_chars]
+        cut: str | None = None
         for sep in ("。", "！", "？", ".", "!", "?"):
             idx = snippet.rfind(sep)
             if idx >= max_chars // 2:
-                return snippet[: idx + 1].strip()
-        return snippet.strip()
-    return cleaned
+                cut = snippet[: idx + 1].strip()
+                break
+        cleaned = cut if cut is not None else snippet.strip()
+
+    return apply_speech_readings(cleaned, custom_readings=reading_overrides)
 
 
 def _combine_rate(sister_rate: str, offset: int) -> str:
@@ -137,6 +251,7 @@ class TTSManager(QObject):
             text,
             skip_code=config.tts_skip_code,
             max_chars=config.tts_max_chars,
+            reading_overrides=getattr(config, "tts_reading_overrides", None),
         )
         if not cleaned:
             return

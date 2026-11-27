@@ -40,7 +40,16 @@ from sisters_mascot.agents.base import ModelChoice  # noqa: E402
 from sisters_mascot.agents.claude_adapter import ClaudeAdapter  # noqa: E402
 from sisters_mascot.agents.codex_adapter import CodexAdapter  # noqa: E402
 from sisters_mascot.agents.opencode_adapter import OpenCodeAdapter  # noqa: E402
-from sisters_mascot.agents.router import AGENT_IDS, AgentRouter  # noqa: E402
+from sisters_mascot.agents.orchestrator import (  # noqa: E402
+    OrchestrationPlan,
+    OrchestrationSubTask,
+    OrchestratorEngine,
+    build_worker_prompts,
+    get_delegatable_sisters,
+    parse_orchestration_plan,
+    resolve_sister_execution_target,
+)
+from sisters_mascot.agents.router import AGENT_IDS, AgentRouter, IsolatedTurnResult  # noqa: E402
 from sisters_mascot.attachments import (  # noqa: E402
     DEFAULT_ATTACHMENT_ONLY_PROMPT,
     MAX_ATTACHMENTS,
@@ -63,6 +72,7 @@ from sisters_mascot.audio.tts import (  # noqa: E402
     TTSManager,
     _normalize_pitch,
     _resolve_edge_voice,
+    apply_speech_readings,
     clean_text_for_speech,
 )
 from sisters_mascot.config import (  # noqa: E402
@@ -71,6 +81,7 @@ from sisters_mascot.config import (  # noqa: E402
     BookmarkItem,
     FolderItem,
     QuickPromptItem,
+    SisterAgentAssignment,
     load_config,
     save_config,
 )
@@ -82,12 +93,14 @@ from sisters_mascot.sisters_loader import (  # noqa: E402
 from sisters_mascot.sprites.renderer import render_sister_pixmap, render_sister_sprite  # noqa: E402
 from sisters_mascot.ui.bubble_panel import BubblePanel  # noqa: E402
 from sisters_mascot.ui.mascot_window import MascotWindow  # noqa: E402
+from sisters_mascot.ui.orchestrator_dialog import OrchestratorTeamDialog  # noqa: E402
 from sisters_mascot.ui.platform import supports_window_positioning  # noqa: E402
 from sisters_mascot.ui.widgets import (  # noqa: E402
     ChatInputEdit,
     LauncherItemDialog,
     ToastBubble,
     extract_local_paths_from_mime,
+    markdown_to_bubble_html,
 )
 
 EXPECTED_SISTER_IDS = [
@@ -576,6 +589,86 @@ class TestSpeechSanitizer(unittest.TestCase):
         truncated = clean_text_for_speech(long_text, max_chars=45)
         self.assertLessEqual(len(truncated), 45)
         self.assertTrue(truncated.endswith("。"))
+
+    def test_speech_readings_fix_names_and_ranks_without_breaking_compounds(self) -> None:
+        self.assertEqual(apply_speech_readings("美緒ちゃん、おはよう！"), "みおちゃん、おはよう！")
+        cases = (
+            ("長女・碧（Aoi）", "ちょうじょ、あおい"),
+            ("碧姉さんにお任せ", "あおいねえさんにお任せ"),
+            ("瑠璃です", "るりです"),
+            ("琥珀にお任せ", "こはくにお任せ"),
+            ("四女・菫、参ります", "よんじょ、すみれ、参ります"),
+            ("朱莉です", "あかりです"),
+            ("紫音と話す", "しおんと話す"),
+            ("緋色です", "ひいろです"),
+            ("真白にお任せ", "ましろにお任せ"),
+            ("九重です", "ここのえです"),
+            ("十和です", "とわです"),
+            ("十一女・結、現場へ", "じゅういちじょ、ゆい、現場へ"),
+            ("十二女・彩、言葉を紡ぐ", "じゅうにじょ、あや、言葉を紡ぐ"),
+            ("十三女・律、執行する", "じゅうさんじょ、りつ、執行する"),
+            ("十四女・凪", "じゅうよんじょ、なぎ"),
+            ("十五女・華音", "じゅうごじょ、かのん"),
+            ("十六女・茜", "じゅうろくじょ、あかね"),
+            ("十七女・焔", "じゅうななじょ、ほむら"),
+            ("律様", "りつさま"),
+            ("結殿", "ゆいどの"),
+        )
+        for src, expected in cases:
+            self.assertEqual(apply_speech_readings(src), expected, f"failed on {src}")
+
+        for safe_word in (
+            "結果",
+            "結論",
+            "結晶",
+            "結び",
+            "結んで",
+            "彩って",
+            "彩ります",
+            "色彩",
+            "規律",
+            "旋律",
+            "調律",
+            "紺碧",
+            "茜色",
+            "凪ぐ",
+        ):
+            self.assertEqual(
+                apply_speech_readings(safe_word),
+                safe_word,
+                f"normal word corrupted: {safe_word}",
+            )
+
+        for sister in load_all_sisters():
+            for line in [
+                sister.greeting,
+                *sister.click_lines,
+                *sister.drag_lines,
+                *sister.dispatch_lines,
+                *sister.return_lines,
+            ]:
+                spoken = clean_text_for_speech(line, max_chars=0)
+                self.assertNotIn("美緒", spoken)
+                self.assertNotIn("姉さん", spoken)
+                self.assertNotIn("結、", spoken)
+                self.assertNotIn("律、", spoken)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = Path(tmpdir) / "config.json"
+            cfg = AppConfig(tts_reading_overrides={"聖域": "せいいき", "律姉さん": "りつねえさん"})
+            save_config(cfg, cfg_path)
+            loaded = load_config(cfg_path)
+            self.assertEqual(
+                loaded.tts_reading_overrides,
+                {"聖域": "せいいき", "律姉さん": "りつねえさん"},
+            )
+            self.assertEqual(
+                clean_text_for_speech(
+                    "聖域へ律姉さんと向かう",
+                    reading_overrides=loaded.tts_reading_overrides,
+                ),
+                "せいいきへりつねえさんと向かう",
+            )
 
     def test_all_17_sisters_use_supported_edge_voices_and_fallback(self) -> None:
         sisters = load_all_sisters()
@@ -2164,6 +2257,448 @@ class TestActivityMonitoringAndErrorVisibility(unittest.TestCase):
             self.assertEqual(len(cancelled_msgs), 1)
             app.processEvents()
         finally:
+            panel.close()
+            app.processEvents()
+
+
+class TestOrchestratorMode(unittest.TestCase):
+    """Config, planning parser, DAG parallel engine, team dialog, and summon transitions."""
+
+    def test_orchestrator_config_round_trip_and_sister_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = Path(tmpdir) / "config.json"
+            cfg = AppConfig(
+                agent_id="opencode",
+                orchestrator_mode=True,
+                orchestrator_confirm_plan=True,
+                orchestrator_max_parallel=9,
+                orchestrator_switch_mascot=False,
+                sister_assignments={
+                    "ruri": SisterAgentAssignment(agent_id="codex", model="gpt-5.4", enabled=True),
+                    "hiiro": SisterAgentAssignment(agent_id="claude", model="sonnet", enabled=True),
+                    "homura": SisterAgentAssignment(agent_id="invalid_cli", model="", enabled=False),
+                },
+            )
+            save_config(cfg, cfg_path)
+            loaded = load_config(cfg_path)
+            self.assertTrue(loaded.orchestrator_mode)
+            self.assertTrue(loaded.orchestrator_confirm_plan)
+            self.assertEqual(loaded.orchestrator_max_parallel, 4)
+            self.assertFalse(loaded.orchestrator_switch_mascot)
+            self.assertEqual(loaded.sister_assignments["ruri"].agent_id, "codex")
+            self.assertEqual(loaded.sister_assignments["ruri"].model, "gpt-5.4")
+            self.assertEqual(loaded.sister_assignments["homura"].agent_id, "")
+            self.assertFalse(loaded.sister_assignments["homura"].enabled)
+
+        sisters = load_all_sisters()
+        self.assertEqual(len(sisters), 17)
+        for sister in sisters:
+            self.assertTrue(sister.dispatch_lines, f"{sister.id} missing dispatch_lines")
+        aoi = sisters[0]
+        self.assertEqual(aoi.id, "aoi")
+        self.assertTrue(aoi.return_lines)
+        for line in [*aoi.dispatch_lines, *aoi.return_lines]:
+            self.assertNotIn("...", line)
+            self.assertNotIn("⋯", line)
+            self.assertNotIn("…", line)
+
+    def test_parse_orchestration_plan_and_cycle_breaking(self) -> None:
+        sisters = load_all_sisters()
+        cfg = AppConfig(
+            sister_assignments={
+                "homura": SisterAgentAssignment(enabled=False),
+            }
+        )
+        enabled = get_delegatable_sisters(sisters, cfg)
+        enabled_ids = {s.id for s in enabled}
+        self.assertNotIn("aoi", enabled_ids)
+        self.assertNotIn("homura", enabled_ids)
+
+        raw = """計画を立案しました。
+```json
+{
+  "mode": "delegate",
+  "aoi_opening": "姉妹たちへ委譲いたします。",
+  "tasks": [
+    {"id": "t1", "sister_id": "瑠璃", "title": "コード修正", "instruction": "実装する", "depends_on": ["t2"]},
+    {"id": "t2", "sister_id": "Hiiro", "title": "情報収集", "instruction": "調べる", "depends_on": ["t1", "unknown"]},
+    {"id": "skip_aoi", "sister_id": "aoi", "title": "NG", "instruction": "無視"},
+    {"id": "skip_dis", "sister_id": "homura", "title": "NG2", "instruction": "無効姉妹"}
+  ]
+}
+```"""
+        plan = parse_orchestration_plan(raw, enabled)
+        self.assertEqual(plan.mode, "delegate")
+        self.assertEqual([t.sister_id for t in plan.tasks], ["ruri", "hiiro"])
+        # Cycle t1 <-> t2 must be cleanly broken so at least one task has empty depends_on
+        self.assertTrue(any(len(t.depends_on) == 0 for t in plan.tasks))
+
+        plain = parse_orchestration_plan("こんにちは！そのままお答えします。", enabled)
+        self.assertEqual(plain.mode, "direct")
+        self.assertIn("こんにちは", plain.direct_reply)
+
+    def test_resolve_target_fallback_when_assigned_agent_unavailable(self) -> None:
+        router = AgentRouter()
+        cfg = AppConfig(
+            agent_id="opencode",
+            models_by_agent={"opencode": "opencode/big-pickle"},
+            sister_assignments={
+                "ruri": SisterAgentAssignment(agent_id="codex", model="gpt-5.4", enabled=True),
+            },
+        )
+        with (
+            patch.object(router.get_adapter("codex"), "is_available", return_value=False),
+            patch.object(router.get_adapter("opencode"), "is_available", return_value=True),
+        ):
+            aid, model, note = resolve_sister_execution_target(cfg, router, "ruri")
+        self.assertEqual(aid, "opencode")
+        self.assertEqual(model, "opencode/big-pickle")
+        self.assertIn("codex", note)
+
+    def test_orchestrator_engine_dag_parallel_and_synthesis(self) -> None:
+        import time as _time
+
+        app = _ensure_qapp()
+        sisters = load_all_sisters()
+        router = AgentRouter()
+        engine = OrchestratorEngine(router, sisters)
+
+        cfg = AppConfig(
+            agent_id="agy",
+            models_by_agent={"agy": "gemini-2.5-pro", "codex": "gpt-5.4"},
+            orchestrator_mode=True,
+            orchestrator_confirm_plan=False,
+            orchestrator_max_parallel=2,
+            sister_assignments={
+                "aoi": SisterAgentAssignment(agent_id="agy", model="gemini-2.5-pro"),
+                "hiiro": SisterAgentAssignment(agent_id="opencode", model="opencode/big-pickle"),
+                "ruri": SisterAgentAssignment(agent_id="codex", model="gpt-5.4"),
+                "akari": SisterAgentAssignment(agent_id="claude", model="sonnet"),
+            },
+        )
+
+        calls: list[dict] = []
+        transitions: list[tuple] = []
+        finished_events: list[tuple] = []
+        call_lock = __import__("threading").Lock()
+
+        engine.active_sister_changed.connect(
+            lambda sid, direction, act, label, line: transitions.append(
+                (sid, direction, act, label, line)
+            )
+        )
+        engine.orchestration_finished.connect(
+            lambda text, plan: finished_events.append((text, plan))
+        )
+
+        def _fake_isolated(agent_id, prompt, **kwargs):
+            sys_p = kwargs.get("system_prompt", "")
+            model = kwargs.get("model", "")
+            with call_lock:
+                calls.append({"agent_id": agent_id, "model": model, "prompt": prompt, "sys": sys_p})
+            if "オーケストレーター計画フェーズ" in sys_p:
+                plan_json = json.dumps(
+                    {
+                        "mode": "delegate",
+                        "aoi_opening": "緋色と瑠璃が先行し、最後に朱莉が検証いたします。",
+                        "tasks": [
+                            {"id": "t1", "sister_id": "hiiro", "title": "調査", "instruction": "最新仕様を調べて", "depends_on": []},
+                            {"id": "t2", "sister_id": "ruri", "title": "実装", "instruction": "コードを書いて", "depends_on": []},
+                            {"id": "t3", "sister_id": "akari", "title": "検証", "instruction": "結果をテストして", "depends_on": ["t1", "t2"]},
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+                return IsolatedTurnResult(text=f"```json\n{plan_json}\n```", returncode=0, elapsed=0.1)
+            if "オーケストレーター統合報告フェーズ" in sys_p:
+                cb = kwargs.get("on_delta")
+                if cb:
+                    cb("碧の統合レポート: 全タスク正常完了です。")
+                return IsolatedTurnResult(text="碧の統合レポート: 全タスク正常完了です。", returncode=0, elapsed=0.2)
+            # Delegated sister turns
+            if "t1" in prompt and "調査" in prompt:
+                _time.sleep(0.03)
+                return IsolatedTurnResult(text="HIIRO_RESEARCH_OK", returncode=0, elapsed=0.05)
+            if "t2" in prompt and "実装" in prompt:
+                _time.sleep(0.03)
+                return IsolatedTurnResult(text="RURI_IMPL_OK", returncode=0, elapsed=0.05)
+            self.assertIn("HIIRO_RESEARCH_OK", prompt)
+            self.assertIn("RURI_IMPL_OK", prompt)
+            return IsolatedTurnResult(text="AKARI_QA_PASS", returncode=0, elapsed=0.05)
+
+        with patch.object(router, "run_isolated_turn", side_effect=_fake_isolated):
+            self.assertTrue(engine.start("調査して実装して検証までお願い", config=cfg))
+            deadline = _time.monotonic() + 5.0
+            while engine.is_running() and _time.monotonic() < deadline:
+                app.processEvents()
+                _time.sleep(0.02)
+            app.processEvents()
+
+        self.assertFalse(engine.is_running())
+        self.assertEqual(len(finished_events), 1)
+        final_text, plan = finished_events[0]
+        self.assertIn("碧の統合レポート", final_text)
+        self.assertEqual(len(plan.tasks), 3)
+        by_sister = {c["model"]: c["agent_id"] for c in calls}
+        self.assertEqual(by_sister.get("opencode/big-pickle"), "opencode")
+        self.assertEqual(by_sister.get("gpt-5.4"), "codex")
+        self.assertEqual(by_sister.get("sonnet"), "claude")
+        self.assertEqual(transitions[0][:2], ("aoi", "command"))
+        summon_sisters = [t[0] for t in transitions if t[1] == "summon"]
+        self.assertEqual(set(summon_sisters), {"hiiro", "ruri", "akari"})
+        self.assertEqual(transitions[-1][:2], ("aoi", "return"))
+        for _sid, _dir, _act, _lbl, line in transitions:
+            self.assertTrue(line)
+
+    def test_orchestrator_engine_confirmation_and_cancel(self) -> None:
+        import time as _time
+
+        app = _ensure_qapp()
+        sisters = load_all_sisters()
+        router = AgentRouter()
+        engine = OrchestratorEngine(router, sisters)
+
+        cfg = AppConfig(orchestrator_mode=True, orchestrator_confirm_plan=True, orchestrator_max_parallel=1)
+        plans: list[tuple] = []
+        finished: list[str] = []
+        cancelled: list[str] = []
+        engine.plan_ready.connect(lambda p, need: plans.append((p, need)))
+        engine.orchestration_finished.connect(lambda txt, _p: finished.append(txt))
+        engine.orchestration_cancelled.connect(cancelled.append)
+
+        def _fake_isolated(agent_id, prompt, **kwargs):
+            sys_p = kwargs.get("system_prompt", "")
+            if "オーケストレーター計画フェーズ" in sys_p:
+                return IsolatedTurnResult(
+                    text='{"mode":"delegate","aoi_opening":"承認待ちです","tasks":[{"id":"t1","sister_id":"ruri","title":"作業","instruction":"実施"}]}',
+                    returncode=0,
+                )
+            if "オーケストレーター統合報告フェーズ" in sys_p:
+                return IsolatedTurnResult(text="統合完了", returncode=0)
+            return IsolatedTurnResult(text="瑠璃完了", returncode=0)
+
+        with patch.object(router, "run_isolated_turn", side_effect=_fake_isolated):
+            engine.start("確認付きで実行", config=cfg)
+            deadline = _time.monotonic() + 3.0
+            while (not engine.is_awaiting_approval() or not plans) and _time.monotonic() < deadline:
+                app.processEvents()
+                _time.sleep(0.01)
+            app.processEvents()
+            self.assertTrue(engine.is_awaiting_approval())
+            self.assertEqual(len(plans), 1)
+            self.assertTrue(plans[0][1])
+
+            engine.approve_pending_plan()
+            deadline = _time.monotonic() + 3.0
+            while engine.is_running() and _time.monotonic() < deadline:
+                app.processEvents()
+                _time.sleep(0.01)
+            app.processEvents()
+
+        self.assertEqual(finished, ["統合完了"])
+        self.assertEqual(cancelled, [])
+
+        # Reject path
+        engine2 = OrchestratorEngine(router, sisters)
+        cancelled2: list[str] = []
+        engine2.orchestration_cancelled.connect(cancelled2.append)
+        with patch.object(router, "run_isolated_turn", side_effect=_fake_isolated):
+            engine2.start("却下テスト", config=cfg)
+            deadline = _time.monotonic() + 3.0
+            while not engine2.is_awaiting_approval() and _time.monotonic() < deadline:
+                app.processEvents()
+                _time.sleep(0.01)
+            app.processEvents()
+            engine2.reject_pending_plan()
+            app.processEvents()
+        self.assertFalse(engine2.is_running())
+        self.assertEqual(len(cancelled2), 1)
+
+        # Mid-execution cancel skips Phase 3 synthesis and emits orchestration_cancelled
+        engine3 = OrchestratorEngine(router, sisters)
+        finished3: list[str] = []
+        cancelled3: list[str] = []
+        syn_called: list[bool] = []
+        engine3.orchestration_finished.connect(lambda txt, _p: finished3.append(txt))
+        engine3.orchestration_cancelled.connect(cancelled3.append)
+
+        def _fake_mid_cancel(agent_id, prompt, **kwargs):
+            sys_p = kwargs.get("system_prompt", "")
+            if "オーケストレーター計画フェーズ" in sys_p:
+                return IsolatedTurnResult(
+                    text='{"mode":"delegate","aoi_opening":"実行します","tasks":[{"id":"t1","sister_id":"ruri","title":"長時間作業","instruction":"実施"}]}',
+                    returncode=0,
+                )
+            if "オーケストレーター統合報告フェーズ" in sys_p:
+                syn_called.append(True)
+                return IsolatedTurnResult(text="統合不可", returncode=0)
+            ce = kwargs.get("cancel_event")
+            if ce is not None:
+                ce.set()
+            return IsolatedTurnResult(text="", returncode=-15, cancelled=True)
+
+        cfg_auto = AppConfig(orchestrator_mode=True, orchestrator_confirm_plan=False, orchestrator_max_parallel=1)
+        with patch.object(router, "run_isolated_turn", side_effect=_fake_mid_cancel):
+            engine3.start("途中キャンセル", config=cfg_auto)
+            deadline = _time.monotonic() + 3.0
+            while engine3.is_running() and _time.monotonic() < deadline:
+                app.processEvents()
+                _time.sleep(0.01)
+            app.processEvents()
+        self.assertEqual(syn_called, [])
+        self.assertEqual(finished3, [])
+        self.assertEqual(len(cancelled3), 1)
+
+    def test_orchestrator_team_dialog_and_mascot_transition_ui(self) -> None:
+        app = _ensure_qapp()
+        sisters = load_all_sisters()
+        sister_map = {s.id: s for s in sisters}
+        router = AgentRouter()
+        router._model_cache["opencode"] = [ModelChoice("opencode/big-pickle", "opencode/big-pickle")]
+        router._model_cache["codex"] = [ModelChoice("gpt-5.4", "GPT-5.4 (gpt-5.4)")]
+
+        cfg = AppConfig(agent_id="opencode", tts_engine="off", orchestrator_mode=True)
+        dlg = OrchestratorTeamDialog(sisters, cfg, router)
+        try:
+            ruri_row = dlg._rows["ruri"]
+            codex_idx = ruri_row.agent_combo.findData("codex")
+            self.assertGreaterEqual(codex_idx, 0)
+            ruri_row.agent_combo.setCurrentIndex(codex_idx)
+            app.processEvents()
+            # Model choices switched to codex models
+            model_datas = [ruri_row.model_combo.itemData(i) for i in range(ruri_row.model_combo.count())]
+            self.assertIn("gpt-5.4", model_datas)
+            ruri_row.model_combo.setCurrentIndex(ruri_row.model_combo.findData("gpt-5.4"))
+            dlg._confirm_plan_check.setChecked(True)
+            dlg._rows["homura"].enabled_check.setChecked(False)
+            dlg.apply_to_config()
+
+            self.assertTrue(cfg.orchestrator_confirm_plan)
+            self.assertEqual(cfg.sister_assignments["ruri"].agent_id, "codex")
+            self.assertEqual(cfg.sister_assignments["ruri"].model, "gpt-5.4")
+            self.assertFalse(cfg.sister_assignments["homura"].enabled)
+        finally:
+            dlg.close()
+
+        # BubblePanel orchestrator UI flow
+        panel = BubblePanel(sisters, sister_map["aoi"], cfg, router, VoiceRecorder())
+        mascot = MascotWindow(sisters, sister_map["aoi"], cfg)
+        try:
+            panel.show()
+            mascot.show()
+            self.assertTrue(panel._orch_mode_btn.isChecked())
+            self.assertFalse(panel._sister_combo.isEnabled())
+
+            with patch.object(panel.orchestrator, "start", return_value=True) as mock_start:
+                panel.send_prompt("オーケストレーターテスト")
+            mock_start.assert_called_once()
+            self.assertTrue(panel._orch_board.isVisible())
+
+            task = OrchestrationSubTask(
+                id="t1",
+                sister_id="ruri",
+                title="実装テスト",
+                instruction="実装する",
+                agent_id="codex",
+                model="gpt-5.4",
+                dispatch_line=sister_map["ruri"].dispatch_lines[0],
+            )
+            plan = OrchestrationPlan(mode="delegate", aoi_opening="瑠璃に任せます。", tasks=[task])
+            panel.handle_orch_plan_ready(plan, True)
+            self.assertTrue(panel._orch_approval_row.isVisible())
+            self.assertIn("t1", panel._orch_task_rows)
+
+            panel.handle_orch_task_started(task)
+            self.assertEqual(panel._orch_task_rows["t1"]["status"].text(), "🔄")
+            task.status = "done"
+            task.output = "実装完了しました。"
+            task.elapsed = 1.2
+            panel.handle_orch_task_finished(task)
+            self.assertEqual(panel._orch_task_rows["t1"]["status"].text(), "✅")
+
+            panel.handle_orch_synthesis_delta("統合結果です。")
+            panel.handle_orch_finished("最終報告：すべて完了しました。", plan)
+            self.assertFalse(panel._orch_board.isVisible())
+
+            # Sister report defaults to collapsed compact preview, expandable on click
+            report_idx = next(
+                i for i, m in enumerate(panel._messages) if m.get("role") == "sister_report"
+            )
+            html_collapsed = panel._chat_browser.toHtml()
+            self.assertIn("碧 (オーケストレーター", html_collapsed)
+            self.assertIn("▶ 詳細を見る", html_collapsed)
+            self.assertNotIn(sister_map["ruri"].dispatch_lines[0], html_collapsed)
+
+            panel._on_chat_anchor_clicked(QUrl(f"orch-toggle:{report_idx}"))
+            html_expanded = panel._chat_browser.toHtml()
+            self.assertIn("▼ 折りたたむ", html_expanded)
+            self.assertIn(sister_map["ruri"].dispatch_lines[0], html_expanded)
+            self.assertIn("実装完了しました。", html_expanded)
+
+            panel._on_chat_anchor_clicked(QUrl(f"orch-toggle:{report_idx}"))
+            self.assertIn("▶ 詳細を見る", panel._chat_browser.toHtml())
+
+            # Error sister report defaults to expanded
+            err_task = OrchestrationSubTask(
+                id="t_err",
+                sister_id="akari",
+                title="失敗テスト",
+                instruction="検証する",
+                agent_id="codex",
+                status="error",
+                error="検証タイムアウト",
+            )
+            panel.handle_orch_task_finished(err_task)
+            self.assertIn("検証タイムアウト", panel._chat_browser.toHtml())
+            self.assertEqual(len(panel._conversation.turns), 2)
+
+            # Markdown pipe tables render cleanly into HTML tables without raw delimiter lines
+            tbl_html = markdown_to_bubble_html(
+                "| 姉妹 | 状態 |\n|---|---|\n| **緋色** | `OK` |",
+                "#4A7CFF",
+            )
+            self.assertIn("<table", tbl_html)
+            self.assertIn("<th", tbl_html)
+            self.assertIn("緋色", tbl_html)
+            self.assertNotIn("|---|", tbl_html)
+
+            # Worker prompt & persona guardrails include single-turn completion and non-existent skill guard
+            w_sys, _w_user = build_worker_prompts(
+                router, sister_map["aya"], task, original_prompt="記録して", dep_results=[]
+            )
+            self.assertIn("着手宣言だけで絶対に終わらせず", w_sys)
+            self.assertIn("実在しないスキル", router._build_persona_context(sister_map["yui"]))
+
+            # MascotWindow cinematic transition across rich / subtle / off modes & small width clamping
+            mascot.set_mascot_width(128)
+            for mode in ("rich", "subtle", "off"):
+                mascot.set_animation_mode(mode)
+                mascot.play_orchestrator_transition(
+                    sister_map["ruri"],
+                    role_tag="⚡ 出動 · 次女 瑠璃",
+                    line=sister_map["ruri"].dispatch_lines[0],
+                    direction="summon",
+                )
+                if mode == "rich":
+                    self.assertTrue(mascot._ripples)
+                    for rip in mascot._ripples:
+                        self.assertLessEqual(rip.max_radius, mascot.width() * 0.5 - 5.0)
+                mascot.grab()
+                self.assertEqual(mascot._sister.id, "ruri")
+                self.assertIn("出動", mascot._callout_pill_text)
+                mascot._on_anim_tick()
+
+            mascot.play_orchestrator_transition(
+                sister_map["aoi"],
+                role_tag="✨ 統合 · 長女 碧",
+                line=sister_map["aoi"].return_lines[0],
+                direction="return",
+            )
+            mascot.grab()
+            self.assertEqual(mascot._sister.id, "aoi")
+            app.processEvents()
+        finally:
+            mascot.close()
             panel.close()
             app.processEvents()
 

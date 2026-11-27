@@ -159,6 +159,18 @@ def _format_inline_markdown(escaped_text: str, accent: str) -> str:
     return out
 
 
+_TABLE_SEP_RE = re.compile(r"^\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?$")
+
+
+def _split_md_table_row(line: str) -> list[str]:
+    text = (line or "").strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|"):
+        text = text[:-1]
+    return [cell.strip() for cell in text.split("|")]
+
+
 def markdown_to_bubble_html(text: str, accent: str) -> str:
     """Convert Markdown text safely into Qt RichText HTML for chat bubbles."""
     safe_accent = _safe_css_color(accent)
@@ -205,13 +217,68 @@ def markdown_to_bubble_html(text: str, accent: str) -> str:
             html_parts.append("</ol>")
             in_ol = False
 
-    for line in lines:
+    i = 0
+    n_lines = len(lines)
+    while i < n_lines:
+        line = lines[i]
         stripped = line.strip()
+        i += 1
 
         cb_match = re.fullmatch(r"\x00CODEBLOCK(\d+)\x00", stripped)
         if cb_match:
             _close_lists()
             html_parts.append(code_blocks[int(cb_match.group(1))])
+            continue
+
+        if (
+            i < n_lines
+            and "|" in stripped
+            and _TABLE_SEP_RE.match(lines[i].strip())
+        ):
+            _close_lists()
+            headers = _split_md_table_row(line)
+            i += 1  # consume separator row
+            rows: list[list[str]] = []
+            while i < n_lines:
+                row_raw = lines[i]
+                row_stripped = row_raw.strip()
+                if (
+                    not row_stripped
+                    or "|" not in row_stripped
+                    or re.fullmatch(r"\x00CODEBLOCK(\d+)\x00", row_stripped)
+                    or re.match(r"^(#{1,3})\s+", row_stripped)
+                ):
+                    break
+                rows.append(_split_md_table_row(row_raw))
+                i += 1
+            col_count = max([len(headers)] + [len(r) for r in rows])
+            tbl_parts = [
+                '<table width="100%" cellspacing="0" cellpadding="4" '
+                'style="border-collapse:collapse; border:1px solid #334155; '
+                'margin:5px 0; font-size:11.5px;">',
+                '<tr style="background-color:#1e2749;">',
+            ]
+            for c_idx in range(col_count):
+                cell = headers[c_idx] if c_idx < len(headers) else ""
+                cell_html = _format_inline_markdown(html.escape(cell), safe_accent)
+                tbl_parts.append(
+                    f'<th align="left" style="border:1px solid #334155; color:{safe_accent}; '
+                    f'padding:4px 6px; font-weight:bold;">{cell_html}</th>'
+                )
+            tbl_parts.append("</tr>")
+            for r_idx, row in enumerate(rows):
+                bg = "#0f1529" if r_idx % 2 == 0 else "#141b33"
+                tbl_parts.append(f'<tr style="background-color:{bg};">')
+                for c_idx in range(col_count):
+                    cell = row[c_idx] if c_idx < len(row) else ""
+                    cell_html = _format_inline_markdown(html.escape(cell), safe_accent)
+                    tbl_parts.append(
+                        f'<td style="border:1px solid #334155; color:#e2e8f0; '
+                        f'padding:4px 6px;">{cell_html}</td>'
+                    )
+                tbl_parts.append("</tr>")
+            tbl_parts.append("</table>")
+            html_parts.append("".join(tbl_parts))
             continue
 
         heading_match = re.match(r"^(#{1,3})\s+(.+)$", stripped)

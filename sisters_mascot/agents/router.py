@@ -8,9 +8,10 @@ import signal
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
@@ -39,6 +40,74 @@ _ERROR_KEYWORDS = (
     "denied",
     "enoent",
 )
+
+
+@dataclass
+class IsolatedTurnResult:
+    """Outcome of an isolated non-session agent CLI execution."""
+
+    text: str
+    returncode: int
+    cancelled: bool = False
+    error: str = ""
+    elapsed: float = 0.0
+
+
+def _build_popen_kwargs(cwd: str, stdin_text: str | None) -> tuple[str, dict]:
+    """Resolve safe working directory and subprocess.Popen keyword arguments."""
+    resolved_cwd = cwd if (cwd and Path(cwd).is_dir()) else str(Path.home())
+    popen_kwargs: dict = {
+        "cwd": resolved_cwd,
+        "stdin": subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "bufsize": 1,
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    else:
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    return resolved_cwd, popen_kwargs
+
+
+def _terminate_process(proc: subprocess.Popen[str] | None) -> None:
+    """Terminate a subprocess cleanly via its process group, escalating to SIGKILL."""
+    if proc is None or proc.poll() is not None:
+        return
+    if os.name == "posix" and hasattr(os, "killpg"):
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+    else:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+    def _force_kill_if_stuck() -> None:
+        if proc.poll() is None:
+            if os.name == "posix" and hasattr(os, "killpg"):
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    return
+                except OSError:
+                    pass
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    timer = threading.Timer(1.5, _force_kill_if_stuck)
+    timer.daemon = True
+    timer.start()
 
 
 class AgentRouter(QObject):
@@ -70,6 +139,7 @@ class AgentRouter(QObject):
         self._lock = threading.Lock()
         self._log_lock = threading.Lock()
         self._process: subprocess.Popen[str] | None = None
+        self._aux_processes: set[subprocess.Popen[str]] = set()
         self._running = False
         self._cancel_requested = False
 
@@ -95,6 +165,12 @@ class AgentRouter(QObject):
         if agent_id not in self._adapters:
             raise KeyError(f"Unknown agent_id: {agent_id}")
         return self._adapters[agent_id]
+
+    def create_adapter(self, agent_id: str) -> BaseAgentAdapter:
+        """Create a fresh isolated adapter instance so concurrent turns stay isolated."""
+        if agent_id not in self._adapters:
+            raise KeyError(f"Unknown agent_id: {agent_id}")
+        return type(self._adapters[agent_id])()
 
     def is_running(self) -> bool:
         """Return True if an agent turn subprocess is currently active."""
@@ -140,7 +216,9 @@ class AgentRouter(QObject):
             "- キャラクターの口調と温かさを保ちつつ、簡潔でわかりやすい日本語で応答してください。\n"
             "- `<conversation_handoff>` が含まれている場合は、これまでの会話や他の姉妹・AIとのやり取りを引き継いで、自然な続きとして応答してください。\n"
             "- ユーザーからファイルやフォルダが添付された場合は、提示された絶対パスを直接読み込み・確認して丁寧にサポートしてください。\n"
-            "- Webページの調査・操作やGoogle Chromeでの確認を求められた場合は、利用可能な Playwright / Chrome MCP ツール（`browser_*` 等）を優先して使用してください。"
+            "- Webページの調査・操作やGoogle Chromeでの確認を求められた場合は、利用可能な Playwright / Chrome MCP ツール（`browser_*` 等）を優先して使用してください。\n"
+            "- プロファイル記述にある外部スキル（`audit` / `void` / `ontology` / `spec-architect` / `activate_skill` 等）は現在のCLIに存在しない場合があるため、一覧にない実在しないスキルを `skill` ツール等で呼び出さないでください。\n"
+            "- 美緒ちゃんへの返答では、`Trace ID` や `RUBRIC.md` 欠如といった内部運用の専門用語で戸惑わせず、わかった結論や次の一歩をやさしく平易な言葉で伝えてください。"
         )
 
     def send_message(
@@ -311,7 +389,6 @@ class AgentRouter(QObject):
         compact_mode: bool = False,
         start_desc: str = "",
     ) -> None:
-        resolved_cwd = cwd if (cwd and Path(cwd).is_dir()) else str(Path.home())
         full_text = ""
         saw_error = False
         stderr_lines: list[str] = []
@@ -325,20 +402,7 @@ class AgentRouter(QObject):
             f"▶ {adapter.spec.display_name} 開始" + (f" ({start_desc})" if start_desc else ""),
         )
 
-        popen_kwargs: dict = {
-            "cwd": resolved_cwd,
-            "stdin": subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-            "text": True,
-            "encoding": "utf-8",
-            "errors": "replace",
-            "bufsize": 1,
-        }
-        if os.name == "posix":
-            popen_kwargs["start_new_session"] = True
-        else:
-            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        _resolved_cwd, popen_kwargs = _build_popen_kwargs(cwd, stdin_text)
 
         try:
             proc = subprocess.Popen(cmd, **popen_kwargs)
@@ -477,41 +541,199 @@ class AgentRouter(QObject):
         self.reply_finished.emit(full_text)
 
     def cancel(self) -> None:
-        """Terminate the running agent subprocess cleanly via its process group."""
+        """Terminate running single-chat and isolated orchestrator subprocesses cleanly."""
         with self._lock:
             self._cancel_requested = True
             proc = self._process
+            aux_procs = list(self._aux_processes)
 
-        if proc is not None and proc.poll() is None:
-            if os.name == "posix" and hasattr(os, "killpg"):
-                try:
-                    pgid = os.getpgid(proc.pid)
-                    os.killpg(pgid, signal.SIGTERM)
-                except OSError:
-                    try:
-                        proc.terminate()
-                    except OSError:
-                        pass
+        _terminate_process(proc)
+        for aux in aux_procs:
+            _terminate_process(aux)
+
+    def run_isolated_turn(
+        self,
+        agent_id: str,
+        prompt: str,
+        *,
+        system_prompt: str = "",
+        model: str = "",
+        cwd: str = "",
+        auto_approve: bool = True,
+        attachments: Sequence[AttachmentItem] = (),
+        cancel_event: threading.Event | None = None,
+        log_prefix: str = "",
+        on_delta: Callable[[str], None] | None = None,
+        on_replace: Callable[[str], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
+        on_tool: Callable[[str, str], None] | None = None,
+    ) -> IsolatedTurnResult:
+        """Run a standalone synchronous turn using a fresh adapter without mutating session state."""
+        if agent_id not in self._adapters:
+            msg = f"未対応のエージェントです: {agent_id}"
+            self._emit_activity("error", f"{log_prefix}❌ {msg}")
+            return IsolatedTurnResult(text="", returncode=-1, error=msg)
+
+        primary_adapter = self._adapters[agent_id]
+        if not primary_adapter.is_available():
+            msg = f"{primary_adapter.spec.display_name} のCLI ({primary_adapter.spec.binary}) が見つかりません。"
+            self._emit_activity("error", f"{log_prefix}❌ {msg}")
+            return IsolatedTurnResult(text="", returncode=-1, error=msg)
+
+        if cancel_event is not None and cancel_event.is_set():
+            return IsolatedTurnResult(text="", returncode=-1, cancelled=True)
+
+        adapter = self.create_adapter(agent_id)
+        adapter.reset_state()
+        att_tuple = tuple(attachments)
+        user_prompt = build_prompt_with_attachments(prompt, att_tuple)
+
+        system_prompt_arg = ""
+        effective_prompt = user_prompt
+        clean_sys = (system_prompt or "").strip()
+        if clean_sys:
+            if adapter.spec.supports_system_prompt:
+                system_prompt_arg = clean_sys
             else:
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
+                effective_prompt = (
+                    f"<system_instructions>\n{clean_sys}\n</system_instructions>\n\n"
+                    f"<user_message>\n{user_prompt}\n</user_message>"
+                )
 
-            def _force_kill_if_stuck() -> None:
-                if proc.poll() is None:
-                    if os.name == "posix" and hasattr(os, "killpg"):
-                        try:
-                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                            return
-                        except OSError:
-                            pass
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
+        effective_cwd = cwd.strip() or str(Path.home())
+        cmd, stdin_text = adapter.build_command(
+            effective_prompt,
+            model=model,
+            session_id=None,
+            cwd=effective_cwd,
+            system_prompt=system_prompt_arg,
+            auto_approve=auto_approve,
+            attachments=att_tuple,
+        )
 
-            threading.Timer(1.5, _force_kill_if_stuck).start()
+        started_at = time.monotonic()
+        self._emit_activity(
+            "info",
+            f"{log_prefix}▶ {adapter.spec.display_name} 開始 (model={model or '既定'})",
+        )
+        _resolved_cwd, popen_kwargs = _build_popen_kwargs(effective_cwd, stdin_text)
+        try:
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+        except OSError as exc:
+            err_msg = f"CLIの起動に失敗しました: {exc}"
+            self._emit_activity("error", f"{log_prefix}❌ {err_msg}")
+            return IsolatedTurnResult(text="", returncode=-1, error=err_msg)
+
+        with self._lock:
+            self._aux_processes.add(proc)
+        if cancel_event is not None and cancel_event.is_set():
+            _terminate_process(proc)
+
+        full_text = ""
+        saw_error = False
+        error_msg = ""
+        stderr_lines: list[str] = []
+
+        def _read_stderr() -> None:
+            if proc.stderr is None:
+                return
+            for err_line in proc.stderr:
+                cleaned = _ANSI_RE.sub("", err_line).strip()
+                if cleaned:
+                    stderr_lines.append(cleaned)
+                    if len(stderr_lines) > 40:
+                        stderr_lines.pop(0)
+                    lowered = cleaned.lower()
+                    lvl = "error" if any(kw in lowered for kw in _ERROR_KEYWORDS) else "warn"
+                    self._emit_activity(lvl, f"{log_prefix}[stderr] {cleaned[:240]}")
+
+        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+        stderr_thread.start()
+
+        if stdin_text is not None and proc.stdin is not None:
+            try:
+                proc.stdin.write(stdin_text)
+                proc.stdin.close()
+            except OSError:
+                pass
+
+        try:
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    if cancel_event is not None and cancel_event.is_set():
+                        _terminate_process(proc)
+                        break
+                    evs = adapter.parse_line(line)
+                    if not evs:
+                        stripped_line = _ANSI_RE.sub("", line).strip()
+                        if stripped_line and not stripped_line.startswith("{"):
+                            self._emit_activity("warn", f"{log_prefix}[stdout] {stripped_line[:240]}")
+                        continue
+                    for ev in evs:
+                        if ev.kind == "delta" and ev.text:
+                            full_text += ev.text
+                            if on_delta is not None:
+                                on_delta(ev.text)
+                        elif ev.kind == "replace":
+                            full_text = ev.text
+                            if on_replace is not None:
+                                on_replace(ev.text)
+                        elif ev.kind in ("tool", "status") and ev.text:
+                            status_msg = f"{ev.text} ({ev.detail})" if ev.detail else ev.text
+                            self._emit_activity(
+                                "tool" if ev.kind == "tool" else "info",
+                                f"{log_prefix}{status_msg}",
+                            )
+                            if on_status is not None:
+                                on_status(status_msg)
+                            if ev.kind == "tool" and on_tool is not None:
+                                on_tool(ev.tool_name or "", status_msg)
+                        elif ev.kind == "log" and ev.text:
+                            self._emit_activity(ev.level or "info", f"{log_prefix}{ev.text}")
+                        elif ev.kind == "error":
+                            saw_error = True
+                            error_msg = ev.text or f"{agent_id} でエラーが発生しました。"
+                            self._emit_activity("error", f"{log_prefix}❌ {error_msg}")
+        finally:
+            returncode = proc.wait()
+            stderr_thread.join(timeout=1.0)
+            with self._lock:
+                self._aux_processes.discard(proc)
+
+        elapsed = max(0.0, time.monotonic() - started_at)
+        cancelled = bool(cancel_event is not None and cancel_event.is_set())
+        if cancelled:
+            self._emit_activity("warn", f"{log_prefix}⏹ 中断 (exit={returncode}, {elapsed:.1f}s)")
+            return IsolatedTurnResult(
+                text=full_text.strip(),
+                returncode=returncode,
+                cancelled=True,
+                elapsed=elapsed,
+            )
+        if saw_error:
+            return IsolatedTurnResult(
+                text=full_text.strip(),
+                returncode=returncode,
+                error=error_msg,
+                elapsed=elapsed,
+            )
+        if returncode != 0:
+            self._emit_activity(
+                "error", f"{log_prefix}❌ プロセス異常終了 (exit={returncode}, {elapsed:.1f}s)"
+            )
+            err_detail = "\n".join(stderr_lines[-6:]).strip()
+            summary_msg = f"{adapter.spec.display_name} が途中で終了しました (exit={returncode})"
+            if err_detail:
+                summary_msg = f"{summary_msg}\n{err_detail}"
+            return IsolatedTurnResult(
+                text=full_text.strip(),
+                returncode=returncode,
+                error=summary_msg,
+                elapsed=elapsed,
+            )
+
+        self._emit_activity("done", f"{log_prefix}✔ 完了 (exit={returncode}, {elapsed:.1f}s)")
+        return IsolatedTurnResult(text=full_text.strip(), returncode=returncode, elapsed=elapsed)
 
     def new_session(self, agent_id: str | None = None) -> None:
         """Clear saved conversation/session IDs for one agent or all agents."""

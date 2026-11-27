@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import html
+import re
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
-from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
+    QDesktopServices,
     QDragEnterEvent,
     QDragLeaveEvent,
     QDragMoveEvent,
@@ -47,6 +49,11 @@ from PyQt6.QtWidgets import (
 
 from sisters_mascot import USER_SPRITES_DIR
 from sisters_mascot.agents.base import ModelChoice
+from sisters_mascot.agents.orchestrator import (
+    OrchestrationPlan,
+    OrchestrationSubTask,
+    OrchestratorEngine,
+)
 from sisters_mascot.agents.router import ACTIVITY_LOG_FILE, AGENT_IDS, AgentRouter
 from sisters_mascot.attachments import (
     AttachmentItem,
@@ -80,6 +87,7 @@ from sisters_mascot.sisters_loader import (
     reset_user_sprite,
 )
 from sisters_mascot.sprites.renderer import clear_sprite_cache
+from sisters_mascot.ui.orchestrator_dialog import OrchestratorTeamDialog
 from sisters_mascot.ui.platform import supports_window_positioning
 from sisters_mascot.ui.widgets import (
     DARK_DIALOG_QSS,
@@ -239,6 +247,23 @@ def _short_name(display_name: str) -> str:
     return name or display_name
 
 
+def _plain_preview_line(text: str, max_chars: int = 110) -> str:
+    """Collapse Markdown prose/tables into a crisp single-line preview for collapsed cards."""
+    raw = (text or "").strip()
+    if not raw:
+        return "（出力なし）"
+    raw = re.sub(r"```[a-zA-Z0-9_+-]*\n?", " ", raw).replace("```", " ")
+    raw = re.sub(r"(?m)^\s*\|?\s*:?-{2,}:?(?:\s*\|\s*:?-{2,}:?)+\s*\|?\s*$", " ", raw)
+    raw = re.sub(r"(?m)^\s*#{1,6}\s+", "", raw)
+    raw = re.sub(r"[`*_>|]", " ", raw)
+    collapsed = " ".join(raw.split()).strip()
+    if not collapsed:
+        return "（出力なし）"
+    if len(collapsed) <= max_chars:
+        return collapsed
+    return collapsed[: max(1, max_chars - 1)] + "…"
+
+
 class BubblePanel(QWidget):
     """Floating dark-glass panel with Chat, Launcher, and Settings tabs."""
 
@@ -252,6 +277,7 @@ class BubblePanel(QWidget):
     test_tts_requested = pyqtSignal()
     toast_requested = pyqtSignal(str, bool)
     conversation_changed = pyqtSignal()
+    orchestrator_mode_changed = pyqtSignal(bool)
 
     def __init__(
         self,
@@ -260,14 +286,21 @@ class BubblePanel(QWidget):
         config: AppConfig,
         router: AgentRouter,
         voice_recorder,
+        orchestrator: OrchestratorEngine | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._sisters: list[SisterProfile] = sorted(sisters, key=lambda s: s.order)
+        self._sisters_by_id: dict[str, SisterProfile] = {s.id: s for s in self._sisters}
         self._sister: SisterProfile = current_sister
         self._config: AppConfig = config
         self._router: AgentRouter = router
         self._voice_recorder = voice_recorder
+        self._orchestrator: OrchestratorEngine = (
+            orchestrator
+            if orchestrator is not None
+            else OrchestratorEngine(router, self._sisters, self)
+        )
 
         self._updating_controls: bool = False
         self._ui_ready: bool = False
@@ -281,6 +314,9 @@ class BubblePanel(QWidget):
         self._pending_turn_sister_name: str = ""
         self._pending_turn_summary_gen: int = 0
         self._pending_turn_had_session: bool = False
+        self._orch_task_rows: dict[str, dict[str, Any]] = {}
+        self._pending_orch_prompt: str = ""
+        self._orch_synthesis_streaming: bool = False
         self._activity_logs: list[str] = []
         self._turn_error_count: int = 0
         self._turn_warn_count: int = 0
@@ -328,10 +364,28 @@ class BubblePanel(QWidget):
         self._activity_tick_timer.timeout.connect(self._on_activity_tick)
 
         self._build_ui()
+        self._connect_orchestrator_signals()
         self._ui_ready = True
         self.sync_from_config(self._sister)
         self._append_system_or_greeting()
         self._refresh_context_bar()
+
+    @property
+    def orchestrator(self) -> OrchestratorEngine:
+        """Return the panel's attached OrchestratorEngine."""
+        return self._orchestrator
+
+    def _connect_orchestrator_signals(self) -> None:
+        self._orchestrator.phase_changed.connect(self.handle_orch_phase_changed)
+        self._orchestrator.plan_ready.connect(self.handle_orch_plan_ready)
+        self._orchestrator.task_started.connect(self.handle_orch_task_started)
+        self._orchestrator.task_updated.connect(self.handle_orch_task_updated)
+        self._orchestrator.task_finished.connect(self.handle_orch_task_finished)
+        self._orchestrator.synthesis_delta.connect(self.handle_orch_synthesis_delta)
+        self._orchestrator.synthesis_replace.connect(self.handle_orch_synthesis_replace)
+        self._orchestrator.orchestration_finished.connect(self.handle_orch_finished)
+        self._orchestrator.orchestration_cancelled.connect(self.handle_orch_cancelled)
+        self._orchestrator.orchestration_error.connect(self.handle_orch_error)
 
     def _update_maximum_size(self) -> None:
         """Let the panel grow up to the current screen's available area."""
@@ -422,6 +476,41 @@ class BubblePanel(QWidget):
         row2.addWidget(self._refresh_models_btn)
 
         header_layout.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        row3.setSpacing(6)
+
+        self._orch_mode_btn = QPushButton("🎼 碧オーケストレーター: OFF", self._header_widget)
+        self._orch_mode_btn.setCheckable(True)
+        self._orch_mode_btn.setToolTip(
+            "長女・碧が指揮者となり、専門の姉妹へ個別AI・モデルで分担指揮するモードを切替"
+        )
+        self._orch_mode_btn.setStyleSheet(
+            "QPushButton { background-color: rgba(30, 36, 62, 210); "
+            "border: 1px solid rgba(148, 163, 184, 0.28); border-radius: 8px; "
+            "padding: 4px 8px; font-size: 11.5px; color: #cbd5e1; font-weight: 600; text-align: left; }"
+            "QPushButton:checked { background-color: rgba(79, 70, 229, 0.52); "
+            "border: 1px solid rgba(165, 180, 252, 0.82); color: #eef2ff; }"
+            "QPushButton:hover { border-color: rgba(165, 180, 252, 0.65); }"
+        )
+        self._orch_mode_btn.toggled.connect(self._on_orch_mode_toggled)
+        row3.addWidget(self._orch_mode_btn, 1)
+
+        self._orch_team_btn = QToolButton(self._header_widget)
+        self._orch_team_btn.setText("👥 姉妹別AI編成")
+        self._orch_team_btn.setToolTip(
+            "碧姉さんと各姉妹が使う AI エージェント・モデル・並列数を設定"
+        )
+        self._orch_team_btn.setStyleSheet(
+            "QToolButton { background-color: rgba(38, 45, 72, 210); "
+            "border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 8px; "
+            "padding: 4px 8px; font-size: 11.5px; color: #e2e8f0; }"
+            "QToolButton:hover { background-color: rgba(99, 102, 241, 0.45); }"
+        )
+        self._orch_team_btn.clicked.connect(self._open_orchestrator_team_dialog)
+        row3.addWidget(self._orch_team_btn)
+
+        header_layout.addLayout(row3)
         layout.addWidget(self._header_widget)
 
         # Tabs
@@ -534,11 +623,68 @@ class BubblePanel(QWidget):
         layout.addWidget(self._context_bar)
 
         self._chat_browser = QTextBrowser(tab)
-        self._chat_browser.setOpenExternalLinks(True)
+        self._chat_browser.setOpenExternalLinks(False)
+        self._chat_browser.setOpenLinks(False)
+        self._chat_browser.anchorClicked.connect(self._on_chat_anchor_clicked)
         self._chat_browser.setAcceptDrops(False)
         if self._chat_browser.viewport() is not None:
             self._chat_browser.viewport().setAcceptDrops(False)
         layout.addWidget(self._chat_browser, 1)
+
+        # Live orchestrator task progress & plan approval board
+        self._orch_board = QFrame(tab)
+        self._orch_board.setStyleSheet(
+            "QFrame { background-color: rgba(17, 23, 44, 224); "
+            "border: 1px solid rgba(129, 140, 248, 0.42); border-radius: 10px; }"
+        )
+        ob_lay = QVBoxLayout(self._orch_board)
+        ob_lay.setContentsMargins(9, 7, 9, 7)
+        ob_lay.setSpacing(5)
+
+        self._orch_board_title = QLabel("🎼 碧の統括ボード", self._orch_board)
+        self._orch_board_title.setStyleSheet(
+            "border: none; background: transparent; font-size: 11.5px; font-weight: 700; color: #c7d2fe;"
+        )
+        ob_lay.addWidget(self._orch_board_title)
+
+        self._orch_tasks_scroll = QScrollArea(self._orch_board)
+        self._orch_tasks_scroll.setWidgetResizable(True)
+        self._orch_tasks_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._orch_tasks_scroll.setMaximumHeight(108)
+        self._orch_tasks_container = QWidget(self._orch_tasks_scroll)
+        self._orch_tasks_layout = QVBoxLayout(self._orch_tasks_container)
+        self._orch_tasks_layout.setContentsMargins(0, 0, 0, 0)
+        self._orch_tasks_layout.setSpacing(4)
+        self._orch_tasks_scroll.setWidget(self._orch_tasks_container)
+        ob_lay.addWidget(self._orch_tasks_scroll)
+
+        self._orch_approval_row = QWidget(self._orch_board)
+        appr_lay = QHBoxLayout(self._orch_approval_row)
+        appr_lay.setContentsMargins(0, 2, 0, 0)
+        appr_lay.setSpacing(6)
+        self._orch_approve_btn = QPushButton("▶ この計画を実行", self._orch_approval_row)
+        self._orch_approve_btn.setStyleSheet(
+            "QPushButton { background-color: rgba(16, 185, 129, 0.36); "
+            "border: 1px solid rgba(52, 211, 153, 0.72); border-radius: 7px; "
+            "padding: 4px 10px; font-size: 11.5px; color: #ecfdf5; font-weight: 700; }"
+            "QPushButton:hover { background-color: rgba(16, 185, 129, 0.58); }"
+        )
+        self._orch_approve_btn.clicked.connect(self._on_approve_orch_plan)
+        self._orch_reject_btn = QPushButton("✕ キャンセル", self._orch_approval_row)
+        self._orch_reject_btn.setStyleSheet(
+            "QPushButton { background-color: rgba(225, 29, 72, 0.32); "
+            "border: 1px solid rgba(251, 113, 133, 0.65); border-radius: 7px; "
+            "padding: 4px 10px; font-size: 11.5px; color: #ffe4e6; }"
+            "QPushButton:hover { background-color: rgba(225, 29, 72, 0.52); }"
+        )
+        self._orch_reject_btn.clicked.connect(self._on_reject_orch_plan)
+        appr_lay.addWidget(self._orch_approve_btn, 1)
+        appr_lay.addWidget(self._orch_reject_btn)
+        self._orch_approval_row.hide()
+        ob_lay.addWidget(self._orch_approval_row)
+
+        self._orch_board.hide()
+        layout.addWidget(self._orch_board)
 
         self._status_bar = QLabel(tab)
         self._status_bar.setStyleSheet(_STATUS_STYLE_NORMAL)
@@ -822,6 +968,10 @@ class BubblePanel(QWidget):
         self._skip_code_check.toggled.connect(self._on_voice_setting_changed)
         vo_lay.addWidget(self._skip_code_check)
 
+        reading_btn = QPushButton("📖 読み辞書を編集（名前の読み間違い補正）…", voice_card)
+        reading_btn.clicked.connect(self._open_reading_dict_dialog)
+        vo_lay.addWidget(reading_btn)
+
         stt_form = QFormLayout()
         stt_form.setSpacing(7)
 
@@ -921,6 +1071,10 @@ class BubblePanel(QWidget):
         self._always_on_top_check.toggled.connect(self._on_display_setting_changed)
         di_lay.addWidget(self._always_on_top_check)
 
+        team_btn = QPushButton("🎼 チーム編成・オーケストレーター設定…", disp_card)
+        team_btn.clicked.connect(self._open_orchestrator_team_dialog)
+        di_lay.addWidget(team_btn)
+
         reset_corner_btn = QPushButton("📍 マスコットを画面右下に戻す", disp_card)
         reset_corner_btn.clicked.connect(self.reset_corner_requested.emit)
         di_lay.addWidget(reset_corner_btn)
@@ -961,6 +1115,21 @@ class BubblePanel(QWidget):
 
             self._populate_model_combo(self._config.agent_id)
             self._sync_mute_button()
+
+            orch_on = bool(getattr(self._config, "orchestrator_mode", False))
+            self._orch_mode_btn.setChecked(orch_on)
+            self._orch_mode_btn.setText(
+                "🎼 碧オーケストレーター: ON" if orch_on else "🎼 碧オーケストレーター: OFF"
+            )
+            if orch_on:
+                aoi_idx = self._sister_combo.findData("aoi")
+                if aoi_idx >= 0:
+                    self._sister_combo.setCurrentIndex(aoi_idx)
+                self._sister_combo.setEnabled(False)
+                self._sister_combo.setToolTip("オーケストレーターモード中は長女・碧が指揮します")
+            else:
+                self._sister_combo.setEnabled(True)
+                self._sister_combo.setToolTip("シスターズ（17姉妹）を選択")
 
             # Settings widgets
             t_idx = self._tts_engine_combo.findData(self._config.tts_engine)
@@ -1144,7 +1313,8 @@ class BubblePanel(QWidget):
 
     # Header drag convenience
     def mousePressEvent(self, event) -> None:  # noqa: ANN001
-        if event.button() == Qt.MouseButton.LeftButton and event.position().y() <= 84:
+        header_bottom = max(84, self._header_widget.geometry().bottom() + 6)
+        if event.button() == Qt.MouseButton.LeftButton and event.position().y() <= header_bottom:
             self._header_drag_pos = event.globalPosition().toPoint() - self.pos()
             event.accept()
             return
@@ -1803,22 +1973,54 @@ class BubblePanel(QWidget):
         cursor = self._chat_input.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         self._chat_input.setTextCursor(cursor)
-        if self._config.stt_auto_send and not self._router.is_running() and not self._compacting:
+        if self._config.stt_auto_send and not self._is_busy():
             self.send_prompt(combined)
             self._chat_input.clear()
 
-    def _render_chat_log(self) -> None:
+    def _is_busy(self) -> bool:
+        return self._router.is_running() or self._orchestrator.is_running() or self._compacting
+
+    def _on_chat_anchor_clicked(self, url: QUrl) -> None:
+        raw = url.toString()
+        if raw.startswith("orch-toggle:"):
+            try:
+                msg_index = int(raw.split(":", 1)[1])
+            except ValueError:
+                return
+            if 0 <= msg_index < len(self._messages):
+                msg = self._messages[msg_index]
+                cur = bool(msg.get("expanded", msg.get("status") == "error"))
+                msg["expanded"] = not cur
+                self._render_chat_log(preserve_scroll=True)
+                self.conversation_changed.emit()
+            return
+        if url.scheme() in ("http", "https"):
+            QDesktopServices.openUrl(url)
+
+    def _render_chat_log(self, *, preserve_scroll: bool = False) -> None:
+        sb = self._chat_browser.verticalScrollBar()
+        prev_scroll = sb.value() if (preserve_scroll and sb is not None) else 0
+
         blocks: list[str] = []
-        for msg in self._messages[-80:]:
-            blocks.append(self._format_message_block(msg))
+        visible = self._messages[-80:]
+        start_idx = max(0, len(self._messages) - len(visible))
+        for offset, msg in enumerate(visible):
+            blocks.append(self._format_message_block(msg, msg_index=start_idx + offset))
 
         if self._streaming_text is not None:
+            if self._orch_synthesis_streaming:
+                aoi_s = self._sisters_by_id.get("aoi") or self._sister
+                stream_author = f"✨ {_short_name(aoi_s.display_name)} (オーケストレーター) · 統合報告中…"
+                stream_accent = aoi_s.accent_color
+            else:
+                stream_author = f"✨ {_short_name(self._sister.display_name)} ({self._config.agent_id}) · 入力中…"
+                stream_accent = self._sister.accent_color
             blocks.append(
                 self._format_message_block(
                     {
                         "role": "sister",
-                        "author": f"✨ {_short_name(self._sister.display_name)} ({self._config.agent_id}) · 入力中…",
-                        "accent": self._sister.accent_color,
+                        "author": stream_author,
+                        "accent": stream_accent,
                         "text": self._streaming_text or "…",
                         "time": "",
                     }
@@ -1833,9 +2035,10 @@ class BubblePanel(QWidget):
         )
         self._chat_browser.setHtml(doc_html)
         sb = self._chat_browser.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        if sb is not None:
+            sb.setValue(min(prev_scroll, sb.maximum()) if preserve_scroll else sb.maximum())
 
-    def _format_message_block(self, msg: dict[str, Any]) -> str:
+    def _format_message_block(self, msg: dict[str, Any], *, msg_index: int = -1) -> str:
         role = msg.get("role", "sister")
         author = html.escape(msg.get("author", ""))
         ts = html.escape(msg.get("time", ""))
@@ -1879,6 +2082,53 @@ class BubblePanel(QWidget):
                 f"{att_html}"
                 f'<div style="color:#f8fafc;">{rendered_body}</div>'
                 "</td></tr></table>"
+            )
+        if role == "orchestrator_plan":
+            return (
+                '<table width="100%" cellspacing="0" cellpadding="5" '
+                'style="background-color:#1a2242; border:1px solid #6366f1; margin:4px 0 5px 0;">'
+                "<tr><td>"
+                f'<div style="font-size:10.5px; color:#a5b4fc; font-weight:bold; margin-bottom:2px;">'
+                f'{author} <span style="color:#94a3b8; font-weight:normal;">{ts}</span></div>'
+                f'<div style="color:#e2e8f0; font-size:11px;">{body_html}</div>'
+                "</td></tr></table>"
+            )
+        if role == "sister_report":
+            is_err_rep = msg.get("status") == "error"
+            expanded = bool(msg.get("expanded", is_err_rep))
+            toggle_html = ""
+            if msg_index >= 0:
+                toggle_lbl = "▼ 折りたたむ" if expanded else "▶ 詳細を見る"
+                toggle_html = (
+                    f'<a href="orch-toggle:{msg_index}" '
+                    'style="color:#93c5fd; text-decoration:none; font-size:10px; font-weight:bold;">'
+                    f"{toggle_lbl}</a>"
+                )
+            hdr_table = (
+                '<table width="100%" cellspacing="0" cellpadding="0" style="margin-bottom:2px;">'
+                "<tr>"
+                f'<td style="font-size:10.5px; color:{html.escape(accent)}; font-weight:bold;">'
+                f'{author} <span style="color:#64748b; font-weight:normal;">{ts}</span></td>'
+                f'<td align="right">{toggle_html}</td>'
+                "</tr></table>"
+            )
+            if expanded:
+                sub_line = html.escape(str(msg.get("dispatch_line") or ""))
+                quote_html = (
+                    f'<div style="color:#cbd5e1; font-size:10.5px; font-style:italic; '
+                    f'margin-bottom:4px;">「{sub_line}」</div>'
+                    if sub_line
+                    else ""
+                )
+                content_html = f"{quote_html}<div style=\"color:#e2e8f0; font-size:11.5px;\">{body_html}</div>"
+            else:
+                preview = html.escape(_plain_preview_line(str(msg.get("text", "")), 110))
+                content_html = f'<div style="color:#94a3b8; font-size:10.5px;">{preview}</div>'
+            return (
+                '<table width="100%" cellspacing="0" cellpadding="5" '
+                f'style="background-color:#141a2e; border-left:3px solid {html.escape(accent)}; '
+                'border-top:1px solid #28324d; margin:2px 10px 4px 6px;">'
+                f"<tr><td>{hdr_table}{content_html}</td></tr></table>"
             )
         if role == "compact":
             return (
@@ -1986,11 +2236,7 @@ class BubblePanel(QWidget):
             f"コンパクト済み要約: {summary_len}文字 ({self._conversation.compacted_count}回実行)\n"
             "AIエージェントや姉妹を切り替えても会話の続きが自動で引き継がれます。"
         )
-        can_click = (
-            self._conversation.can_compact
-            and not self._compacting
-            and not self._router.is_running()
-        )
+        can_click = self._conversation.can_compact and not self._is_busy()
         self._compact_btn.setEnabled(can_click)
 
     def _on_compact_menu_clicked(self) -> None:
@@ -2000,11 +2246,7 @@ class BubblePanel(QWidget):
             "QMenu::item { padding:5px 12px; border-radius:5px; }"
             "QMenu::item:selected { background:#4f46e5; }"
         )
-        can_run = (
-            self._conversation.can_compact
-            and not self._compacting
-            and not self._router.is_running()
-        )
+        can_run = self._conversation.can_compact and not self._is_busy()
 
         ai_act = QAction("🗜️ AIでコンパクト化（おすすめ）", menu)
         ai_act.setEnabled(can_run)
@@ -2079,7 +2321,7 @@ class BubblePanel(QWidget):
             if not auto:
                 self.toast_requested.emit("まだコンパクト化するほどの会話履歴がありません。", False)
             return False
-        if self._router.is_running() or self._compacting:
+        if self._is_busy():
             if not auto:
                 self.toast_requested.emit("現在処理中です。終わってから実行してください。", True)
             return False
@@ -2162,6 +2404,275 @@ class BubblePanel(QWidget):
         )
         return before_chars, after_chars
 
+    def _on_orch_mode_toggled(self, checked: bool) -> None:
+        if self._updating_controls:
+            return
+        if self._is_busy():
+            self._updating_controls = True
+            try:
+                self._orch_mode_btn.setChecked(not checked)
+            finally:
+                self._updating_controls = False
+            self.toast_requested.emit("処理の完了後にオーケストレーターモードを切り替えてください。", True)
+            return
+        self._orch_mode_btn.setText(
+            "🎼 碧オーケストレーター: ON" if checked else "🎼 碧オーケストレーター: OFF"
+        )
+        self._config.orchestrator_mode = bool(checked)
+        self.orchestrator_mode_changed.emit(bool(checked))
+        self.config_updated.emit()
+
+    def _open_orchestrator_team_dialog(self) -> None:
+        dlg = OrchestratorTeamDialog(self._sisters, self._config, self._router, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.config_updated.emit()
+            self.toast_requested.emit("👥 姉妹別AI編成を保存しました", False)
+
+    def _on_approve_orch_plan(self) -> None:
+        self._orch_approval_row.hide()
+        self._orch_board_title.setText("🎼 碧の統括ボード · 実行開始")
+        self._orchestrator.approve_pending_plan()
+
+    def _on_reject_orch_plan(self) -> None:
+        self._orch_approval_row.hide()
+        self._orchestrator.reject_pending_plan()
+
+    def _reset_orch_board(self, title: str = "🎼 碧の統括ボード") -> None:
+        self._orch_task_rows.clear()
+        self._clear_layout(self._orch_tasks_layout)
+        self._orch_board_title.setText(title)
+        self._orch_approval_row.hide()
+
+    def handle_orch_phase_changed(self, phase: str, status_text: str) -> None:
+        if phase == "idle":
+            self._orch_approval_row.hide()
+            self._orch_board.hide()
+            return
+        if status_text:
+            self._orch_board_title.setText(status_text)
+        self._orch_board.show()
+        if status_text:
+            self.touch_activity(status_text)
+
+    def handle_orch_plan_ready(self, plan: OrchestrationPlan, needs_confirmation: bool) -> None:
+        self._reset_orch_board(
+            "🎼 碧の計画（実行待ち）" if needs_confirmation else "🎼 碧の統括ボード · 作業進行中"
+        )
+        plan_lines: list[str] = []
+        if plan.aoi_opening:
+            plan_lines.append(plan.aoi_opening)
+            plan_lines.append("")
+
+        for task in plan.tasks:
+            sister = self._sisters_by_id.get(task.sister_id)
+            sname = _short_name(sister.display_name) if sister else task.sister_id
+            rank = sister.rank_label if sister else ""
+            accent = sister.accent_color if sister else "#818cf8"
+            model_tag = f"{task.agent_id} / {task.model}" if task.model else task.agent_id
+
+            row_frame = QFrame(self._orch_tasks_container)
+            row_frame.setStyleSheet(
+                f"QFrame {{ background-color: rgba(25, 31, 56, 195); "
+                f"border-left: 3px solid {accent}; border-radius: 7px; }}"
+            )
+            r_lay = QHBoxLayout(row_frame)
+            r_lay.setContentsMargins(7, 4, 7, 4)
+            r_lay.setSpacing(6)
+
+            st_lbl = QLabel("⏳", row_frame)
+            st_lbl.setFixedWidth(18)
+            st_lbl.setStyleSheet("border: none; background: transparent; font-size: 11px;")
+
+            title_lbl = QLabel(f"{rank} {sname}: {task.title}", row_frame)
+            title_lbl.setStyleSheet(
+                "border: none; background: transparent; font-size: 11px; font-weight: 600; color: #f8fafc;"
+            )
+
+            meta_lbl = QLabel(f"[{model_tag}]", row_frame)
+            meta_lbl.setStyleSheet("border: none; background: transparent; font-size: 10px; color: #94a3b8;")
+
+            r_lay.addWidget(st_lbl)
+            r_lay.addWidget(title_lbl, 1)
+            r_lay.addWidget(meta_lbl)
+            self._orch_tasks_layout.addWidget(row_frame)
+            self._orch_task_rows[task.id] = {
+                "frame": row_frame,
+                "status": st_lbl,
+                "title": title_lbl,
+                "meta": meta_lbl,
+                "model_tag": model_tag,
+            }
+
+            dep_txt = f" ← {', '.join(task.depends_on)}" if task.depends_on else ""
+            plan_lines.append(f"- **{rank}·{sname}** (`{model_tag}`): {task.title}{dep_txt}")
+
+        self._orch_approval_row.setVisible(bool(needs_confirmation))
+        self._orch_board.show()
+
+        self._messages.append(
+            {
+                "role": "orchestrator_plan",
+                "author": "🎼 碧 (オーケストレーター計画)",
+                "accent": "#6366f1",
+                "text": "\n".join(plan_lines),
+                "time": datetime.now().strftime("%H:%M"),
+            }
+        )
+        self._render_chat_log()
+        self.touch_activity("🎼 碧の計画を共有しました")
+
+    def handle_orch_task_started(self, task: OrchestrationSubTask) -> None:
+        row = self._orch_task_rows.get(task.id)
+        if row is not None:
+            row["status"].setText("🔄")
+            row["meta"].setText(f"[{row['model_tag']}] 実行中…")
+        sister = self._sisters_by_id.get(task.sister_id)
+        sname = _short_name(sister.display_name) if sister else task.sister_id
+        self.touch_activity(f"🎼 {sname}: {task.title}")
+
+    def handle_orch_task_updated(self, task_id: str, status_text: str) -> None:
+        row = self._orch_task_rows.get(task_id)
+        if row is not None and status_text:
+            short_st = status_text if len(status_text) <= 26 else status_text[:25] + "…"
+            row["meta"].setText(f"[{row['model_tag']}] {short_st}")
+        if status_text:
+            self.touch_activity(status_text)
+
+    def handle_orch_task_finished(self, task: OrchestrationSubTask) -> None:
+        icon = {"done": "✅", "error": "❌", "skipped": "⏭️", "cancelled": "⏹"}.get(task.status, "•")
+        row = self._orch_task_rows.get(task.id)
+        if row is not None:
+            row["status"].setText(icon)
+            suffix = f"{task.elapsed:.1f}s" if task.elapsed > 0 else task.status
+            row["meta"].setText(f"[{row['model_tag']}] {suffix}")
+
+        sister = self._sisters_by_id.get(task.sister_id)
+        sname = _short_name(sister.display_name) if sister else task.sister_id
+        rank = sister.rank_label if sister else ""
+        accent = sister.accent_color if sister else "#818cf8"
+        model_tag = f"{task.agent_id} / {task.model}" if task.model else task.agent_id
+        elapsed_suffix = f" · {task.elapsed:.1f}s" if task.elapsed > 0 else ""
+
+        body = (task.output or "").strip()
+        if task.error:
+            body = f"{body}\n\n⚠️ {task.error}".strip() if body else f"⚠️ {task.error}"
+        elif not body:
+            body = "（出力なし）"
+
+        self._messages.append(
+            {
+                "role": "sister_report",
+                "author": f"{icon} {rank}·{sname} ({model_tag}) — {task.title}{elapsed_suffix}",
+                "accent": accent,
+                "status": task.status,
+                "expanded": task.status == "error",
+                "dispatch_line": task.dispatch_line,
+                "text": body,
+                "time": datetime.now().strftime("%H:%M"),
+            }
+        )
+        self._render_chat_log()
+        self.touch_activity(f"{icon} {sname} 完了 ({task.elapsed:.1f}s)")
+
+    def handle_orch_synthesis_delta(self, chunk: str) -> None:
+        self._orch_synthesis_streaming = True
+        if self._streaming_text is None:
+            self._streaming_text = ""
+        self._streaming_text += chunk
+        self.touch_activity("💠 碧姉さんが統合報告を作成中…")
+        if not self._stream_flush_timer.isActive():
+            self._stream_flush_timer.start()
+
+    def handle_orch_synthesis_replace(self, full_text: str) -> None:
+        self._orch_synthesis_streaming = True
+        self._streaming_text = full_text
+        self.touch_activity("💠 碧姉さんが統合報告を作成中…")
+        if not self._stream_flush_timer.isActive():
+            self._stream_flush_timer.start()
+
+    def handle_orch_finished(self, final_text: str, plan: OrchestrationPlan) -> None:
+        self._stream_flush_timer.stop()
+        resolved_text = (final_text or self._streaming_text or "").strip()
+        self._streaming_text = None
+        self._orch_synthesis_streaming = False
+        self._orch_approval_row.hide()
+        self._orch_board.hide()
+
+        aoi = self._sisters_by_id.get("aoi") or self._sister
+        assign_aoi = (getattr(self._config, "sister_assignments", {}) or {}).get("aoi")
+        aoi_agent = (getattr(assign_aoi, "agent_id", "") or "").strip() or self._config.agent_id
+        now_str = datetime.now().strftime("%H:%M")
+
+        if resolved_text:
+            participants: list[str] = []
+            for task in plan.tasks:
+                s = self._sisters_by_id.get(task.sister_id)
+                label = _short_name(s.display_name) if s else task.sister_id
+                if label not in participants:
+                    participants.append(label)
+            conv_text = (
+                f"[参加シスターズ: {', '.join(participants)}]\n{resolved_text}"
+                if participants
+                else resolved_text
+            )
+            self._conversation.add_sister_turn(
+                conv_text,
+                author="碧",
+                sister_id="aoi",
+                agent_id=aoi_agent,
+                time_str=now_str,
+            )
+            author_badge = (
+                f"💠 碧 (オーケストレーター · {aoi_agent})"
+                if plan.tasks
+                else f"💠 碧 ({aoi_agent})"
+            )
+            self._messages.append(
+                {
+                    "role": "sister",
+                    "author": author_badge,
+                    "accent": aoi.accent_color,
+                    "text": resolved_text,
+                    "time": now_str,
+                }
+            )
+
+        self.set_running_state(False)
+        self._render_chat_log()
+        self._refresh_context_bar()
+        self.conversation_changed.emit()
+        self._maybe_warn_or_auto_compact()
+
+    def handle_orch_cancelled(self, summary_text: str) -> None:
+        _ = summary_text
+        self._stream_flush_timer.stop()
+        self._streaming_text = None
+        self._orch_synthesis_streaming = False
+        self._orch_approval_row.hide()
+        self._orch_board.hide()
+        if not self._messages or "中断しました" not in str(self._messages[-1].get("text", "")):
+            self._messages.append(
+                {
+                    "role": "orchestrator_plan",
+                    "author": "⏹ 碧オーケストレーター",
+                    "accent": "#94a3b8",
+                    "text": "オーケストレーションを中断しました。",
+                    "time": datetime.now().strftime("%H:%M"),
+                }
+            )
+        self.set_running_state(False)
+        self._render_chat_log()
+        self._refresh_context_bar()
+        self.conversation_changed.emit()
+
+    def handle_orch_error(self, err: str) -> None:
+        self._stream_flush_timer.stop()
+        self._streaming_text = None
+        self._orch_synthesis_streaming = False
+        self._orch_approval_row.hide()
+        self._orch_board.hide()
+        self.append_error_message(err)
+
     def send_prompt(
         self,
         text: str,
@@ -2176,7 +2687,7 @@ class BubblePanel(QWidget):
         )
         if not prompt and not resolved_attachments:
             return
-        if self._router.is_running() or self._compacting:
+        if self._is_busy():
             self.toast_requested.emit("現在処理中です。停止してから送信してください。", True)
             return
 
@@ -2188,6 +2699,46 @@ class BubblePanel(QWidget):
             self._config.agent_id = preferred_agent
             self.agent_changed.emit(preferred_agent)
             self.sync_from_config(self._sister)
+
+        if bool(getattr(self._config, "orchestrator_mode", False)):
+            now_str = datetime.now().strftime("%H:%M")
+            assign_aoi = (getattr(self._config, "sister_assignments", {}) or {}).get("aoi")
+            aoi_agent = (getattr(assign_aoi, "agent_id", "") or "").strip() or self._config.agent_id
+            handoff = self._conversation.build_handoff_context(
+                aoi_agent, "aoi", has_session=False
+            )
+            att_labels = [f"{att.icon} {att.name}" for att in resolved_attachments]
+            self._conversation.add_user_turn(
+                prompt, attachments=att_labels, time_str=now_str
+            )
+            self._messages.append(
+                {
+                    "role": "user",
+                    "author": "美緒ちゃん",
+                    "accent": "#6366f1",
+                    "text": prompt,
+                    "attachments": format_attachments_for_chat_display(resolved_attachments),
+                    "time": now_str,
+                }
+            )
+            self._pending_orch_prompt = prompt
+            self._orch_synthesis_streaming = False
+            self._streaming_text = None
+            self._reset_orch_board("🎼 碧姉さんが計画を立案中…")
+            self._orch_board.show()
+            self._render_chat_log()
+            self.set_running_state(True, "🎼 碧姉さんが計画を立案中…")
+            started = self._orchestrator.start(
+                prompt,
+                config=self._config,
+                attachments=resolved_attachments,
+                handoff_context=handoff,
+            )
+            if not started:
+                self._orch_board.hide()
+                self.set_running_state(False)
+            self.conversation_changed.emit()
+            return
 
         agent_id = self._config.agent_id
         sister_id = self._sister.id
@@ -2238,6 +2789,18 @@ class BubblePanel(QWidget):
         self.conversation_changed.emit()
 
     def _on_send_or_stop(self) -> None:
+        if self._orchestrator.is_running():
+            was_awaiting = self._orchestrator.is_awaiting_approval()
+            self._orchestrator.cancel()
+            if not was_awaiting:
+                self._streaming_text = None
+                self._orch_synthesis_streaming = False
+                self._orch_approval_row.hide()
+                self._orch_board.hide()
+                self.set_running_state(False)
+                self._render_chat_log()
+                self._refresh_context_bar()
+            return
         if self._router.is_running() or self._compacting:
             was_compacting = self._compacting
             self._compacting = False
@@ -2529,10 +3092,16 @@ class BubblePanel(QWidget):
         self.ensure_models_discovered(aid, force=True)
 
     def _on_new_session(self) -> None:
+        if self._orchestrator.is_running():
+            self._orchestrator.cancel()
+            self.set_running_state(False)
         if self._router.is_running() or self._compacting:
             self._compacting = False
             self._router.cancel()
             self.set_running_state(False)
+        self._orch_approval_row.hide()
+        self._orch_board.hide()
+        self._orch_synthesis_streaming = False
         self._streaming_text = None
         self._router.new_session(None)
         self._conversation.reset()
@@ -2601,6 +3170,56 @@ class BubblePanel(QWidget):
         if not self._updating_controls:
             self._config.tts_rate_offset = int(value)
             self.config_updated.emit()
+
+    def _open_reading_dict_dialog(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("📖 音声の読み辞書（TTS読み補正）")
+        dlg.resize(440, 340)
+        dlg.setStyleSheet(DARK_DIALOG_QSS)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(14, 14, 14, 12)
+        lay.setSpacing(10)
+
+        hint = QLabel(
+            "※「美緒ちゃん」「碧〜焔の全17姉妹」「長女〜十七女」は標準で正しい読みに補正されます。\n"
+            "追加で読み方を指定したい単語があれば「単語=よみ」の形式で1行ずつ入力してください。",
+            dlg,
+        )
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        editor = QPlainTextEdit(dlg)
+        editor.setPlaceholderText("例:\n聖域=せいいき\n律姉さん=りつねえさん")
+        current_map = getattr(self._config, "tts_reading_overrides", {}) or {}
+        if current_map:
+            editor.setPlainText("\n".join(f"{k}={v}" for k, v in sorted(current_map.items())))
+        lay.addWidget(editor, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel,
+            dlg,
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            parsed: dict[str, str] = {}
+            for raw_line in editor.toPlainText().splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                normalized_line = line.replace("＝", "=", 1)
+                if "=" not in normalized_line:
+                    continue
+                src, dst = normalized_line.split("=", 1)
+                src_clean = src.strip()
+                dst_clean = dst.strip()
+                if src_clean and dst_clean:
+                    parsed[src_clean] = dst_clean
+            self._config.tts_reading_overrides = parsed
+            self.config_updated.emit()
+            self.toast_requested.emit("📖 音声の読み辞書を保存しました", False)
 
     def _on_voice_setting_changed(self) -> None:
         if self._updating_controls:

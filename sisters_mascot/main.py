@@ -7,6 +7,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QTimer
@@ -15,6 +16,7 @@ from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
 
 from sisters_mascot import APP_NAME, APP_VERSION
+from sisters_mascot.agents.orchestrator import OrchestratorEngine
 from sisters_mascot.agents.router import AGENT_IDS, AgentRouter
 from sisters_mascot.attachments import MAX_ATTACHMENTS
 from sisters_mascot.audio.stt import VoiceRecorder
@@ -141,6 +143,7 @@ class MascotAppController(QObject):
         self._last_scale: str = self.config.mascot_scale
         self._last_anim_mode: str = str(getattr(self.config, "animation_mode", "rich") or "rich")
         self._last_top: bool = self.config.always_on_top
+        self._last_orchestrator_mode: bool = bool(getattr(self.config, "orchestrator_mode", False))
         self._shutting_down: bool = False
 
         self._size_save_timer = QTimer(self)
@@ -149,12 +152,32 @@ class MascotAppController(QObject):
         self._size_save_timer.timeout.connect(self._save_config_safe)
 
         self.router = AgentRouter(self)
+        self.orchestrator = OrchestratorEngine(self.router, self.sisters, self)
         self.tts = TTSManager(self)
         self.recorder = VoiceRecorder(self)
+        self._last_orch_tts_ts: float = 0.0
+        self._last_summon_fx_ts: float = 0.0
+        self._orch_transition_queue: list[tuple[str, str, str, str, str]] = []
+        self._orch_transition_timer = QTimer(self)
+        self._orch_transition_timer.setSingleShot(True)
+        self._orch_transition_timer.timeout.connect(self._flush_next_orch_transition)
 
         current = self.current_sister()
-        self.mascot = MascotWindow(self.sisters, current, self.config)
-        self.panel = BubblePanel(self.sisters, current, self.config, self.router, self.recorder)
+        initial_mascot_sister = (
+            self.sister_map.get("aoi", current)
+            if getattr(self.config, "orchestrator_mode", False)
+            else current
+        )
+        self._mascot_display_sister_id: str = initial_mascot_sister.id
+        self.mascot = MascotWindow(self.sisters, initial_mascot_sister, self.config)
+        self.panel = BubblePanel(
+            self.sisters,
+            current,
+            self.config,
+            self.router,
+            self.recorder,
+            orchestrator=self.orchestrator,
+        )
         self.tray = SistersTrayIcon(muted=self.config.tts_engine == "off", parent=self.mascot)
 
         self._local_server = QLocalServer(self)
@@ -162,14 +185,17 @@ class MascotAppController(QObject):
         self._connect_signals()
         self._load_conversation_safe()
 
-        self.tray.update_tooltip(f"{current.rank_label} · {current.display_name}", self.config.agent_id)
+        if getattr(self.config, "orchestrator_mode", False):
+            self.tray.update_tooltip(f"🎼 統括: {initial_mascot_sister.display_name}", self.config.agent_id)
+        else:
+            self.tray.update_tooltip(f"{current.rank_label} · {current.display_name}", self.config.agent_id)
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray.show()
 
         self.mascot.show()
         self.mascot.raise_()
-        if current.greeting:
-            self.mascot.show_toast(current.greeting, duration_ms=3200)
+        if initial_mascot_sister.greeting:
+            self.mascot.show_toast(initial_mascot_sister.greeting, duration_ms=3200)
 
         self.panel.ensure_models_discovered(self.config.agent_id)
 
@@ -239,11 +265,13 @@ class MascotAppController(QObject):
         if hasattr(self.mascot, "size_changed"):
             self.mascot.size_changed.connect(self._on_mascot_size_changed)
         self.mascot.files_dropped.connect(self._on_mascot_files_dropped)
+        self.mascot.orchestrator_mode_toggled.connect(self.set_orchestrator_mode)
         self.mascot.quit_requested.connect(self.quit)
 
         # Bubble panel
         self.panel.sister_changed.connect(self.switch_sister)
         self.panel.agent_changed.connect(self.switch_agent)
+        self.panel.orchestrator_mode_changed.connect(self.set_orchestrator_mode)
         self.panel.config_updated.connect(self._on_panel_config_updated)
         self.panel.mascot_size_changed.connect(self._on_panel_mascot_size_changed)
         self.panel.mute_toggled.connect(self.toggle_mute)
@@ -272,6 +300,12 @@ class MascotAppController(QObject):
         self.router.compact_error.connect(self._on_compact_error)
         self.router.activity_logged.connect(self.panel.append_activity_log)
         self.router.model_choices_discovered.connect(self.panel.on_model_choices_discovered)
+
+        # Orchestrator engine (mascot transitions & voice)
+        self.orchestrator.active_sister_changed.connect(self._on_orch_active_sister_changed)
+        self.orchestrator.orchestration_finished.connect(self._on_orch_finished)
+        self.orchestrator.orchestration_cancelled.connect(self._on_orch_cancelled)
+        self.orchestrator.orchestration_error.connect(self._on_orch_error)
 
         # TTS
         self.tts.speaking_started.connect(lambda: self._sync_mascot_idle_or_speaking(True))
@@ -311,14 +345,74 @@ class MascotAppController(QObject):
         else:
             self.mascot.show_toast("すでに添付リストに入っているみたい！", duration_ms=2600)
 
+    def _is_agent_busy(self) -> bool:
+        return self.router.is_running() or self.orchestrator.is_running()
+
+    def _clear_orch_transition_queue(self) -> None:
+        self._orch_transition_queue.clear()
+        self._orch_transition_timer.stop()
+
+    def set_orchestrator_mode(self, enabled: bool) -> None:
+        if self._is_agent_busy():
+            self.mascot.show_toast(
+                "処理の完了後にオーケストレーターモードを切り替えてね。", is_error=True
+            )
+            self.panel.sync_from_config(self.current_sister())
+            return
+        self._clear_orch_transition_queue()
+        new_val = bool(enabled)
+        changed = self._last_orchestrator_mode != new_val
+        self._last_orchestrator_mode = new_val
+        self.config.orchestrator_mode = new_val
+        self._save_config_safe()
+        self.panel.sync_from_config(self.current_sister())
+        self.mascot.sync_orchestrator_badge()
+
+        if new_val:
+            aoi = self.sister_map.get("aoi") or self.current_sister()
+            self.tts.stop()
+            line = aoi.dispatch_lines[0] if getattr(aoi, "dispatch_lines", None) else aoi.greeting
+            self.mascot.play_orchestrator_transition(
+                aoi,
+                role_tag="🎼 指揮モード起動 · 長女 碧",
+                line=line,
+                direction="command",
+                activity_kind="idle",
+                status_label="",
+            )
+            self._last_summon_fx_ts = time.monotonic()
+            self._mascot_display_sister_id = aoi.id
+            self.tray.update_tooltip(f"🎼 統括: {aoi.display_name}", self.config.agent_id)
+        else:
+            restored = self.current_sister()
+            if self._mascot_display_sister_id != restored.id:
+                self.mascot.set_sister(restored)
+                self._mascot_display_sister_id = restored.id
+            else:
+                self.mascot.sync_orchestrator_badge()
+            self.mascot.set_activity("idle")
+            self.tray.update_tooltip(
+                f"{restored.rank_label} · {restored.display_name}", self.config.agent_id
+            )
+            if changed:
+                self.mascot.show_toast("💬 通常対話モードに戻りました", duration_ms=2600)
+
     def switch_sister(self, sister_id: str) -> None:
         sister = self.sister_map.get(sister_id)
-        if sister is None or sister.id == self.config.sister_id:
+        if sister is None:
+            return
+        self._clear_orch_transition_queue()
+        if self.config.orchestrator_mode:
+            self.config.orchestrator_mode = False
+            self._last_orchestrator_mode = False
+            self.mascot.sync_orchestrator_badge()
+        elif sister.id == self.config.sister_id and self._mascot_display_sister_id == sister.id:
             return
         self.tts.stop()
         self.config.sister_id = sister.id
         self._save_config_safe()
         self.mascot.set_sister(sister)
+        self._mascot_display_sister_id = sister.id
         self.panel.notify_sister_switched(sister)
         self.tray.update_tooltip(f"{sister.rank_label} · {sister.display_name}", self.config.agent_id)
         if sister.greeting:
@@ -330,6 +424,7 @@ class MascotAppController(QObject):
         self.config.agent_id = agent_id
         self._save_config_safe()
         self.mascot.set_agent_id(agent_id)
+        self.mascot.sync_orchestrator_badge()
         self.panel.sync_from_config(self.current_sister())
         self.panel.ensure_models_discovered(agent_id)
         self.tray.update_tooltip(
@@ -370,7 +465,7 @@ class MascotAppController(QObject):
         if (
             self.config.tts_click_reactions
             and self.config.tts_engine != "off"
-            and not self.router.is_running()
+            and not self._is_agent_busy()
             and not self.tts.is_speaking()
             and not self.recorder.is_recording()
         ):
@@ -411,6 +506,7 @@ class MascotAppController(QObject):
             self._last_top = self.config.always_on_top
             self.mascot.set_always_on_top(self.config.always_on_top)
 
+        self.mascot.sync_orchestrator_badge()
         self._save_config_safe()
 
     def _on_test_tts(self) -> None:
@@ -457,8 +553,124 @@ class MascotAppController(QObject):
         self.mascot.set_activity("idle")
         self.mascot.show_toast(err, is_error=True, duration_ms=4500)
 
+    def _apply_orch_transition(
+        self,
+        sister_id: str,
+        direction: str,
+        activity_kind: str,
+        status_label: str,
+        line: str,
+    ) -> None:
+        target = self.sister_map.get(sister_id) or self.current_sister()
+        short = target.display_name.split("（", 1)[0].split("(", 1)[0].strip() or target.display_name
+        role_tag = {
+            "command": f"🎼 指揮開始 · {target.rank_label} {short}",
+            "return": f"✨ 統合フェーズ · {target.rank_label} {short}",
+            "summon": f"⚡ 出動 · {target.rank_label} {short}",
+        }.get(direction, f"⚡ 出動 · {target.rank_label} {short}")
+        self.mascot.play_orchestrator_transition(
+            target,
+            role_tag=role_tag,
+            line=line,
+            direction=direction,
+            activity_kind=activity_kind,
+            status_label=status_label,
+        )
+        self._mascot_display_sister_id = target.id
+        now = time.monotonic()
+        if (
+            self.config.tts_engine != "off"
+            and line
+            and not self.recorder.is_recording()
+            and (direction == "return" or now - self._last_orch_tts_ts >= 1.4)
+        ):
+            self._last_orch_tts_ts = now
+            self.tts.speak(line, target, self.config)
+
+    def _flush_next_orch_transition(self) -> None:
+        if not self.orchestrator.is_running() or not self._orch_transition_queue:
+            self._orch_transition_queue.clear()
+            return
+        sister_id, direction, activity_kind, status_label, line = self._orch_transition_queue.pop(0)
+        self._apply_orch_transition(sister_id, direction, activity_kind, status_label, line)
+        self._last_summon_fx_ts = time.monotonic()
+        if self._orch_transition_queue:
+            self._orch_transition_timer.start(1800)
+
+    def _on_orch_active_sister_changed(
+        self,
+        sister_id: str,
+        direction: str,
+        activity_kind: str,
+        status_label: str,
+        line: str,
+    ) -> None:
+        target = self.sister_map.get(sister_id) or self.current_sister()
+        short = target.display_name.split("（", 1)[0].split("(", 1)[0].strip() or target.display_name
+        if direction == "update":
+            if (
+                self._mascot_display_sister_id == target.id
+                or sister_id == "aoi"
+                or not self.config.orchestrator_switch_mascot
+            ):
+                self.mascot.set_activity(activity_kind, status_label)
+            return
+
+        if direction in ("command", "return"):
+            self._clear_orch_transition_queue()
+            self._apply_orch_transition(sister_id, direction, activity_kind, status_label, line)
+            self._last_summon_fx_ts = time.monotonic()
+            return
+
+        if self.config.orchestrator_switch_mascot:
+            elapsed = time.monotonic() - self._last_summon_fx_ts
+            if elapsed < 1.8 or self._orch_transition_timer.isActive():
+                self._orch_transition_queue.append(
+                    (sister_id, direction, activity_kind, status_label, line)
+                )
+                if not self._orch_transition_timer.isActive():
+                    delay_ms = max(250, int((1.8 - elapsed) * 1000))
+                    self._orch_transition_timer.start(delay_ms)
+            else:
+                self._apply_orch_transition(sister_id, direction, activity_kind, status_label, line)
+                self._last_summon_fx_ts = time.monotonic()
+        else:
+            self.mascot.set_activity(activity_kind, status_label)
+            if line:
+                self.mascot.show_toast(
+                    line,
+                    title=f"⚡ 出動 · {target.rank_label} {short}",
+                    duration_ms=3400,
+                )
+
+    def _restore_orchestrator_mascot_idle(self) -> SisterProfile:
+        self._clear_orch_transition_queue()
+        home_sister = (
+            self.sister_map.get("aoi")
+            if getattr(self.config, "orchestrator_mode", False)
+            else None
+        ) or self.current_sister()
+        if self._mascot_display_sister_id != home_sister.id:
+            self.mascot.set_sister(home_sister)
+            self._mascot_display_sister_id = home_sister.id
+        if not self.tts.is_speaking():
+            self.mascot.set_activity("idle")
+        return home_sister
+
+    def _on_orch_finished(self, final_text: str, _plan: object) -> None:
+        aoi = self._restore_orchestrator_mascot_idle()
+        if final_text and self.config.tts_engine != "off":
+            self.tts.speak(final_text, aoi, self.config)
+
+    def _on_orch_cancelled(self, _summary: str) -> None:
+        self._restore_orchestrator_mascot_idle()
+
+    def _on_orch_error(self, err: str) -> None:
+        self._restore_orchestrator_mascot_idle()
+        self.mascot.show_toast(err, is_error=True, duration_ms=4500)
+
     def _sync_mascot_idle_or_speaking(self, speaking: bool) -> None:
-        if self.recorder.is_recording() or self.router.is_running():
+        if self.recorder.is_recording() or self._is_agent_busy():
             return
         if speaking:
             self.mascot.set_activity("speaking", "🔊 お話し中…")
@@ -473,7 +685,7 @@ class MascotAppController(QObject):
 
     def _on_stt_stopped(self) -> None:
         self.panel.set_voice_state("idle")
-        if not self.router.is_running():
+        if not self._is_agent_busy():
             self.mascot.set_activity("idle")
 
     def _on_stt_transcribing(self) -> None:
@@ -482,7 +694,7 @@ class MascotAppController(QObject):
 
     def _on_stt_ready(self, text: str) -> None:
         self.panel.set_voice_state("idle")
-        if not self.router.is_running():
+        if not self._is_agent_busy():
             self.mascot.set_activity("idle")
         self.panel.handle_transcript(text)
         if not self.panel.isVisible() and text.strip():
@@ -490,7 +702,7 @@ class MascotAppController(QObject):
 
     def _on_stt_error(self, err: str) -> None:
         self.panel.set_voice_state("idle")
-        if not self.router.is_running():
+        if not self._is_agent_busy():
             self.mascot.set_activity("idle")
         self.mascot.show_toast(err, is_error=True, duration_ms=4000)
 
@@ -498,6 +710,14 @@ class MascotAppController(QObject):
         if self._shutting_down:
             return
         self._shutting_down = True
+        try:
+            self._clear_orch_transition_queue()
+        except Exception:
+            pass
+        try:
+            self.orchestrator.cancel()
+        except Exception:
+            pass
         try:
             self.router.cancel()
         except Exception:

@@ -211,6 +211,7 @@ class MascotWindow(QWidget):
     size_changed = pyqtSignal(int)
     mascot_clicked_line = pyqtSignal(str)
     files_dropped = pyqtSignal(list)
+    orchestrator_mode_toggled = pyqtSignal(bool)
     quit_requested = pyqtSignal()
 
     def __init__(
@@ -300,6 +301,13 @@ class MascotWindow(QWidget):
         # Size pill overlay
         self._size_pill_text: str = ""
 
+        # Cinematic orchestrator summon / baton-pass transition state
+        self._summon_fx_progress: float = 1.0
+        self._summon_fx_direction: str = "summon"
+        self._prev_fx_pixmap: QPixmap = QPixmap()
+        self._prev_fx_color: QColor = QColor("#818cf8")
+        self._callout_pill_text: str = ""
+
         # Line anti-repeat tracking
         self._last_click_line: str = ""
         self._last_drag_line: str = ""
@@ -348,6 +356,11 @@ class MascotWindow(QWidget):
         self._size_pill_timer = QTimer(self)
         self._size_pill_timer.setSingleShot(True)
         self._size_pill_timer.timeout.connect(self._clear_size_pill)
+
+        # Orchestrator transition callout pill clear timer
+        self._callout_pill_timer = QTimer(self)
+        self._callout_pill_timer.setSingleShot(True)
+        self._callout_pill_timer.timeout.connect(self._clear_callout_pill)
 
         # Debounced wheel resize signal emission (300ms)
         self._size_save_timer = QTimer(self)
@@ -459,10 +472,17 @@ class MascotWindow(QWidget):
         self._minibar.hide()
 
     def _update_minibar_text(self) -> None:
-        self._minibar_label.setText(f"💠 {_short_name(self._sister.display_name)} · {self._agent_id}")
+        if getattr(self._config, "orchestrator_mode", False):
+            self._minibar_label.setText(f"🎼 {_short_name(self._sister.display_name)} · 統括")
+        else:
+            self._minibar_label.setText(f"💠 {_short_name(self._sister.display_name)} · {self._agent_id}")
         self._mute_btn.setText("🔇" if self._muted else "🔊")
         self._minibar.adjustSize()
         self._layout_minibar()
+
+    def sync_orchestrator_badge(self) -> None:
+        """Refresh the hover minibar label when orchestrator mode toggles."""
+        self._update_minibar_text()
 
     def _layout_minibar(self) -> None:
         bw = min(self.width() - 8, max(168, self._minibar.sizeHint().width()))
@@ -730,6 +750,101 @@ class MascotWindow(QWidget):
         self._quirk_hop_vel = 0.0
         self._particles.clear()
         self._ripples.clear()
+        self._summon_fx_progress = 1.0
+        self._prev_fx_pixmap = QPixmap()
+
+    def play_orchestrator_transition(
+        self,
+        sister: SisterProfile,
+        *,
+        role_tag: str = "",
+        line: str = "",
+        direction: str = "summon",
+        activity_kind: str = "thinking",
+        status_label: str = "",
+    ) -> None:
+        """Switch sister sprite with a summon/baton-pass light burst, callout, and toast line."""
+        old_pixmap = QPixmap(self._pixmap) if not self._pixmap.isNull() else QPixmap()
+        old_color, _ = self._sister_colors()
+        switching_sister = sister.id != self._sister.id
+
+        self._temp_state_timer.stop()
+        self._temp_sprite_state = None
+        self._sister = sister
+        self._activity_kind = activity_kind if activity_kind else "thinking"
+        self._status_text = "" if self._activity_kind == "idle" else (status_label or "✨ 考え中…")
+        self._mic_btn.setStyleSheet("")
+        self._ripple_cooldown = 0.0
+        self._update_minibar_text()
+        self._rebuild_geometry_and_pixmap()
+
+        short = _short_name(sister.display_name)
+        if role_tag:
+            self._callout_pill_text = role_tag
+        elif direction == "command":
+            self._callout_pill_text = f"🎼 指揮開始 · {sister.rank_label} {short}"
+        elif direction == "return":
+            self._callout_pill_text = f"✨ 統合 · {sister.rank_label} {short}"
+        else:
+            self._callout_pill_text = f"⚡ 出動 · {sister.rank_label} {short}"
+        self._callout_pill_timer.start(2800)
+
+        self._summon_fx_direction = direction
+        if self._animation_mode == "off":
+            self._summon_fx_progress = 1.0
+            self._prev_fx_pixmap = QPixmap()
+            self._entrance_scale = 1.0
+            self._entrance_vel = 0.0
+            self._entrance_opacity = 1.0
+        elif self._animation_mode == "subtle":
+            self._summon_fx_progress = 0.0
+            self._prev_fx_pixmap = old_pixmap if switching_sister else QPixmap()
+            self._prev_fx_color = old_color
+            self._entrance_scale = 0.88
+            self._entrance_vel = 1.8
+            self._entrance_opacity = 0.18 if switching_sister else 0.78
+            self._spawn_burst_particles(6, include_hearts=False)
+        else:
+            self._summon_fx_progress = 0.0
+            self._prev_fx_pixmap = old_pixmap if switching_sister else QPixmap()
+            self._prev_fx_color = old_color
+            self._entrance_scale = 0.72 if switching_sister else 0.86
+            self._entrance_vel = 3.2
+            self._entrance_opacity = 0.0 if switching_sister else 0.65
+            self._bounce_vel = -125.0
+            self._squash_x = 1.08
+            self._squash_y = 0.92
+            accent_c, sec_c = self._sister_colors()
+            safe_max_r = max(24.0, min(self.width() * 0.5 - 6.0, self.height() * 0.5 - 12.0))
+            base_r = max(self._base_w, self._base_h)
+            self._ripples.append(
+                _Ripple(
+                    radius=min(max(14.0, self._base_w * 0.16), safe_max_r * 0.35),
+                    max_radius=min(base_r * 0.76, safe_max_r),
+                    alpha=0.88,
+                    speed=210.0,
+                    color=QColor(accent_c),
+                    width=2.8,
+                )
+            )
+            self._ripples.append(
+                _Ripple(
+                    radius=min(max(8.0, self._base_w * 0.10), safe_max_r * 0.25),
+                    max_radius=min(base_r * 0.62, safe_max_r * 0.84),
+                    alpha=0.72,
+                    speed=160.0,
+                    color=QColor(sec_c),
+                    width=2.0,
+                )
+            )
+            if len(self._ripples) > 8:
+                self._ripples = self._ripples[-8:]
+            self._spawn_radial_summon_burst(18)
+
+        if line and line.strip():
+            toast_title = role_tag or self._callout_pill_text or f"{sister.rank_label} · {short}"
+            self.show_toast(line.strip(), title=toast_title, duration_ms=4200)
+        self.update()
 
     def refresh_sprite(self) -> None:
         """Re-render sprite (e.g. after importing or resetting custom sprite)."""
@@ -800,6 +915,11 @@ class MascotWindow(QWidget):
             self._size_pill_text = ""
             self.update()
 
+    def _clear_callout_pill(self) -> None:
+        if self._callout_pill_text:
+            self._callout_pill_text = ""
+            self.update()
+
     def _emit_size_changed(self) -> None:
         self.size_changed.emit(self._config.mascot_width)
 
@@ -865,6 +985,36 @@ class MascotWindow(QWidget):
             )
         if len(self._particles) > 28:
             self._particles = self._particles[-28:]
+
+    def _spawn_radial_summon_burst(self, count: int) -> None:
+        if self._animation_mode == "off" or count <= 0:
+            return
+        accent, secondary = self._sister_colors()
+        cx = self.width() * 0.5
+        cy = _PAD_TOP + self._base_h * 0.44
+        for idx in range(count):
+            angle = (math.tau * idx / count) + random.uniform(-0.14, 0.14)
+            speed = random.uniform(62.0, 128.0)
+            color = QColor(accent if idx % 2 == 0 else secondary)
+            if idx % 3 == 0:
+                color = QColor("#fde68a")
+            self._particles.append(
+                _Particle(
+                    x=cx + math.cos(angle) * 10.0,
+                    y=cy + math.sin(angle) * 10.0,
+                    vx=math.cos(angle) * speed,
+                    vy=math.sin(angle) * speed - 12.0,
+                    life=0.0,
+                    max_life=random.uniform(0.65, 1.05),
+                    size=random.uniform(5.8, 9.5),
+                    kind="star",
+                    color=color,
+                    rot=random.uniform(-35.0, 35.0),
+                    vrot=random.uniform(-140.0, 140.0),
+                )
+            )
+        if len(self._particles) > 36:
+            self._particles = self._particles[-36:]
 
     def _spawn_activity_ripple(self) -> None:
         accent, _ = self._sister_colors()
@@ -958,6 +1108,11 @@ class MascotWindow(QWidget):
             self._entrance_vel = 0.0
         if self._entrance_opacity < 1.0:
             self._entrance_opacity = min(1.0, self._entrance_opacity + dt * 4.4)
+
+        if self._summon_fx_progress < 1.0:
+            self._summon_fx_progress = min(1.0, self._summon_fx_progress + dt / 0.78)
+            if self._summon_fx_progress >= 1.0:
+                self._prev_fx_pixmap = QPixmap()
 
         # Pendulum drag swing spring
         if not self._dragging:
@@ -1101,7 +1256,7 @@ class MascotWindow(QWidget):
             elif self._activity_kind == "speaking":
                 glow_color = QColor("#a78bfa")
 
-            radius = max(self._base_w, self._base_h) * 0.56
+            radius = min(max(self._base_w, self._base_h) * 0.56, max(28.0, self.width() * 0.5 - 4.0))
             aura = QRadialGradient(QPointF(pivot_x, aura_cy), radius)
             c0 = QColor(glow_color)
             c0.setAlpha(int((96 if (self._activity_kind != "idle" or self._file_drop_hover) else 54) * pulse))
@@ -1140,6 +1295,9 @@ class MascotWindow(QWidget):
 
             if self._activity_kind == "tool":
                 self._paint_tool_halos(painter, pivot_x, aura_cy)
+
+        if not is_off and self._summon_fx_progress < 1.0:
+            self._paint_summon_fx_bg(painter, pivot_x, pivot_y, aura_cy, accent, secondary)
 
         # Draw sprite anchored at bottom-center pivot so her feet stay grounded
         painter.save()
@@ -1186,7 +1344,10 @@ class MascotWindow(QWidget):
                 else:
                     _draw_four_point_star(painter, QPointF(p.x, p.y), sz, col, p.rot)
 
-        # Top pill overlay (drop indicator > size badge > status pill)
+        if is_rich and self._summon_fx_progress < 1.0:
+            self._paint_summon_fx_fg(painter, accent, secondary)
+
+        # Top pill overlay (drop indicator > size badge > orchestrator callout > status pill)
         if self._file_drop_hover:
             top_pill_text = (
                 f"📎 {self._file_drop_count}件をドロップして添付！"
@@ -1194,11 +1355,15 @@ class MascotWindow(QWidget):
                 else "📎 ドロップして添付！"
             )
             pill_accent = QColor("#34d399")
+        elif self._size_pill_text:
+            top_pill_text = self._size_pill_text
+            pill_accent = QColor("#38bdf8")
+        elif self._callout_pill_text:
+            top_pill_text = self._callout_pill_text
+            pill_accent = QColor("#fbbf24") if self._summon_fx_direction in ("command", "return") else accent.lighter(125)
         else:
-            top_pill_text = self._size_pill_text or (
-                self._status_text if self._activity_kind != "idle" else ""
-            )
-            pill_accent = QColor("#38bdf8") if self._size_pill_text else accent
+            top_pill_text = self._status_text if self._activity_kind != "idle" else ""
+            pill_accent = accent
         if top_pill_text:
             self._paint_top_pill(painter, top_pill_text, pill_accent)
 
@@ -1298,6 +1463,118 @@ class MascotWindow(QWidget):
             col = QColor(103, 232, 249, 220)
             _draw_four_point_star(painter, QPointF(mx, my), 5.0, col, theta * 25.0)
 
+    def _paint_summon_fx_bg(
+        self,
+        painter: QPainter,
+        pivot_x: float,
+        pivot_y: float,
+        aura_cy: float,
+        accent: QColor,
+        secondary: QColor,
+    ) -> None:
+        t = max(0.0, min(1.0, self._summon_fx_progress))
+        envelope = math.sin(t * math.pi)
+        safe_max_r = max(24.0, min(self.width() * 0.5 - 6.0, self.height() * 0.5 - 12.0))
+        base_r = min(max(self._base_w, self._base_h) * 0.46, safe_max_r)
+
+        # 1. Vertical translucent summon light pillar
+        pillar_w = min(self.width() * 0.55, max(24.0, self._base_w * (0.42 + 0.30 * envelope)))
+        pillar_grad = QLinearGradient(
+            pivot_x - pillar_w * 0.5, 0.0, pivot_x + pillar_w * 0.5, 0.0
+        )
+        edge_col = QColor(accent)
+        edge_col.setAlpha(0)
+        mid_col = QColor(secondary)
+        mid_col.setAlpha(int(120 * envelope))
+        core_col = QColor(255, 255, 255, int(155 * envelope))
+        pillar_grad.setColorAt(0.0, edge_col)
+        pillar_grad.setColorAt(0.28, mid_col)
+        pillar_grad.setColorAt(0.5, core_col)
+        pillar_grad.setColorAt(0.72, mid_col)
+        pillar_grad.setColorAt(1.0, edge_col)
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(pillar_grad)
+        painter.drawRect(
+            QRectF(pivot_x - pillar_w * 0.5, float(_PAD_TOP) - 18.0, pillar_w, pivot_y - _PAD_TOP + 22.0)
+        )
+        painter.restore()
+
+        # 2. Rotating double summon magic circle behind sprite
+        painter.save()
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        outer_r = base_r * (0.72 + 0.28 * t)
+        ring_col = QColor(accent.lighter(130))
+        ring_col.setAlpha(int(210 * envelope))
+        pen_outer = QPen(ring_col, 2.2, Qt.PenStyle.DashLine)
+        pen_outer.setDashPattern([9.0, 5.0])
+        painter.setPen(pen_outer)
+        painter.translate(pivot_x, aura_cy)
+        painter.rotate(t * 210.0)
+        painter.drawEllipse(QRectF(-outer_r, -outer_r, outer_r * 2, outer_r * 2))
+        painter.restore()
+
+        painter.save()
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        inner_r = outer_r * 0.78
+        arc_col = QColor("#fde68a" if self._summon_fx_direction in ("command", "return") else secondary)
+        arc_col.setAlpha(int(195 * envelope))
+        painter.setPen(QPen(arc_col, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.translate(pivot_x, aura_cy)
+        painter.rotate(-t * 280.0)
+        inner_rect = QRectF(-inner_r, -inner_r, inner_r * 2, inner_r * 2)
+        painter.drawArc(inner_rect, 0, 95 * 16)
+        painter.drawArc(inner_rect, 180 * 16, 95 * 16)
+        painter.restore()
+
+        # 3. Dissolving ghost of outgoing sister during first 42% of baton pass
+        if not self._prev_fx_pixmap.isNull() and t < 0.42:
+            ghost_t = t / 0.42
+            ghost_alpha = (1.0 - ghost_t) * 0.65
+            painter.save()
+            painter.setOpacity(ghost_alpha)
+            painter.translate(pivot_x, pivot_y - ghost_t * 14.0)
+            g_scale = 1.0 + 0.08 * ghost_t
+            painter.scale(g_scale, g_scale)
+            g_rect = QRectF(
+                -self._sprite_w * 0.5 + self._sprite_offset_x,
+                -float(self._sprite_h) + self._sprite_offset_y,
+                float(self._sprite_w),
+                float(self._sprite_h),
+            )
+            painter.drawPixmap(g_rect, self._prev_fx_pixmap, QRectF(self._prev_fx_pixmap.rect()))
+            painter.restore()
+
+    def _paint_summon_fx_fg(
+        self,
+        painter: QPainter,
+        accent: QColor,
+        secondary: QColor,
+    ) -> None:
+        t = max(0.0, min(1.0, self._summon_fx_progress))
+        if t > 0.68:
+            return
+        streak_t = t / 0.68
+        alpha = int(200 * math.sin(streak_t * math.pi))
+        if alpha <= 4:
+            return
+        painter.save()
+        w = float(self.width())
+        h = float(self.height())
+        for idx, (col_src, width_px, y_off) in enumerate(
+            ((accent.lighter(145), 3.0, -28.0), (secondary.lighter(150), 2.0, 18.0))
+        ):
+            pen_col = QColor(col_src)
+            pen_col.setAlpha(alpha)
+            painter.setPen(QPen(pen_col, width_px, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            progress_x = -0.25 + streak_t * 1.50
+            x0 = w * (progress_x - 0.18 + idx * 0.06)
+            x1 = w * (progress_x + 0.14 + idx * 0.06)
+            y0 = h * 0.65 + y_off - idx * 14.0
+            y1 = h * 0.25 + y_off - idx * 14.0
+            painter.drawLine(QPointF(x0, y0), QPointF(x1, y1))
+        painter.restore()
+
     def _sprite_draw_origin(self) -> tuple[float, float]:
         ox = self.width() * 0.5 - self._sprite_w * 0.5 + self._sprite_offset_x
         oy = float(_PAD_TOP + self._base_h) - float(self._sprite_h) + self._sprite_offset_y
@@ -1308,8 +1585,10 @@ class MascotWindow(QWidget):
         if self._minibar.isVisible() and self._minibar.geometry().contains(pos.toPoint()):
             return True
 
-        top_pill_text = self._size_pill_text or (
-            self._status_text if self._activity_kind != "idle" else ""
+        top_pill_text = (
+            self._size_pill_text
+            or self._callout_pill_text
+            or (self._status_text if self._activity_kind != "idle" else "")
         )
         if top_pill_text and self._top_pill_rect(top_pill_text).adjusted(-4, -4, 4, 4).contains(pos):
             return True
@@ -1610,6 +1889,16 @@ class MascotWindow(QWidget):
 
         menu.addSeparator()
 
+        orch_act = QAction("🎼 オーケストレーターモード (碧統括)", menu)
+        orch_act.setCheckable(True)
+        orch_act.setChecked(bool(getattr(self._config, "orchestrator_mode", False)))
+        orch_act.triggered.connect(
+            lambda checked=False: self.orchestrator_mode_toggled.emit(bool(checked))
+        )
+        menu.addAction(orch_act)
+
+        menu.addSeparator()
+
         voice_act = QAction("🔊 音声読み上げ (ON/OFF)", menu)
         voice_act.setCheckable(True)
         voice_act.setChecked(not self._muted)
@@ -1641,6 +1930,7 @@ class MascotWindow(QWidget):
         self._hover_leave_timer.stop()
         self._pos_save_timer.stop()
         self._size_pill_timer.stop()
+        self._callout_pill_timer.stop()
         self._size_save_timer.stop()
         self._stop_movie()
         self._toast.close()
