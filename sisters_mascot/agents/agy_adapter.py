@@ -15,6 +15,7 @@ from sisters_mascot.agents.base import (
     ModelChoice,
     StreamEvent,
     make_tool_event,
+    make_tool_result_event,
 )
 from sisters_mascot.attachments import AttachmentItem, collect_attachment_dirs
 
@@ -174,6 +175,26 @@ class AgyAdapter(BaseAgentAdapter):
             elif isinstance(content, str) and content and not self._saw_stream_delta:
                 self._emitted_any_text = True
                 events.append(StreamEvent(kind="delta", text=content))
+            return events
+
+        if ev_type == "user":
+            msg = data.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else data.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "tool_result":
+                        continue
+                    t_name = str(block.get("tool_name") or block.get("name") or "tool")
+                    is_err = bool(block.get("is_error"))
+                    detail = block.get("content") if is_err else ""
+                    events.append(make_tool_result_event(t_name, is_error=is_err, detail=detail))
+            return events
+
+        if ev_type == "tool_result":
+            t_name = str(data.get("tool_name") or data.get("name") or "tool")
+            is_err = bool(data.get("is_error"))
+            detail = (data.get("content") or data.get("error") or "") if is_err else ""
+            events.append(make_tool_result_event(t_name, is_error=is_err, detail=detail))
             return events
 
         if ev_type in ("tool_use", "tool", "tool_call"):

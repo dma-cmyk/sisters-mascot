@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,14 +12,17 @@ from typing import Any, Sequence
 from sisters_mascot.attachments import AttachmentItem
 
 PLAYWRIGHT_TOOL_KEYWORDS = ("playwright", "browser_")
+_TOOL_CALL_RE = re.compile(r"tools\.([A-Za-z0-9_]+\.[A-Za-z0-9_]+)")
 
 
 @dataclass
 class StreamEvent:
-    kind: str  # "delta" | "replace" | "tool" | "status" | "session" | "done" | "error"
+    kind: str  # "delta" | "replace" | "tool" | "status" | "log" | "session" | "done" | "error"
     text: str = ""
     session_id: str | None = None
     tool_name: str | None = None
+    detail: str = ""
+    level: str = "info"
 
 
 @dataclass
@@ -36,32 +40,168 @@ class ModelChoice:
     label: str = ""
 
 
+def _clip_single_line(text: Any, max_chars: int = 90) -> str:
+    """Collapse whitespace and extract a concise single-line preview."""
+    if isinstance(text, list):
+        parts: list[str] = []
+        for item in text:
+            if isinstance(item, dict) and item.get("text"):
+                parts.append(str(item["text"]))
+            elif isinstance(item, str):
+                parts.append(item)
+        raw = " ".join(parts)
+    elif isinstance(text, dict):
+        raw = str(text.get("message") or text.get("text") or text.get("error") or text)
+    else:
+        raw = str(text or "")
+    collapsed = " ".join(raw.split()).strip()
+    if len(collapsed) <= max_chars:
+        return collapsed
+    return collapsed[: max(1, max_chars - 1)] + "…"
+
+
+def extract_effective_tool_name(tool_name: str, payload: Any = None) -> str:
+    """Resolve wrapped tool names (e.g. OpenCode `execute` wrapping `playwright.*`)."""
+    clean = (tool_name or "").strip() or "tool"
+    if not isinstance(payload, dict):
+        return clean
+
+    state = payload.get("state")
+    if isinstance(state, dict):
+        meta = state.get("metadata")
+        if isinstance(meta, dict):
+            tool_calls = meta.get("toolCalls")
+            if isinstance(tool_calls, list) and tool_calls:
+                last_call = tool_calls[-1]
+                if isinstance(last_call, dict):
+                    inner = str(last_call.get("tool") or last_call.get("name") or "").strip()
+                    if inner:
+                        return inner
+        st_input = state.get("input")
+        if isinstance(st_input, dict):
+            code = st_input.get("code")
+            if isinstance(code, str):
+                match = _TOOL_CALL_RE.search(code)
+                if match:
+                    return match.group(1)
+
+    return clean
+
+
 def is_playwright_tool(tool_name: str, payload: Any = None) -> bool:
     """Return True if a tool call targets Playwright / Chrome browser automation."""
-    haystack = tool_name.lower()
-    if any(kw in haystack for kw in PLAYWRIGHT_TOOL_KEYWORDS):
-        return True
+    effective = extract_effective_tool_name(tool_name, payload)
+    for candidate in (tool_name, effective):
+        haystack = (candidate or "").lower()
+        if any(kw in haystack for kw in PLAYWRIGHT_TOOL_KEYWORDS):
+            return True
     if isinstance(payload, dict):
         for key in ("server", "mcp_server", "server_name", "tool", "name"):
             val = payload.get(key)
             if isinstance(val, str) and any(kw in val.lower() for kw in PLAYWRIGHT_TOOL_KEYWORDS):
                 return True
+        state = payload.get("state")
+        if isinstance(state, dict):
+            st_input = state.get("input")
+            if isinstance(st_input, dict):
+                code = st_input.get("code")
+                if isinstance(code, str) and any(kw in code.lower() for kw in PLAYWRIGHT_TOOL_KEYWORDS):
+                    return True
     return False
+
+
+def summarize_tool_payload(tool_name: str, payload: Any = None, *, max_chars: int = 90) -> str:
+    """Extract a concise single-line preview of a tool's target or arguments."""
+    _ = tool_name
+    if not isinstance(payload, dict):
+        return ""
+
+    candidates: list[dict[str, Any]] = [payload]
+    state = payload.get("state")
+    if isinstance(state, dict):
+        meta = state.get("metadata")
+        if isinstance(meta, dict):
+            tool_calls = meta.get("toolCalls")
+            if isinstance(tool_calls, list) and tool_calls and isinstance(tool_calls[-1], dict):
+                last_in = tool_calls[-1].get("input")
+                if isinstance(last_in, dict):
+                    candidates.append(last_in)
+        if isinstance(state.get("input"), dict):
+            candidates.append(state["input"])
+    for key in ("input", "arguments", "params"):
+        sub = payload.get(key)
+        if isinstance(sub, dict):
+            candidates.append(sub)
+
+    for src in candidates:
+        for field_name in (
+            "command",
+            "cmd",
+            "url",
+            "path",
+            "file_path",
+            "element",
+            "query",
+            "text",
+            "target",
+            "code",
+        ):
+            val = src.get(field_name)
+            if isinstance(val, str) and val.strip():
+                return _clip_single_line(val, max_chars)
+    return ""
 
 
 def make_tool_event(tool_name: str, payload: Any = None) -> StreamEvent:
     """Create a StreamEvent for a tool invocation, highlighting Playwright Chrome actions."""
-    clean_name = tool_name.strip() or "tool"
-    if is_playwright_tool(clean_name, payload):
+    effective = extract_effective_tool_name(tool_name, payload)
+    detail = summarize_tool_payload(effective, payload)
+    if is_playwright_tool(effective, payload):
         return StreamEvent(
             kind="tool",
-            tool_name=clean_name,
+            tool_name=effective,
             text="🌐 Chrome (Playwright) 操作中...",
+            detail=detail,
+            level="tool",
         )
     return StreamEvent(
         kind="tool",
+        tool_name=effective,
+        text=f"🛠️ {effective} 実行中...",
+        detail=detail,
+        level="tool",
+    )
+
+
+def make_tool_result_event(
+    tool_name: str,
+    *,
+    is_error: bool = False,
+    detail: Any = "",
+) -> StreamEvent:
+    """Create a structured execution log StreamEvent when a tool completes or fails."""
+    clean_name = (tool_name or "").strip() or "tool"
+    clean_detail = _clip_single_line(detail, 140) if detail else ""
+    if is_error:
+        msg = (
+            f"❌ ツール失敗 ({clean_name}): {clean_detail}"
+            if clean_detail
+            else f"❌ ツール失敗 ({clean_name})"
+        )
+        return StreamEvent(
+            kind="log",
+            tool_name=clean_name,
+            text=msg,
+            detail=clean_detail,
+            level="error",
+        )
+    msg = f"✅ 完了 ({clean_name}: {clean_detail})" if clean_detail else f"✅ 完了 ({clean_name})"
+    return StreamEvent(
+        kind="log",
         tool_name=clean_name,
-        text=f"🛠️ {clean_name} 実行中...",
+        text=msg,
+        detail=clean_detail,
+        level="info",
     )
 
 

@@ -1940,5 +1940,233 @@ class TestConversationContinuityAndCompact(unittest.TestCase):
             app.processEvents()
 
 
+class TestActivityMonitoringAndErrorVisibility(unittest.TestCase):
+    """Live activity log, stderr/non-zero exit visibility, stall detection, and cancel dedup."""
+
+    def test_adapter_tool_lifecycle_error_reasoning_and_multipart_text(self) -> None:
+        oc = OpenCodeAdapter()
+        oc.reset_state()
+
+        e1 = oc.parse_line('{"type":"text","part":{"id":"p1","type":"text","text":"10番を始めます。"}}')
+        self.assertEqual([(e.kind, e.text) for e in e1], [("delta", "10番を始めます。")])
+        e2 = oc.parse_line('{"type":"text","part":{"id":"p2","type":"text","text":"11番へ進みます。"}}')
+        self.assertEqual([(e.kind, e.text) for e in e2], [("delta", "\n\n11番へ進みます。")])
+
+        tool_run = oc.parse_line(
+            json.dumps(
+                {
+                    "type": "tool",
+                    "part": {
+                        "id": "t1",
+                        "type": "tool",
+                        "tool": "execute",
+                        "state": {
+                            "status": "running",
+                            "input": {"code": "return await tools.playwright.browser_evaluate({target:\"e1\"});"},
+                        },
+                    },
+                }
+            )
+        )
+        self.assertEqual(len(tool_run), 1)
+        self.assertEqual(tool_run[0].kind, "tool")
+        self.assertEqual(tool_run[0].tool_name, "playwright.browser_evaluate")
+        self.assertIn("Playwright", tool_run[0].text)
+
+        tool_err = oc.parse_line(
+            json.dumps(
+                {
+                    "type": "tool",
+                    "part": {
+                        "id": "t1",
+                        "type": "tool",
+                        "tool": "execute",
+                        "state": {
+                            "status": "error",
+                            "error": {"type": "aborted", "message": "Tool execution interrupted"},
+                            "metadata": {"toolCalls": [{"tool": "playwright.browser_evaluate"}]},
+                        },
+                    },
+                }
+            )
+        )
+        self.assertEqual(len(tool_err), 1)
+        self.assertEqual((tool_err[0].kind, tool_err[0].level), ("log", "error"))
+        self.assertIn("Tool execution interrupted", tool_err[0].text)
+
+        tool_ok = oc.parse_line(
+            json.dumps(
+                {
+                    "type": "tool",
+                    "part": {
+                        "id": "t2",
+                        "type": "tool",
+                        "tool": "execute",
+                        "state": {
+                            "status": "completed",
+                            "metadata": {"toolCalls": [{"tool": "playwright.browser_click"}]},
+                        },
+                    },
+                }
+            )
+        )
+        self.assertEqual((tool_ok[0].kind, tool_ok[0].level), ("log", "info"))
+        self.assertIn("playwright.browser_click", tool_ok[0].text)
+
+        reason = oc.parse_line('{"type":"reasoning","part":{"id":"r1","type":"reasoning","text":"Checking selector state"}}')
+        self.assertEqual(reason[0].kind, "log")
+        self.assertIn("💭 思考:", reason[0].text)
+
+        claude = ClaudeAdapter()
+        c_res = claude.parse_line('{"type":"user","message":{"content":[{"type":"tool_result","tool_name":"Bash","is_error":true,"content":"Permission denied"}]}}')
+        self.assertEqual((c_res[0].kind, c_res[0].level), ("log", "error"))
+        self.assertIn("Permission denied", c_res[0].text)
+
+        codex = CodexAdapter()
+        cx_start = codex.parse_line('{"type":"item.started","item":{"id":"c1","type":"command_execution","command":"pytest -q"}}')
+        self.assertEqual(cx_start[0].detail, "pytest -q")
+        cx_fail = codex.parse_line('{"type":"item.completed","item":{"id":"c1","type":"command_execution","command":"pytest -q","exit_code":1}}')
+        self.assertEqual((cx_fail[0].kind, cx_fail[0].level), ("log", "error"))
+        self.assertIn("exit=1", cx_fail[0].text)
+
+    def test_router_surfaces_stderr_nonzero_exit_after_text_and_cancel_no_dup(self) -> None:
+        app = _ensure_qapp()
+
+        class _SyncThread:
+            def __init__(self, target=None, args=(), kwargs=None, daemon=None) -> None:
+                self._target = target
+                self._args = args
+                self._kwargs = kwargs or {}
+
+            def start(self) -> None:
+                if self._target:
+                    self._target(*self._args, **self._kwargs)
+
+            def join(self, timeout=None) -> None:  # noqa: ANN001
+                _ = timeout
+
+        # 1. Partial text followed by stderr + non-zero exit must surface error
+        r1 = AgentRouter()
+        oc = r1.get_adapter("opencode")
+        replies: list[str] = []
+        errors: list[str] = []
+        logs: list[tuple[str, str]] = []
+        r1.reply_finished.connect(replies.append)
+        r1.error_occurred.connect(errors.append)
+        r1.activity_logged.connect(lambda lvl, msg: logs.append((lvl, msg)))
+
+        class _CrashProc:
+            stdin = None
+            stdout = iter(['{"type":"text","part":{"id":"p1","type":"text","text":"途中まで出力"}}\n'])
+            stderr = iter(["Error: ECONNREFUSED 127.0.0.1:9222\n"])
+
+            def wait(self) -> int:
+                return 1
+
+            def poll(self):
+                return 1
+
+        with (
+            patch.object(oc, "is_available", return_value=True),
+            patch("sisters_mascot.agents.router.subprocess.Popen", return_value=_CrashProc()),
+            patch("sisters_mascot.agents.router.threading.Thread", _SyncThread),
+        ):
+            r1.send_message("opencode", "作業して", sister=load_all_sisters()[0])
+
+        app.processEvents()
+        self.assertEqual(replies, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("exit=1", errors[0])
+        self.assertIn("ECONNREFUSED", errors[0])
+        self.assertTrue(any(lvl == "error" and "ECONNREFUSED" in msg for lvl, msg in logs))
+
+        # 2. User cancel emits turn_cancelled instead of reply_finished
+        r2 = AgentRouter()
+        oc2 = r2.get_adapter("opencode")
+        r2_replies: list[str] = []
+        r2_cancelled: list[str] = []
+        r2.reply_finished.connect(r2_replies.append)
+        r2.turn_cancelled.connect(r2_cancelled.append)
+
+        class _CancelProc:
+            stdin = None
+            stdout = iter(['{"type":"text","part":{"id":"p1","type":"text","text":"途中"}}\n'])
+            stderr = iter(())
+
+            def wait(self) -> int:
+                return -15
+
+            def poll(self):
+                return -15
+
+        def _fake_parse_and_cancel(line: str):
+            r2._cancel_requested = True
+            return []
+
+        with (
+            patch.object(oc2, "is_available", return_value=True),
+            patch.object(oc2, "parse_line", side_effect=_fake_parse_and_cancel),
+            patch("sisters_mascot.agents.router.subprocess.Popen", return_value=_CancelProc()),
+            patch("sisters_mascot.agents.router.threading.Thread", _SyncThread),
+        ):
+            r2.send_message("opencode", "作業して", sister=load_all_sisters()[0])
+
+        app.processEvents()
+        self.assertEqual(r2_replies, [])
+        self.assertEqual(len(r2_cancelled), 1)
+
+    def test_bubble_panel_activity_drawer_heartbeat_stall_and_cancel_dedup(self) -> None:
+        import time as _time
+
+        app = _ensure_qapp()
+        sisters = load_all_sisters()
+        cfg = AppConfig(tts_engine="off")
+        router = AgentRouter()
+        panel = BubblePanel(sisters, sisters[0], cfg, router, VoiceRecorder())
+        try:
+            panel.show()
+            self.assertFalse(panel._activity_drawer.isVisible())
+            panel._log_toggle_btn.click()
+            self.assertTrue(panel._activity_drawer.isVisible())
+            panel._log_toggle_btn.click()
+            self.assertFalse(panel._activity_drawer.isVisible())
+
+            panel.set_running_state(True, "🌐 Chrome (Playwright) 操作中...")
+            self.assertTrue(panel._status_bar.isVisible())
+            self.assertIn("経過 00:", panel._status_bar.text())
+            self.assertIn("●", panel._log_toggle_btn.text())
+
+            panel.append_activity_log("error", "[stderr] Connection reset")
+            self.assertIn("⚠️1", panel._log_toggle_btn.text())
+            self.assertIn("Connection reset", panel._activity_view.toPlainText())
+            self.assertIn("⚠️エラー1件", panel._status_bar.text())
+
+            # Simulate 50s without activity -> stall warning banner + log line
+            panel._last_activity_ts = _time.monotonic() - 50.0
+            panel._on_activity_tick()
+            self.assertIn("秒間更新なし", panel._status_bar.text())
+            self.assertTrue(panel._stall_notified)
+            self.assertIn("新しい応答がありません", panel._activity_view.toPlainText())
+
+            # Cancel deduplication: _on_send_or_stop + handle_turn_cancelled saves once
+            with patch.object(router, "send_message"):
+                panel.send_prompt("キャンセルテスト")
+            panel.append_stream_delta("途中までのテキスト")
+            with (
+                patch.object(router, "is_running", return_value=True),
+                patch.object(router, "cancel"),
+            ):
+                panel._on_send_or_stop()
+            panel.handle_turn_cancelled("途中までのテキスト")
+
+            self.assertEqual(len(panel._conversation.turns), 2)
+            cancelled_msgs = [m for m in panel._messages if "(中断)" in str(m.get("author", ""))]
+            self.assertEqual(len(cancelled_msgs), 1)
+            app.processEvents()
+        finally:
+            panel.close()
+            app.processEvents()
+
+
 if __name__ == "__main__":
     unittest.main()

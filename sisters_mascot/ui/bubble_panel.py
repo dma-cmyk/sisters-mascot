@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
@@ -46,7 +47,7 @@ from PyQt6.QtWidgets import (
 
 from sisters_mascot import USER_SPRITES_DIR
 from sisters_mascot.agents.base import ModelChoice
-from sisters_mascot.agents.router import AGENT_IDS, AgentRouter
+from sisters_mascot.agents.router import ACTIVITY_LOG_FILE, AGENT_IDS, AgentRouter
 from sisters_mascot.attachments import (
     AttachmentItem,
     MAX_ATTACHMENTS,
@@ -96,6 +97,25 @@ _SPRITE_STATES: list[tuple[str, str]] = [
     ("talking", "お話し中 (talking)"),
     ("dragged", "ドラッグ中 (dragged)"),
 ]
+
+STALL_WARN_SECONDS: float = 45.0
+MAX_ACTIVITY_LOG_LINES: int = 300
+
+_STATUS_STYLE_NORMAL = (
+    "background-color: rgba(99, 102, 241, 0.22); "
+    "border: 1px solid rgba(129, 140, 248, 0.45); "
+    "border-radius: 8px; padding: 4px 10px; font-size: 11.5px; color: #e0e7ff;"
+)
+_STATUS_STYLE_WARN = (
+    "background-color: rgba(217, 119, 6, 0.26); "
+    "border: 1px solid rgba(251, 191, 36, 0.65); "
+    "border-radius: 8px; padding: 4px 10px; font-size: 11.5px; color: #fef3c7;"
+)
+_STATUS_STYLE_ERROR = (
+    "background-color: rgba(225, 29, 72, 0.24); "
+    "border: 1px solid rgba(251, 113, 133, 0.65); "
+    "border-radius: 8px; padding: 4px 10px; font-size: 11.5px; color: #ffe4e6;"
+)
 
 _PANEL_QSS = """
 #BubbleGlassFrame {
@@ -261,6 +281,13 @@ class BubblePanel(QWidget):
         self._pending_turn_sister_name: str = ""
         self._pending_turn_summary_gen: int = 0
         self._pending_turn_had_session: bool = False
+        self._activity_logs: list[str] = []
+        self._turn_error_count: int = 0
+        self._turn_warn_count: int = 0
+        self._run_started_ts: float | None = None
+        self._last_activity_ts: float | None = None
+        self._base_status_text: str = ""
+        self._stall_notified: bool = False
         self._streaming_text: str | None = None
         self._discovered_choices: dict[str, list[ModelChoice]] = {}
         self._manual_refresh_pending: set[str] = set()
@@ -295,6 +322,10 @@ class BubblePanel(QWidget):
         self._drop_overlay_hide_timer.setSingleShot(True)
         self._drop_overlay_hide_timer.setInterval(45)
         self._drop_overlay_hide_timer.timeout.connect(self._hide_drop_overlay)
+
+        self._activity_tick_timer = QTimer(self)
+        self._activity_tick_timer.setInterval(1000)
+        self._activity_tick_timer.timeout.connect(self._on_activity_tick)
 
         self._build_ui()
         self._ui_ready = True
@@ -485,6 +516,21 @@ class BubblePanel(QWidget):
         self._compact_menu_btn.clicked.connect(self._on_compact_menu_clicked)
         ctx_lay.addWidget(self._compact_menu_btn)
 
+        self._log_toggle_btn = QToolButton(self._context_bar)
+        self._log_toggle_btn.setText("📋 ログ")
+        self._log_toggle_btn.setCheckable(True)
+        self._log_toggle_btn.setToolTip("リアルタイム実行ログ（ツール実行・エラー・stderr）を表示/非表示")
+        self._log_toggle_btn.setStyleSheet(
+            "QToolButton { background-color: rgba(51, 65, 95, 190); "
+            "border: 1px solid rgba(148, 163, 184, 0.25); "
+            "border-radius: 7px; padding: 2px 7px; font-size: 11px; color: #e2e8f0; }"
+            "QToolButton:checked { background-color: rgba(99, 102, 241, 0.42); "
+            "border-color: rgba(165, 180, 252, 0.75); color: #ffffff; }"
+            "QToolButton:hover { background-color: rgba(99, 102, 241, 0.45); }"
+        )
+        self._log_toggle_btn.toggled.connect(self._on_log_drawer_toggled)
+        ctx_lay.addWidget(self._log_toggle_btn)
+
         layout.addWidget(self._context_bar)
 
         self._chat_browser = QTextBrowser(tab)
@@ -495,13 +541,61 @@ class BubblePanel(QWidget):
         layout.addWidget(self._chat_browser, 1)
 
         self._status_bar = QLabel(tab)
-        self._status_bar.setStyleSheet(
-            "background-color: rgba(99, 102, 241, 0.22); "
-            "border: 1px solid rgba(129, 140, 248, 0.45); "
-            "border-radius: 8px; padding: 4px 10px; font-size: 11.5px; color: #e0e7ff;"
-        )
+        self._status_bar.setStyleSheet(_STATUS_STYLE_NORMAL)
         self._status_bar.hide()
         layout.addWidget(self._status_bar)
+
+        # Collapsible live activity log drawer
+        self._activity_drawer = QFrame(tab)
+        self._activity_drawer.setStyleSheet(
+            "QFrame { background-color: rgba(9, 13, 26, 228); "
+            "border: 1px solid rgba(148, 163, 184, 0.24); border-radius: 10px; }"
+        )
+        act_lay = QVBoxLayout(self._activity_drawer)
+        act_lay.setContentsMargins(8, 6, 8, 6)
+        act_lay.setSpacing(4)
+
+        act_hdr = QHBoxLayout()
+        act_hdr.setSpacing(5)
+        act_title = QLabel("📋 リアルタイム実行ログ", self._activity_drawer)
+        act_title.setStyleSheet(
+            "border: none; background: transparent; font-size: 11px; font-weight: 700; color: #cbd5e1;"
+        )
+        act_hdr.addWidget(act_title, 1)
+
+        for btn_txt, tip, slot in (
+            ("コピー", "ログ全文をクリップボードへコピー", self._copy_activity_logs),
+            ("ファイル", "activity.log の保存先を開く", self._open_activity_log_file),
+            ("🗑️", "ログ表示をクリア", self._clear_activity_logs),
+        ):
+            b = QToolButton(self._activity_drawer)
+            b.setText(btn_txt)
+            b.setToolTip(tip)
+            b.setStyleSheet(
+                "QToolButton { background-color: rgba(38, 45, 72, 210); "
+                "border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 6px; "
+                "padding: 1px 6px; font-size: 10.5px; color: #e2e8f0; }"
+                "QToolButton:hover { background-color: rgba(99, 102, 241, 0.45); }"
+            )
+            b.clicked.connect(slot)
+            act_hdr.addWidget(b)
+        act_lay.addLayout(act_hdr)
+
+        self._activity_view = QPlainTextEdit(self._activity_drawer)
+        self._activity_view.setReadOnly(True)
+        self._activity_view.setFixedHeight(125)
+        self._activity_view.setPlaceholderText(
+            "ここにAIのツール実行・思考・エラー・stderrがリアルタイム表示されます…"
+        )
+        self._activity_view.setStyleSheet(
+            "QPlainTextEdit { background-color: rgba(6, 9, 19, 235); color: #cbd5e1; "
+            "border: 1px solid rgba(71, 85, 105, 0.35); border-radius: 7px; "
+            "font-family: monospace; font-size: 10.5px; padding: 4px 6px; }"
+        )
+        act_lay.addWidget(self._activity_view)
+
+        self._activity_drawer.hide()
+        layout.addWidget(self._activity_drawer)
 
         # Horizontal quick-prompt chips
         self._chips_scroll = QScrollArea(tab)
@@ -1358,38 +1452,210 @@ class BubblePanel(QWidget):
 
     def set_running_state(self, running: bool, status: str = "") -> None:
         if running:
+            now = time.monotonic()
+            self._run_started_ts = now
+            self._last_activity_ts = now
+            self._turn_error_count = 0
+            self._turn_warn_count = 0
+            self._stall_notified = False
+            self._base_status_text = status or "✨ 考え中…"
             self._send_btn.setText("⏹ 停止")
             self._send_btn.setStyleSheet(
                 "background-color: rgba(225, 29, 72, 0.72); border-color: #fda4af; color: #fff;"
             )
-            if status:
-                self._status_bar.setText(status)
-                self._status_bar.show()
+            self._activity_tick_timer.start()
+            self._on_activity_tick()
         else:
+            self._activity_tick_timer.stop()
+            self._run_started_ts = None
+            self._last_activity_ts = None
+            self._stall_notified = False
+            self._base_status_text = ""
             self._send_btn.setText("送信")
             self._send_btn.setStyleSheet("")
+            self._status_bar.setStyleSheet(_STATUS_STYLE_NORMAL)
             self._status_bar.hide()
+        if hasattr(self, "_log_toggle_btn"):
+            self._update_log_toggle_badge()
         if hasattr(self, "_compact_btn"):
             self._refresh_context_bar()
 
+    def touch_activity(self, status_text: str | None = None) -> None:
+        """Record fresh agent activity to reset stall timer and update status."""
+        self._last_activity_ts = time.monotonic()
+        self._stall_notified = False
+        if status_text is not None:
+            self._base_status_text = status_text
+        if self._run_started_ts is not None:
+            self._on_activity_tick()
+        elif status_text:
+            self._status_bar.setStyleSheet(_STATUS_STYLE_NORMAL)
+            self._status_bar.setText(status_text)
+            self._status_bar.show()
+
+    def _update_log_toggle_badge(self) -> None:
+        if not hasattr(self, "_log_toggle_btn"):
+            return
+        if self._turn_error_count > 0:
+            self._log_toggle_btn.setText(f"📋 ログ ⚠️{self._turn_error_count}")
+            self._log_toggle_btn.setStyleSheet(
+                "QToolButton { background-color: rgba(225, 29, 72, 0.34); "
+                "border: 1px solid rgba(251, 113, 133, 0.72); "
+                "border-radius: 7px; padding: 2px 7px; font-size: 11px; color: #ffe4e6; font-weight: 600; }"
+                "QToolButton:checked { background-color: rgba(225, 29, 72, 0.55); border-color: #fda4af; }"
+            )
+        elif self._run_started_ts is not None:
+            self._log_toggle_btn.setText("📋 ログ ●")
+            self._log_toggle_btn.setStyleSheet(
+                "QToolButton { background-color: rgba(51, 65, 95, 210); "
+                "border: 1px solid rgba(129, 140, 248, 0.55); "
+                "border-radius: 7px; padding: 2px 7px; font-size: 11px; color: #c7d2fe; }"
+                "QToolButton:checked { background-color: rgba(99, 102, 241, 0.42); color: #ffffff; }"
+            )
+        elif self._turn_warn_count > 0:
+            self._log_toggle_btn.setText(f"📋 ログ ({self._turn_warn_count})")
+            self._log_toggle_btn.setStyleSheet(
+                "QToolButton { background-color: rgba(217, 119, 6, 0.25); "
+                "border: 1px solid rgba(251, 191, 36, 0.55); "
+                "border-radius: 7px; padding: 2px 7px; font-size: 11px; color: #fef3c7; }"
+                "QToolButton:checked { background-color: rgba(99, 102, 241, 0.42); color: #ffffff; }"
+            )
+        else:
+            self._log_toggle_btn.setText("📋 ログ")
+            self._log_toggle_btn.setStyleSheet(
+                "QToolButton { background-color: rgba(51, 65, 95, 190); "
+                "border: 1px solid rgba(148, 163, 184, 0.25); "
+                "border-radius: 7px; padding: 2px 7px; font-size: 11px; color: #e2e8f0; }"
+                "QToolButton:checked { background-color: rgba(99, 102, 241, 0.42); "
+                "border-color: rgba(165, 180, 252, 0.75); color: #ffffff; }"
+                "QToolButton:hover { background-color: rgba(99, 102, 241, 0.45); }"
+            )
+
+    def _on_log_drawer_toggled(self, checked: bool) -> None:
+        self._activity_drawer.setVisible(bool(checked))
+        if checked:
+            sb = self._activity_view.verticalScrollBar()
+            if sb is not None:
+                sb.setValue(sb.maximum())
+
+    def _copy_activity_logs(self) -> None:
+        cb = QGuiApplication.clipboard()
+        if cb is not None:
+            cb.setText("\n".join(self._activity_logs))
+        self.toast_requested.emit("📋 実行ログをコピーしました", False)
+
+    def _open_activity_log_file(self) -> None:
+        target = ACTIVITY_LOG_FILE if ACTIVITY_LOG_FILE.exists() else ACTIVITY_LOG_FILE.parent
+        if not target.exists():
+            target.mkdir(parents=True, exist_ok=True)
+        ok, msg = open_folder(str(target))
+        if not ok and msg:
+            self.toast_requested.emit(msg, True)
+
+    def _clear_activity_logs(self) -> None:
+        self._activity_logs.clear()
+        self._activity_view.clear()
+        self._turn_error_count = 0
+        self._turn_warn_count = 0
+        self._update_log_toggle_badge()
+
+    def append_activity_log(
+        self, level: str, message: str, *, update_heartbeat: bool = True
+    ) -> None:
+        """Append a live execution log line and update error/warning badges."""
+        clean = (message or "").strip()
+        if not clean:
+            return
+        if update_heartbeat:
+            self._last_activity_ts = time.monotonic()
+            self._stall_notified = False
+
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {clean}"
+        self._activity_logs.append(line)
+        if len(self._activity_logs) > MAX_ACTIVITY_LOG_LINES:
+            self._activity_logs = self._activity_logs[-MAX_ACTIVITY_LOG_LINES:]
+            self._activity_view.setPlainText("\n".join(self._activity_logs))
+        else:
+            self._activity_view.appendPlainText(line)
+        sb = self._activity_view.verticalScrollBar()
+        if sb is not None:
+            sb.setValue(sb.maximum())
+
+        if level == "error":
+            self._turn_error_count += 1
+        elif level == "warn":
+            self._turn_warn_count += 1
+        self._update_log_toggle_badge()
+
+        if self._run_started_ts is not None:
+            self._on_activity_tick()
+
+    def _on_activity_tick(self) -> None:
+        if self._run_started_ts is None:
+            self._activity_tick_timer.stop()
+            return
+        now = time.monotonic()
+        elapsed = max(0.0, now - self._run_started_ts)
+        idle = max(0.0, now - (self._last_activity_ts or self._run_started_ts))
+        mins, secs = divmod(int(elapsed), 60)
+        elapsed_str = f"{mins:02d}:{secs:02d}"
+        base = self._base_status_text or "✨ 考え中…"
+        err_suffix = (
+            f" · ⚠️エラー{self._turn_error_count}件"
+            if self._turn_error_count > 0
+            else ""
+        )
+
+        if idle >= STALL_WARN_SECONDS:
+            self._status_bar.setStyleSheet(_STATUS_STYLE_WARN)
+            self._status_bar.setText(
+                f"⚠️ {base} · 経過 {elapsed_str} · {int(idle)}秒間更新なし（待ちまたは停止の可能性）{err_suffix}"
+            )
+            if not self._stall_notified:
+                self._stall_notified = True
+                self.append_activity_log(
+                    "warn",
+                    f"⏳ {int(idle)}秒間新しい応答がありません（外部ツール待ちまたは停止の可能性）",
+                    update_heartbeat=False,
+                )
+        else:
+            self._status_bar.setStyleSheet(
+                _STATUS_STYLE_ERROR if self._turn_error_count > 0 else _STATUS_STYLE_NORMAL
+            )
+            self._status_bar.setText(
+                f"{base} · 経過 {elapsed_str} · {int(idle)}秒前に更新{err_suffix}"
+            )
+        self._status_bar.show()
+
     def set_status_text(self, text: str) -> None:
         if text:
-            self._status_bar.setText(text)
-            self._status_bar.show()
-        else:
+            self.touch_activity(text)
+        elif self._run_started_ts is None:
             self._status_bar.hide()
 
     def append_stream_delta(self, chunk: str) -> None:
         if self._streaming_text is None:
             self._streaming_text = ""
         self._streaming_text += chunk
+        self.touch_activity()
         if not self._stream_flush_timer.isActive():
             self._stream_flush_timer.start()
 
     def replace_stream_text(self, full_text: str) -> None:
         self._streaming_text = full_text
+        self.touch_activity()
         if not self._stream_flush_timer.isActive():
             self._stream_flush_timer.start()
+
+    def handle_turn_cancelled(self, partial_text: str = "") -> None:
+        """Finalize UI after router confirms user cancellation without duplicating bubbles."""
+        _ = partial_text
+        self._stream_flush_timer.stop()
+        self._streaming_text = None
+        self.set_running_state(False)
+        self._render_chat_log()
+        self._refresh_context_bar()
 
     def finalize_stream_reply(self, full_text: str) -> None:
         self._stream_flush_timer.stop()
@@ -2420,4 +2686,5 @@ class BubblePanel(QWidget):
         self._resize_save_timer.stop()
         self._move_save_timer.stop()
         self._drop_overlay_hide_timer.stop()
+        self._activity_tick_timer.stop()
         super().closeEvent(event)

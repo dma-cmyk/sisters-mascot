@@ -13,7 +13,9 @@ from sisters_mascot.agents.base import (
     BaseAgentAdapter,
     ModelChoice,
     StreamEvent,
+    extract_effective_tool_name,
     make_tool_event,
+    make_tool_result_event,
 )
 from sisters_mascot.attachments import AttachmentItem, collect_file_paths
 
@@ -37,9 +39,15 @@ class OpenCodeAdapter(BaseAgentAdapter):
             supports_system_prompt=False,
         )
         self._last_part_text: dict[str, str] = {}
+        self._emitted_part_ids: list[str] = []
+        self._seen_tool_states: dict[str, str] = {}
+        self._seen_reasoning: set[str] = set()
 
     def reset_state(self) -> None:
         self._last_part_text.clear()
+        self._emitted_part_ids.clear()
+        self._seen_tool_states.clear()
+        self._seen_reasoning.clear()
 
     def discover_model_choices(self) -> list[ModelChoice]:
         fallback = [ModelChoice(id=m, label=m) for m in self.spec.default_models]
@@ -128,6 +136,7 @@ class OpenCodeAdapter(BaseAgentAdapter):
             text = str(part.get("text") if part else data.get("text") or "")
             part_id = str(part.get("id") or "__default__") if part else "__default__"
             if text:
+                is_new_part = part_id not in self._last_part_text
                 prev = self._last_part_text.get(part_id, "")
                 if text != prev:
                     if prev and text.startswith(prev):
@@ -137,13 +146,52 @@ class OpenCodeAdapter(BaseAgentAdapter):
                             events.append(StreamEvent(kind="delta", text=delta))
                     else:
                         self._last_part_text[part_id] = text
-                        events.append(StreamEvent(kind="delta", text=text))
+                        emit_text = (
+                            f"\n\n{text}"
+                            if (is_new_part and self._emitted_part_ids and not text.startswith("\n"))
+                            else text
+                        )
+                        events.append(StreamEvent(kind="delta", text=emit_text))
+                if part_id not in self._emitted_part_ids:
+                    self._emitted_part_ids.append(part_id)
             return events
 
         if ev_type in ("tool_use", "tool") or part_type == "tool":
-            tool_name = str(part.get("tool") or part.get("name") or data.get("tool") or data.get("name") or "tool")
             payload: Any = part if part else data
-            events.append(make_tool_event(tool_name, payload))
+            raw_tool = str(part.get("tool") or part.get("name") or data.get("tool") or data.get("name") or "tool")
+            resolved_tool = extract_effective_tool_name(raw_tool, payload)
+            state = (
+                part.get("state")
+                if isinstance(part.get("state"), dict)
+                else (data.get("state") if isinstance(data.get("state"), dict) else {})
+            )
+            status = str(state.get("status") or "").lower()
+            part_id = str(part.get("id") or data.get("id") or "")
+            if part_id:
+                state_key = status or "pending"
+                if self._seen_tool_states.get(part_id) == state_key:
+                    return events
+                self._seen_tool_states[part_id] = state_key
+
+            if status == "error":
+                events.append(
+                    make_tool_result_event(resolved_tool, is_error=True, detail=state.get("error"))
+                )
+            elif status == "completed":
+                events.append(make_tool_result_event(resolved_tool, is_error=False))
+            else:
+                events.append(make_tool_event(resolved_tool, payload))
+            return events
+
+        if ev_type == "reasoning" or part_type == "reasoning":
+            r_text = str(part.get("text") if part else data.get("text") or "").strip()
+            r_id = str(part.get("id") or data.get("id") or r_text[:40])
+            if r_text and r_id not in self._seen_reasoning:
+                self._seen_reasoning.add(r_id)
+                snippet = " ".join(r_text.split())
+                if len(snippet) > 90:
+                    snippet = snippet[:89] + "…"
+                events.append(StreamEvent(kind="log", level="info", text=f"💭 思考: {snippet}"))
             return events
 
         if ev_type == "error":

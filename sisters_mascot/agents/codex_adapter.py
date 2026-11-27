@@ -14,6 +14,8 @@ from sisters_mascot.agents.base import (
     ModelChoice,
     StreamEvent,
     make_tool_event,
+    make_tool_result_event,
+    summarize_tool_payload,
 )
 from sisters_mascot.attachments import (
     AttachmentItem,
@@ -196,18 +198,44 @@ class CodexAdapter(BaseAgentAdapter):
                         self._item_texts[item_id] = text
                         events.append(StreamEvent(kind="replace", text=text))
             elif item_type == "mcp_tool_call":
+                tool_name = str(item.get("tool") or item.get("name") or "mcp_tool")
                 if ev_type in ("item.started", "item.updated"):
-                    tool_name = str(item.get("tool") or item.get("name") or "mcp_tool")
                     events.append(make_tool_event(tool_name, item))
+                elif ev_type == "item.completed":
+                    err_obj = item.get("error")
+                    is_err = bool(err_obj) or str(item.get("status") or "").lower() == "failed"
+                    events.append(
+                        make_tool_result_event(tool_name, is_error=is_err, detail=err_obj or "")
+                    )
             elif item_type == "command_execution":
+                cmd_snip = summarize_tool_payload("command_execution", item)
                 if ev_type == "item.started":
                     events.append(
                         StreamEvent(
                             kind="tool",
                             tool_name="command_execution",
                             text="💻 コマンド実行中...",
+                            detail=cmd_snip,
+                            level="tool",
                         )
                     )
+                elif ev_type == "item.completed":
+                    exit_code = item.get("exit_code")
+                    is_err = exit_code is not None and exit_code != 0
+                    detail = (
+                        f"exit={exit_code} {cmd_snip}".strip()
+                        if exit_code is not None
+                        else cmd_snip
+                    )
+                    events.append(
+                        make_tool_result_event("command_execution", is_error=is_err, detail=detail)
+                    )
+            elif item_type == "reasoning" and ev_type == "item.completed":
+                r_text = " ".join(str(item.get("text") or "").split()).strip()
+                if r_text:
+                    if len(r_text) > 90:
+                        r_text = r_text[:89] + "…"
+                    events.append(StreamEvent(kind="log", level="info", text=f"💭 思考: {r_text}"))
             return events
 
         if ev_type == "error":

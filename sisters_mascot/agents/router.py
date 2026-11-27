@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import threading
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from sisters_mascot import CONFIG_DIR
 from sisters_mascot.agents.agy_adapter import AgyAdapter
 from sisters_mascot.agents.base import BaseAgentAdapter, ModelChoice
 from sisters_mascot.agents.claude_adapter import ClaudeAdapter
@@ -21,6 +25,20 @@ from sisters_mascot.conversation import COMPACT_SYSTEM_PROMPT
 from sisters_mascot.sisters_loader import SisterProfile
 
 AGENT_IDS: tuple[str, ...] = ("agy", "claude", "codex", "opencode")
+ACTIVITY_LOG_FILE: Path = CONFIG_DIR / "activity.log"
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_ERROR_KEYWORDS = (
+    "error",
+    "traceback",
+    "exception",
+    "fatal",
+    "econn",
+    "429",
+    "timeout",
+    "failed",
+    "denied",
+    "enoent",
+)
 
 
 class AgentRouter(QObject):
@@ -30,9 +48,11 @@ class AgentRouter(QObject):
     replace_received = pyqtSignal(str)
     status_changed = pyqtSignal(str)
     reply_finished = pyqtSignal(str)
+    turn_cancelled = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
     compact_finished = pyqtSignal(str)
     compact_error = pyqtSignal(str)
+    activity_logged = pyqtSignal(str, str)
     models_discovered = pyqtSignal(str, list)
     model_choices_discovered = pyqtSignal(str, list)
 
@@ -48,6 +68,7 @@ class AgentRouter(QObject):
         self._model_cache: dict[str, list[ModelChoice]] = {}
         self._discovering_agents: set[str] = set()
         self._lock = threading.Lock()
+        self._log_lock = threading.Lock()
         self._process: subprocess.Popen[str] | None = None
         self._running = False
         self._cancel_requested = False
@@ -185,9 +206,11 @@ class AgentRouter(QObject):
             attachments=att_tuple,
         )
 
+        start_desc = f"{'継続セッション' if session_id else '新規セッション'}, model={model or '既定'}"
         worker = threading.Thread(
             target=self._run_subprocess,
             args=(agent_id, sister.id, adapter, cmd, stdin_text, effective_cwd),
+            kwargs={"start_desc": start_desc},
             daemon=True,
         )
         worker.start()
@@ -241,14 +264,40 @@ class AgentRouter(QObject):
             attachments=(),
         )
 
+        start_desc = f"コンパクト, model={model or '既定'}"
         worker = threading.Thread(
             target=self._run_subprocess,
             args=(agent_id, "", adapter, cmd, stdin_text, effective_cwd),
-            kwargs={"compact_mode": True},
+            kwargs={"compact_mode": True, "start_desc": start_desc},
             daemon=True,
         )
         worker.start()
         return True
+
+    def _write_activity_log(self, level: str, message: str) -> None:
+        if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+            return
+        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{level.upper():5s}] {message}\n"
+        with self._log_lock:
+            try:
+                ACTIVITY_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+                if ACTIVITY_LOG_FILE.is_file() and ACTIVITY_LOG_FILE.stat().st_size > 512 * 1024:
+                    raw = ACTIVITY_LOG_FILE.read_bytes()[-(256 * 1024) :]
+                    nl = raw.find(b"\n")
+                    if nl >= 0:
+                        raw = raw[nl + 1 :]
+                    ACTIVITY_LOG_FILE.write_bytes(raw)
+                with ACTIVITY_LOG_FILE.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+            except OSError:
+                pass
+
+    def _emit_activity(self, level: str, message: str) -> None:
+        clean = _ANSI_RE.sub("", message or "").strip()
+        if not clean:
+            return
+        self._write_activity_log(level, clean)
+        self.activity_logged.emit(level, clean)
 
     def _run_subprocess(
         self,
@@ -260,14 +309,20 @@ class AgentRouter(QObject):
         cwd: str,
         *,
         compact_mode: bool = False,
+        start_desc: str = "",
     ) -> None:
         resolved_cwd = cwd if (cwd and Path(cwd).is_dir()) else str(Path.home())
         full_text = ""
         saw_error = False
         stderr_lines: list[str] = []
+        started_at = time.monotonic()
 
         self.status_changed.emit(
             "🗜️ 会話をコンパクト化中…" if compact_mode else "✨ 考え中..."
+        )
+        self._emit_activity(
+            "info",
+            f"▶ {adapter.spec.display_name} 開始" + (f" ({start_desc})" if start_desc else ""),
         )
 
         popen_kwargs: dict = {
@@ -293,6 +348,7 @@ class AgentRouter(QObject):
                 self._process = None
             self.status_changed.emit("")
             err_msg = f"CLIの起動に失敗しました: {exc}"
+            self._emit_activity("error", f"❌ {err_msg}")
             if compact_mode:
                 self.compact_error.emit(err_msg)
             else:
@@ -306,11 +362,14 @@ class AgentRouter(QObject):
             if proc.stderr is None:
                 return
             for err_line in proc.stderr:
-                cleaned = err_line.strip()
+                cleaned = _ANSI_RE.sub("", err_line).strip()
                 if cleaned:
                     stderr_lines.append(cleaned)
                     if len(stderr_lines) > 40:
                         stderr_lines.pop(0)
+                    lowered = cleaned.lower()
+                    lvl = "error" if any(kw in lowered for kw in _ERROR_KEYWORDS) else "warn"
+                    self._emit_activity(lvl, f"[stderr] {cleaned[:240]}")
 
         stderr_thread = threading.Thread(target=read_stderr, daemon=True)
         stderr_thread.start()
@@ -328,7 +387,13 @@ class AgentRouter(QObject):
                     with self._lock:
                         if self._cancel_requested:
                             break
-                    for ev in adapter.parse_line(line):
+                    evs = adapter.parse_line(line)
+                    if not evs:
+                        stripped_line = _ANSI_RE.sub("", line).strip()
+                        if stripped_line and not stripped_line.startswith("{"):
+                            self._emit_activity("warn", f"[stdout] {stripped_line[:240]}")
+                        continue
+                    for ev in evs:
                         if ev.kind == "session" and ev.session_id and not compact_mode:
                             with self._lock:
                                 self._sessions[(agent_id, sister_id)] = ev.session_id
@@ -340,11 +405,20 @@ class AgentRouter(QObject):
                             full_text = ev.text
                             if not compact_mode:
                                 self.replace_received.emit(ev.text)
-                        elif ev.kind in ("tool", "status") and ev.text and not compact_mode:
-                            self.status_changed.emit(ev.text)
+                        elif ev.kind in ("tool", "status") and ev.text:
+                            status_msg = f"{ev.text} ({ev.detail})" if ev.detail else ev.text
+                            if not compact_mode:
+                                self.status_changed.emit(status_msg)
+                            self._emit_activity(
+                                "tool" if ev.kind == "tool" else "info",
+                                status_msg,
+                            )
+                        elif ev.kind == "log" and ev.text:
+                            self._emit_activity(ev.level or "info", ev.text)
                         elif ev.kind == "error":
                             saw_error = True
                             msg = ev.text or f"{agent_id} でエラーが発生しました。"
+                            self._emit_activity("error", f"❌ {msg}")
                             if compact_mode:
                                 self.compact_error.emit(msg)
                             else:
@@ -358,35 +432,48 @@ class AgentRouter(QObject):
                 self._running = False
                 self._cancel_requested = False
 
+        elapsed = max(0.0, time.monotonic() - started_at)
         self.status_changed.emit("")
 
         if compact_mode:
             if cancelled:
+                self._emit_activity(
+                    "warn", f"⏹ コンパクト化を中断 (exit={returncode}, {elapsed:.1f}s)"
+                )
                 self.compact_error.emit("コンパクト化を中断しました。")
                 return
             if saw_error:
                 return
-            if returncode != 0 and not full_text.strip():
+            if returncode != 0:
+                self._emit_activity(
+                    "error",
+                    f"❌ コンパクト化プロセス異常終了 (exit={returncode}, {elapsed:.1f}s)",
+                )
                 err_detail = "\n".join(stderr_lines[-6:]).strip()
                 self.compact_error.emit(
                     err_detail
                     or f"{adapter.spec.display_name} が終了コード {returncode} で終了しました。"
                 )
                 return
+            self._emit_activity("done", f"✔ コンパクト完了 (exit={returncode}, {elapsed:.1f}s)")
             self.compact_finished.emit(full_text.strip())
             return
 
         if cancelled:
-            self.reply_finished.emit(full_text)
+            self._emit_activity("warn", f"⏹ ユーザーにより中断 (exit={returncode}, {elapsed:.1f}s)")
+            self.turn_cancelled.emit(full_text)
             return
 
-        if returncode != 0 and not saw_error and not full_text.strip():
+        if returncode != 0 and not saw_error:
+            self._emit_activity("error", f"❌ プロセス異常終了 (exit={returncode}, {elapsed:.1f}s)")
             err_detail = "\n".join(stderr_lines[-6:]).strip()
-            self.error_occurred.emit(
-                err_detail or f"{adapter.spec.display_name} が終了コード {returncode} で終了しました。"
-            )
+            summary_msg = f"{adapter.spec.display_name} が途中で終了しました (exit={returncode})"
+            if err_detail:
+                summary_msg = f"{summary_msg}\n{err_detail}"
+            self.error_occurred.emit(summary_msg)
             return
 
+        self._emit_activity("done", f"✔ 完了 (exit={returncode}, {elapsed:.1f}s)")
         self.reply_finished.emit(full_text)
 
     def cancel(self) -> None:

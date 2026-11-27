@@ -266,9 +266,11 @@ class MascotAppController(QObject):
         self.router.replace_received.connect(self.panel.replace_stream_text)
         self.router.status_changed.connect(self._on_agent_status)
         self.router.reply_finished.connect(self._on_agent_finished)
+        self.router.turn_cancelled.connect(self._on_agent_cancelled)
         self.router.error_occurred.connect(self._on_agent_error)
         self.router.compact_finished.connect(self._on_compact_finished)
         self.router.compact_error.connect(self._on_compact_error)
+        self.router.activity_logged.connect(self.panel.append_activity_log)
         self.router.model_choices_discovered.connect(self.panel.on_model_choices_discovered)
 
         # TTS
@@ -434,6 +436,11 @@ class MascotAppController(QObject):
             self.mascot.set_activity("idle")
         if full_text and self.config.tts_engine != "off":
             self.tts.speak(full_text, self.current_sister(), self.config)
+
+    def _on_agent_cancelled(self, partial_text: str) -> None:
+        self.panel.handle_turn_cancelled(partial_text)
+        if not self.tts.is_speaking():
+            self.mascot.set_activity("idle")
 
     def _on_agent_error(self, err: str) -> None:
         self.panel.append_error_message(err)
