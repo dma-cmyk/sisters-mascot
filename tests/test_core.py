@@ -19,8 +19,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from PyQt6.QtCore import QEvent, QPoint, QPointF, QRect, QSize, Qt  # noqa: E402
+from PyQt6.QtCore import QEvent, QMimeData, QPoint, QPointF, QRect, QSize, Qt, QUrl  # noqa: E402
 from PyQt6.QtGui import (  # noqa: E402
+    QDragEnterEvent,
+    QDragLeaveEvent,
+    QDragMoveEvent,
+    QDropEvent,
     QFocusEvent,
     QGuiApplication,
     QImage,
@@ -37,6 +41,15 @@ from sisters_mascot.agents.claude_adapter import ClaudeAdapter  # noqa: E402
 from sisters_mascot.agents.codex_adapter import CodexAdapter  # noqa: E402
 from sisters_mascot.agents.opencode_adapter import OpenCodeAdapter  # noqa: E402
 from sisters_mascot.agents.router import AGENT_IDS, AgentRouter  # noqa: E402
+from sisters_mascot.attachments import (  # noqa: E402
+    DEFAULT_ATTACHMENT_ONLY_PROMPT,
+    MAX_ATTACHMENTS,
+    build_attachment_item,
+    build_prompt_with_attachments,
+    collect_attachment_dirs,
+    collect_file_paths,
+    collect_image_paths,
+)
 from sisters_mascot.audio.stt import VoiceRecorder  # noqa: E402
 from sisters_mascot.audio.tts import (  # noqa: E402
     DEFAULT_EDGE_VOICE,
@@ -64,7 +77,12 @@ from sisters_mascot.sprites.renderer import render_sister_pixmap, render_sister_
 from sisters_mascot.ui.bubble_panel import BubblePanel  # noqa: E402
 from sisters_mascot.ui.mascot_window import MascotWindow  # noqa: E402
 from sisters_mascot.ui.platform import supports_window_positioning  # noqa: E402
-from sisters_mascot.ui.widgets import ChatInputEdit, LauncherItemDialog, ToastBubble  # noqa: E402
+from sisters_mascot.ui.widgets import (  # noqa: E402
+    ChatInputEdit,
+    LauncherItemDialog,
+    ToastBubble,
+    extract_local_paths_from_mime,
+)
 
 EXPECTED_SISTER_IDS = [
     "aoi",
@@ -1333,6 +1351,305 @@ class TestSpriteAlignmentAndHitTesting(unittest.TestCase):
             panel.close()
             mascot.close()
             app.processEvents()
+
+
+class TestAttachmentsAndDragDrop(unittest.TestCase):
+    """File/folder attachment modeling, CLI adapter flags, and headless D&D/paste UI."""
+
+    def test_attachment_item_and_prompt_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cwd = root / "workspace"
+            cwd.mkdir()
+            cwd_file = cwd / "inside.py"
+            cwd_file.write_text("print('ok')\n", encoding="utf-8")
+
+            ext_dir = root / "shared_docs"
+            ext_dir.mkdir()
+            (ext_dir / "sub").mkdir()
+            doc = ext_dir / "readme.md"
+            doc.write_text("# Hello\n", encoding="utf-8")
+            photo = ext_dir / "shot.png"
+            photo.write_bytes(b"\x89PNG\r\n\x1a\n")
+            svg = ext_dir / "icon.svg"
+            svg.write_text("<svg></svg>", encoding="utf-8")
+
+            self.assertIsNone(build_attachment_item(""))
+            self.assertIsNone(build_attachment_item(root / "does_not_exist.txt"))
+
+            doc_att = build_attachment_item(doc)
+            photo_att = build_attachment_item(photo)
+            svg_att = build_attachment_item(svg)
+            dir_att = build_attachment_item(ext_dir)
+            cwd_att = build_attachment_item(cwd_file)
+            assert doc_att and photo_att and svg_att and dir_att and cwd_att
+
+            self.assertEqual(doc_att.kind, "file")
+            self.assertEqual(doc_att.icon, "📄")
+            self.assertEqual(photo_att.kind, "image")
+            self.assertEqual(photo_att.icon, "🖼️")
+            self.assertEqual(svg_att.kind, "file")  # raster images only for vision
+            self.assertEqual(dir_att.kind, "folder")
+            self.assertEqual(dir_att.icon, "📁")
+            self.assertEqual(dir_att.item_count, 4)
+            self.assertEqual(dir_att.preview_entries, ("sub/", "icon.svg", "readme.md", "shot.png"))
+
+            dirs = collect_attachment_dirs([cwd_att, dir_att, doc_att, photo_att], cwd=str(cwd))
+            self.assertEqual(dirs, [str(ext_dir.resolve())])
+
+            self.assertEqual(collect_image_paths([dir_att, doc_att, photo_att, svg_att]), [photo_att.path])
+            self.assertEqual(
+                collect_file_paths([dir_att, doc_att, photo_att, svg_att]),
+                [doc_att.path, photo_att.path, svg_att.path],
+            )
+
+            with_text = build_prompt_with_attachments("要約して", [dir_att, photo_att, doc_att])
+            self.assertIn("【添付されたファイル・フォルダ】", with_text)
+            self.assertIn(f"- [フォルダ] {dir_att.path}", with_text)
+            self.assertIn(f"- [画像] {photo_att.path}", with_text)
+            self.assertIn(f"- [ファイル] {doc_att.path}", with_text)
+            self.assertTrue(with_text.endswith("要約して"))
+
+            only_att = build_prompt_with_attachments("   ", [doc_att])
+            self.assertTrue(only_att.endswith(DEFAULT_ATTACHMENT_ONLY_PROMPT))
+
+    def test_adapters_and_router_with_attachments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cwd = root / "cwd"
+            cwd.mkdir()
+            local_file = cwd / "local.txt"
+            local_file.write_text("local", encoding="utf-8")
+
+            ext = root / "ext"
+            ext.mkdir()
+            pic = ext / "preview.webp"
+            pic.write_bytes(b"RIFF....WEBP")
+            svg = ext / "diagram.svg"
+            svg.write_text("<svg/>", encoding="utf-8")
+            note = ext / "notes.md"
+            note.write_text("notes", encoding="utf-8")
+
+            atts = [
+                build_attachment_item(ext),
+                build_attachment_item(pic),
+                build_attachment_item(svg),
+                build_attachment_item(note),
+                build_attachment_item(local_file),
+            ]
+            assert all(atts)
+
+            agy_cmd, _ = AgyAdapter().build_command("check", cwd=str(cwd), attachments=atts)
+            self.assertIn("--add-dir", agy_cmd)
+            self.assertEqual(agy_cmd.count(str(ext)), 1)
+            self.assertNotIn(str(cwd), agy_cmd)
+
+            claude_cmd, _ = ClaudeAdapter().build_command("check", cwd=str(cwd), attachments=atts)
+            self.assertEqual(claude_cmd[-2:], ["--add-dir", str(ext)])
+
+            codex_new, _ = CodexAdapter().build_command(
+                "check", cwd=str(cwd), session_id=None, attachments=atts
+            )
+            self.assertIn("--add-dir", codex_new)
+            self.assertIn(str(ext), codex_new)
+            self.assertIn(f"--image={pic}", codex_new)
+            self.assertNotIn(f"--image={svg}", codex_new)
+            self.assertEqual(codex_new[-1], "-")
+
+            codex_resume, _ = CodexAdapter().build_command(
+                "follow up", cwd=str(cwd), session_id="thread-9", attachments=atts
+            )
+            self.assertNotIn("--add-dir", codex_resume)
+            self.assertIn(f"--image={pic}", codex_resume)
+            self.assertEqual(codex_resume[-2:], ["thread-9", "-"])
+
+            oc_cmd, _ = OpenCodeAdapter().build_command("check", cwd=str(cwd), attachments=atts)
+            self.assertEqual(oc_cmd[-1], "check")
+            self.assertIn(str(pic), oc_cmd)
+            self.assertIn(str(svg), oc_cmd)
+            self.assertIn(str(note), oc_cmd)
+            self.assertIn(str(local_file), oc_cmd)
+            self.assertNotIn(str(ext), oc_cmd)
+
+            router = AgentRouter()
+            codex_adapter = router.get_adapter("codex")
+            sisters = load_all_sisters()
+            aoi = sisters[0]
+            captured: dict = {}
+
+            def _fake_build(prompt, **kwargs):
+                captured["prompt"] = prompt
+                captured["kwargs"] = kwargs
+                return ["codex", "exec", "-"], prompt
+
+            with (
+                patch.object(codex_adapter, "is_available", return_value=True),
+                patch.object(codex_adapter, "build_command", side_effect=_fake_build),
+                patch.object(router, "_run_subprocess"),
+            ):
+                router.send_message(
+                    "codex",
+                    "確認して",
+                    sister=aoi,
+                    cwd=str(cwd),
+                    attachments=[atts[0], atts[1]],
+                )
+            self.assertIn("【添付されたファイル・フォルダ】", captured["prompt"])
+            self.assertIn(str(ext), captured["prompt"])
+            self.assertIn(str(pic), captured["prompt"])
+            self.assertIn("確認して", captured["prompt"])
+            self.assertEqual(len(captured["kwargs"]["attachments"]), 2)
+
+    def test_panel_chat_input_and_mascot_drag_drop(self) -> None:
+        from sisters_mascot.main import MascotAppController
+
+        app = _ensure_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sample_dir = root / "my_folder"
+            sample_dir.mkdir()
+            sample_file = root / "notes.txt"
+            sample_file.write_text("hello", encoding="utf-8")
+            missing_file = root / "missing.txt"
+
+            mime = QMimeData()
+            mime.setUrls(
+                [
+                    QUrl("https://example.com"),
+                    QUrl.fromLocalFile(str(missing_file)),
+                    QUrl.fromLocalFile(str(sample_file)),
+                    QUrl.fromLocalFile(str(sample_dir)),
+                    QUrl.fromLocalFile(str(sample_file)),  # duplicate
+                ]
+            )
+            extracted = extract_local_paths_from_mime(mime)
+            self.assertEqual(extracted, [str(sample_file), str(sample_dir)])
+
+            cfg = AppConfig(tts_engine="off", animation_mode="off")
+            with (
+                patch("sisters_mascot.main.load_config", return_value=cfg),
+                patch("sisters_mascot.main.save_config", return_value=root / "cfg.json"),
+                patch.object(BubblePanel, "ensure_models_discovered", lambda self, *a, **k: None),
+                patch.object(MascotAppController, "_setup_single_instance_server", lambda self: None),
+            ):
+                controller = MascotAppController(app)
+
+            try:
+                mascot, panel = controller.mascot, controller.panel
+                mascot.show()
+                panel.show()
+
+                # 1. Drop onto BubblePanel
+                enter_ev = QDragEnterEvent(
+                    QPoint(40, 40), Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier
+                )
+                panel.dragEnterEvent(enter_ev)
+                self.assertTrue(enter_ev.isAccepted())
+                self.assertTrue(panel._drop_overlay.isVisible())
+
+                drop_ev = QDropEvent(
+                    QPointF(40, 40), Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier
+                )
+                panel.dropEvent(drop_ev)
+                self.assertTrue(drop_ev.isAccepted())
+                self.assertFalse(panel._drop_overlay.isVisible())
+                self.assertEqual(len(panel.get_attachments()), 2)
+                self.assertTrue(panel._attachments_bar.isVisible())
+
+                # Removing and clearing attachments
+                panel.remove_attachment(str(sample_file))
+                self.assertEqual([a.path for a in panel.get_attachments()], [str(sample_dir)])
+                panel.clear_attachments()
+                self.assertEqual(panel.get_attachments(), [])
+                self.assertFalse(panel._attachments_bar.isVisible())
+
+                # 2. Drop and Ctrl+V paste on ChatInputEdit (never inserts file:/// URLs)
+                panel._chat_input.setPlainText("既存テキスト")
+                edit_drop = QDropEvent(
+                    QPointF(10, 10), Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier
+                )
+                panel._chat_input.dropEvent(edit_drop)
+                self.assertEqual(panel._chat_input.toPlainText(), "既存テキスト")
+                self.assertEqual(len(panel.get_attachments()), 2)
+
+                panel.clear_attachments()
+                self.assertTrue(panel._chat_input.canInsertFromMimeData(mime))
+                panel._chat_input.insertFromMimeData(mime)
+                self.assertEqual(panel._chat_input.toPlainText(), "既存テキスト")
+                self.assertEqual(len(panel.get_attachments()), 2)
+
+                plain_mime = QMimeData()
+                plain_mime.setText("追加")
+                panel._chat_input.insertFromMimeData(plain_mime)
+                self.assertIn("追加", panel._chat_input.toPlainText())
+
+                # 3. Drop onto MascotWindow opens panel & queues attachments
+                panel.clear_attachments()
+                panel.hide()
+                m_enter = QDragEnterEvent(
+                    QPoint(50, 50), Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier
+                )
+                mascot.dragEnterEvent(m_enter)
+                self.assertTrue(mascot._file_drop_hover)
+                self.assertEqual(mascot._file_drop_count, 2)
+
+                mascot.dragLeaveEvent(QDragLeaveEvent())
+                self.assertFalse(mascot._file_drop_hover)
+
+                mascot.dragEnterEvent(m_enter)
+                m_drop = QDropEvent(
+                    QPointF(50, 50), Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier
+                )
+                mascot.dropEvent(m_drop)
+                self.assertFalse(mascot._file_drop_hover)
+                self.assertEqual(mascot._temp_sprite_state, "happy")
+                self.assertTrue(panel.isVisible())
+                self.assertEqual(panel._tabs.currentIndex(), 0)
+                self.assertEqual(len(panel.get_attachments()), 2)
+
+                # 4. Busy router preserves queued attachments
+                with patch.object(controller.router, "is_running", return_value=True):
+                    panel.send_prompt("")
+                self.assertEqual(len(panel.get_attachments()), 2)
+
+                # 5. Attachment-only send clears queue, sends attachments, and renders badges in HTML
+                sent_calls: list[dict] = []
+
+                def _fake_send(agent_id, prompt, **kwargs):
+                    sent_calls.append({"agent_id": agent_id, "prompt": prompt, **kwargs})
+
+                with patch.object(controller.router, "send_message", side_effect=_fake_send):
+                    panel._chat_input.clear()
+                    panel._on_send_or_stop()
+
+                self.assertEqual(panel.get_attachments(), [])
+                self.assertFalse(panel._attachments_bar.isVisible())
+                self.assertEqual(len(sent_calls), 1)
+                self.assertEqual(len(sent_calls[0]["attachments"]), 2)
+                log_html = panel._chat_browser.toHtml()
+                self.assertIn("notes.txt", log_html)
+                self.assertIn("my_folder", log_html)
+
+                # 6. Respect MAX_ATTACHMENTS cap cleanly
+                many_files: list[Path] = []
+                for idx in range(MAX_ATTACHMENTS + 3):
+                    fp = root / f"f{idx}.txt"
+                    fp.write_text("x", encoding="utf-8")
+                    many_files.append(fp)
+                added = panel.add_attachments(many_files, notify=True)
+                self.assertEqual(len(added), MAX_ATTACHMENTS)
+                self.assertEqual(len(panel.get_attachments()), MAX_ATTACHMENTS)
+
+                app.processEvents()
+            finally:
+                try:
+                    app.aboutToQuit.disconnect(controller.shutdown)
+                except (TypeError, RuntimeError):
+                    pass
+                controller.shutdown()
+                controller.panel.close()
+                controller.mascot.close()
+                app.processEvents()
 
 
 if __name__ == "__main__":

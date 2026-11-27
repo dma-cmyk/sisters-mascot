@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 from pathlib import Path
+from typing import Sequence
 
 from sisters_mascot.agents.base import (
     AgentSpec,
@@ -13,6 +14,11 @@ from sisters_mascot.agents.base import (
     ModelChoice,
     StreamEvent,
     make_tool_event,
+)
+from sisters_mascot.attachments import (
+    AttachmentItem,
+    collect_attachment_dirs,
+    collect_image_paths,
 )
 
 _CONFIG_MODEL_RE = re.compile(r'^\s*model\s*=\s*["\']([^"\']+)["\']')
@@ -121,16 +127,20 @@ class CodexAdapter(BaseAgentAdapter):
         cwd: str = "",
         system_prompt: str = "",
         auto_approve: bool = True,
+        attachments: Sequence[AttachmentItem] = (),
     ) -> tuple[list[str], str | None]:
         _ = system_prompt
         binary = self.resolved_binary()
         cleaned_model = model.strip()
         effective_cwd = cwd.strip() or str(Path.home())
+        images = collect_image_paths(attachments)
 
         if session_id:
             cmd = [binary, "exec", "resume", "--json", "--skip-git-repo-check"]
             if cleaned_model:
                 cmd.extend(["-m", cleaned_model])
+            for img_path in images:
+                cmd.append(f"--image={img_path}")
             cmd.extend([session_id, "-"])
             return cmd, prompt
 
@@ -139,6 +149,10 @@ class CodexAdapter(BaseAgentAdapter):
             cmd.extend(["-m", cleaned_model])
         if auto_approve:
             cmd.append("--approve-for-me")
+        for extra_dir in collect_attachment_dirs(attachments, effective_cwd):
+            cmd.extend(["--add-dir", extra_dir])
+        for img_path in images:
+            cmd.append(f"--image={img_path}")
         cmd.append("-")
         return cmd, prompt
 

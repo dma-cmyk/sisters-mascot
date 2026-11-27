@@ -7,7 +7,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from sisters_mascot.agents.base import (
     AgentSpec,
@@ -16,6 +16,7 @@ from sisters_mascot.agents.base import (
     StreamEvent,
     make_tool_event,
 )
+from sisters_mascot.attachments import AttachmentItem, collect_attachment_dirs
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _MODEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,}$")
@@ -118,8 +119,9 @@ class AgyAdapter(BaseAgentAdapter):
         cwd: str = "",
         system_prompt: str = "",
         auto_approve: bool = True,
+        attachments: Sequence[AttachmentItem] = (),
     ) -> tuple[list[str], str | None]:
-        _ = cwd, system_prompt
+        _ = system_prompt
         cmd = [self.resolved_binary(), "-p", prompt, "--output-format", "stream-json"]
         if model.strip():
             cmd.extend(["--model", model.strip()])
@@ -127,6 +129,8 @@ class AgyAdapter(BaseAgentAdapter):
             cmd.extend(["--conversation", session_id])
         if auto_approve:
             cmd.extend(["--mode", "auto"])
+        for extra_dir in collect_attachment_dirs(attachments, cwd):
+            cmd.extend(["--add-dir", extra_dir])
         return cmd, None
 
     def parse_line(self, line: str) -> list[StreamEvent]:

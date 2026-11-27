@@ -6,7 +6,9 @@ import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
+
+from sisters_mascot.attachments import AttachmentItem
 
 PLAYWRIGHT_TOOL_KEYWORDS = ("playwright", "browser_")
 
@@ -131,6 +133,7 @@ class BaseAgentAdapter:
         cwd: str = "",
         system_prompt: str = "",
         auto_approve: bool = True,
+        attachments: Sequence[AttachmentItem] = (),
     ) -> tuple[list[str], str | None]:
         """Build (argv, stdin_text) for invoking the CLI non-interactively."""
         raise NotImplementedError

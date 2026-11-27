@@ -6,7 +6,7 @@ import json
 import re
 import shutil
 import subprocess
-from typing import Any
+from typing import Any, Sequence
 
 from sisters_mascot.agents.base import (
     AgentSpec,
@@ -15,6 +15,7 @@ from sisters_mascot.agents.base import (
     StreamEvent,
     make_tool_event,
 )
+from sisters_mascot.attachments import AttachmentItem, collect_file_paths
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -88,6 +89,7 @@ class OpenCodeAdapter(BaseAgentAdapter):
         cwd: str = "",
         system_prompt: str = "",
         auto_approve: bool = True,
+        attachments: Sequence[AttachmentItem] = (),
     ) -> tuple[list[str], str | None]:
         _ = cwd, system_prompt
         cmd = [self.resolved_binary(), "run", "--format", "json"]
@@ -97,6 +99,8 @@ class OpenCodeAdapter(BaseAgentAdapter):
             cmd.extend(["-s", session_id])
         if auto_approve:
             cmd.append("--auto")
+        for file_path in collect_file_paths(attachments):
+            cmd.extend(["--file", file_path])
         cmd.append(prompt)
         return cmd, None
 

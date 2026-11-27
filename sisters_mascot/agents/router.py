@@ -7,6 +7,7 @@ import signal
 import subprocess
 import threading
 from pathlib import Path
+from typing import Sequence
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
@@ -15,6 +16,7 @@ from sisters_mascot.agents.base import BaseAgentAdapter, ModelChoice
 from sisters_mascot.agents.claude_adapter import ClaudeAdapter
 from sisters_mascot.agents.codex_adapter import CodexAdapter
 from sisters_mascot.agents.opencode_adapter import OpenCodeAdapter
+from sisters_mascot.attachments import AttachmentItem, build_prompt_with_attachments
 from sisters_mascot.sisters_loader import SisterProfile
 
 AGENT_IDS: tuple[str, ...] = ("agy", "claude", "codex", "opencode")
@@ -81,6 +83,7 @@ class AgentRouter(QObject):
             "【デスクトップ・マスコットとしての対話環境】\n"
             "- あなたは現在、美緒ちゃん（マスター）のデスクトップ上のマスコットランチャーから話しかけられています。\n"
             "- キャラクターの口調と温かさを保ちつつ、簡潔でわかりやすい日本語で応答してください。\n"
+            "- ユーザーからファイルやフォルダが添付された場合は、提示された絶対パスを直接読み込み・確認して丁寧にサポートしてください。\n"
             "- Webページの調査・操作やGoogle Chromeでの確認を求められた場合は、利用可能な Playwright / Chrome MCP ツール（`browser_*` 等）を優先して使用してください。"
         )
 
@@ -93,6 +96,7 @@ class AgentRouter(QObject):
         model: str = "",
         cwd: str = "",
         auto_approve: bool = True,
+        attachments: Sequence[AttachmentItem] = (),
     ) -> None:
         """Start an asynchronous streaming agent turn."""
         if agent_id not in self._adapters:
@@ -117,15 +121,18 @@ class AgentRouter(QObject):
         session_id = self._sessions.get(session_key)
         persona_context = self._build_persona_context(sister)
 
+        att_tuple = tuple(attachments)
+        user_prompt = build_prompt_with_attachments(prompt, att_tuple)
+
         system_prompt_arg = ""
-        effective_prompt = prompt
+        effective_prompt = user_prompt
         if session_id is None:
             if adapter.spec.supports_system_prompt:
                 system_prompt_arg = persona_context
             else:
                 effective_prompt = (
                     f"<system_instructions>\n{persona_context}\n</system_instructions>\n\n"
-                    f"<user_message>\n{prompt}\n</user_message>"
+                    f"<user_message>\n{user_prompt}\n</user_message>"
                 )
 
         effective_cwd = cwd.strip() or str(Path.home())
@@ -137,6 +144,7 @@ class AgentRouter(QObject):
             cwd=effective_cwd,
             system_prompt=system_prompt_arg,
             auto_approve=auto_approve,
+            attachments=att_tuple,
         )
 
         worker = threading.Thread(

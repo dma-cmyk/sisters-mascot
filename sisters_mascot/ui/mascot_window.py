@@ -14,6 +14,10 @@ from PyQt6.QtGui import (
     QAction,
     QColor,
     QCursor,
+    QDragEnterEvent,
+    QDragLeaveEvent,
+    QDragMoveEvent,
+    QDropEvent,
     QFont,
     QFontMetrics,
     QGuiApplication,
@@ -49,7 +53,7 @@ from sisters_mascot.sprites.renderer import (
     render_sister_sprite,
 )
 from sisters_mascot.ui.platform import supports_window_positioning
-from sisters_mascot.ui.widgets import ToastBubble
+from sisters_mascot.ui.widgets import ToastBubble, extract_local_paths_from_mime
 
 _PAD_X = 28
 _PAD_TOP = 42
@@ -206,6 +210,7 @@ class MascotWindow(QWidget):
     position_changed = pyqtSignal(int, int)
     size_changed = pyqtSignal(int)
     mascot_clicked_line = pyqtSignal(str)
+    files_dropped = pyqtSignal(list)
     quit_requested = pyqtSignal()
 
     def __init__(
@@ -298,11 +303,14 @@ class MascotWindow(QWidget):
         # Line anti-repeat tracking
         self._last_click_line: str = ""
         self._last_drag_line: str = ""
+        self._file_drop_hover: bool = False
+        self._file_drop_count: int = 0
 
         self._toast = ToastBubble(None)
 
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
+        self.setAcceptDrops(True)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
         self._apply_window_flags(initial=True)
 
@@ -963,7 +971,9 @@ class MascotWindow(QWidget):
         # Hover cursor lean & zoom
         target_lean = 0.0
         target_zoom = 1.0
-        if self._hovered and not self._dragging:
+        if self._file_drop_hover:
+            target_zoom = 1.045
+        elif self._hovered and not self._dragging:
             if self._animation_mode == "rich":
                 local_x = self.mapFromGlobal(QCursor.pos()).x()
                 half_w = max(1.0, self._base_w * 0.5)
@@ -1078,11 +1088,13 @@ class MascotWindow(QWidget):
         pivot_y = float(_PAD_TOP + self._base_h) + float_y + self._bounce_y + self._quirk_hop_y + act_bounce
         aura_cy = pivot_y - self._base_h * 0.5
 
-        # Glowing aura behind sprite when active or hovered
-        if self._activity_kind != "idle" or self._hovered:
+        # Glowing aura behind sprite when active, hovered, or accepting file drop
+        if self._activity_kind != "idle" or self._hovered or self._file_drop_hover:
             pulse = 1.0 if is_off else (0.75 + 0.25 * math.sin(self._anim_phase * 1.8))
             glow_color = QColor(accent)
-            if self._activity_kind == "tool":
+            if self._file_drop_hover:
+                glow_color = QColor("#34d399")
+            elif self._activity_kind == "tool":
                 glow_color = QColor("#38bdf8")
             elif self._activity_kind == "listening":
                 glow_color = QColor("#fb7185")
@@ -1092,7 +1104,7 @@ class MascotWindow(QWidget):
             radius = max(self._base_w, self._base_h) * 0.56
             aura = QRadialGradient(QPointF(pivot_x, aura_cy), radius)
             c0 = QColor(glow_color)
-            c0.setAlpha(int((96 if self._activity_kind != "idle" else 54) * pulse))
+            c0.setAlpha(int((96 if (self._activity_kind != "idle" or self._file_drop_hover) else 54) * pulse))
             c1 = QColor(secondary)
             c1.setAlpha(int(36 * pulse))
             aura.setColorAt(0.0, c0)
@@ -1101,6 +1113,21 @@ class MascotWindow(QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(aura)
             painter.drawEllipse(QPointF(pivot_x, aura_cy), radius, radius)
+
+        if self._file_drop_hover:
+            ring_rect = QRectF(
+                8.0,
+                float(_PAD_TOP) - 8.0,
+                max(40.0, float(self.width()) - 16.0),
+                max(40.0, float(self._base_h) + 16.0),
+            )
+            painter.save()
+            drop_pen = QPen(QColor(52, 211, 153, 210), 2.0, Qt.PenStyle.DashLine)
+            drop_pen.setDashPattern([8.0, 5.0])
+            painter.setPen(drop_pen)
+            painter.setBrush(QColor(16, 185, 129, 20))
+            painter.drawRoundedRect(ring_rect, 18.0, 18.0)
+            painter.restore()
 
         # Activity rings behind sprite (soundwave / listening ripples & Playwright cyan halos)
         if is_rich:
@@ -1159,12 +1186,20 @@ class MascotWindow(QWidget):
                 else:
                     _draw_four_point_star(painter, QPointF(p.x, p.y), sz, col, p.rot)
 
-        # Top pill overlay (size badge temporarily overrides status pill cleanly)
-        top_pill_text = self._size_pill_text or (
-            self._status_text if self._activity_kind != "idle" else ""
-        )
-        if top_pill_text:
+        # Top pill overlay (drop indicator > size badge > status pill)
+        if self._file_drop_hover:
+            top_pill_text = (
+                f"📎 {self._file_drop_count}件をドロップして添付！"
+                if self._file_drop_count > 1
+                else "📎 ドロップして添付！"
+            )
+            pill_accent = QColor("#34d399")
+        else:
+            top_pill_text = self._size_pill_text or (
+                self._status_text if self._activity_kind != "idle" else ""
+            )
             pill_accent = QColor("#38bdf8") if self._size_pill_text else accent
+        if top_pill_text:
             self._paint_top_pill(painter, top_pill_text, pill_accent)
 
     def _top_pill_rect(self, text: str) -> QRectF:
@@ -1321,6 +1356,42 @@ class MascotWindow(QWidget):
                 if dx * dx + dy * dy <= r2 and self._hit_image.pixelColor(px, py).alpha() > 20:
                     return True
         return False
+
+    # Drag-and-drop file/folder attachment handling
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        paths = extract_local_paths_from_mime(event.mimeData())
+        if paths:
+            self._file_drop_hover = True
+            self._file_drop_count = len(paths)
+            event.acceptProposedAction()
+            self.update()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        if self._file_drop_hover or extract_local_paths_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
+        if self._file_drop_hover:
+            self._file_drop_hover = False
+            self._file_drop_count = 0
+            self.update()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        paths = extract_local_paths_from_mime(event.mimeData())
+        self._file_drop_hover = False
+        self._file_drop_count = 0
+        self.update()
+        if paths:
+            event.acceptProposedAction()
+            self.trigger_bounce()
+            self.files_dropped.emit(paths)
+            return
+        super().dropEvent(event)
 
     # Hover & Wheel Resize handling
     def enterEvent(self, event) -> None:  # noqa: ANN001

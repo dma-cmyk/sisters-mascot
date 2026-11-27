@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
 
 from sisters_mascot import APP_NAME, APP_VERSION
 from sisters_mascot.agents.router import AGENT_IDS, AgentRouter
+from sisters_mascot.attachments import MAX_ATTACHMENTS
 from sisters_mascot.audio.stt import VoiceRecorder
 from sisters_mascot.audio.tts import TTSManager
 from sisters_mascot.config import AppConfig, load_config, save_config
@@ -211,6 +212,7 @@ class MascotAppController(QObject):
         self.mascot.mascot_clicked_line.connect(self._on_mascot_click_line)
         if hasattr(self.mascot, "size_changed"):
             self.mascot.size_changed.connect(self._on_mascot_size_changed)
+        self.mascot.files_dropped.connect(self._on_mascot_files_dropped)
         self.mascot.quit_requested.connect(self.quit)
 
         # Bubble panel
@@ -260,6 +262,23 @@ class MascotAppController(QObject):
 
     def _open_panel(self) -> None:
         self.panel.show_for_mascot(self.mascot.frameGeometry())
+
+    def _on_mascot_files_dropped(self, paths: list[str]) -> None:
+        was_at_limit = len(self.panel.get_attachments()) >= MAX_ATTACHMENTS
+        added = self.panel.add_attachments(paths, notify=False)
+        self.panel.show_for_mascot(self.mascot.frameGeometry(), tab_index=0)
+        if added:
+            if len(added) == 1:
+                msg = f"📎 {added[0].name} を受け取ったよ！メッセージと一緒に送ってね。"
+            else:
+                msg = f"📎 {len(added)}件を受け取ったよ！メッセージと一緒に送ってね。"
+            self.mascot.show_toast(msg, duration_ms=3400)
+        elif was_at_limit:
+            self.mascot.show_toast(
+                f"添付は最大 {MAX_ATTACHMENTS} 件までだよ。", is_error=True, duration_ms=3200
+            )
+        else:
+            self.mascot.show_toast("すでに添付リストに入っているみたい！", duration_ms=2600)
 
     def switch_sister(self, sister_id: str) -> None:
         sister = self.sister_map.get(sister_id)

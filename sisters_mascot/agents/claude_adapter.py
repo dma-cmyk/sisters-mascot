@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from sisters_mascot.agents.base import (
     AgentSpec,
@@ -15,6 +15,7 @@ from sisters_mascot.agents.base import (
     StreamEvent,
     make_tool_event,
 )
+from sisters_mascot.attachments import AttachmentItem, collect_attachment_dirs
 
 _DYNAMIC_ALIASES: tuple[tuple[str, str], ...] = (
     ("sonnet", "Sonnet (sonnet)"),
@@ -128,8 +129,8 @@ class ClaudeAdapter(BaseAgentAdapter):
         cwd: str = "",
         system_prompt: str = "",
         auto_approve: bool = True,
+        attachments: Sequence[AttachmentItem] = (),
     ) -> tuple[list[str], str | None]:
-        _ = cwd
         cmd = [
             self.resolved_binary(),
             "-p",
@@ -147,6 +148,8 @@ class ClaudeAdapter(BaseAgentAdapter):
             cmd.extend(["--append-system-prompt", system_prompt])
         if auto_approve:
             cmd.extend(["--permission-mode", "acceptEdits"])
+        for extra_dir in collect_attachment_dirs(attachments, cwd):
+            cmd.extend(["--add-dir", extra_dir])
         return cmd, None
 
     def parse_line(self, line: str) -> list[StreamEvent]:

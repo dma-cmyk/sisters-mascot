@@ -5,10 +5,18 @@ from __future__ import annotations
 import html
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QGuiApplication
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QDragEnterEvent,
+    QDragLeaveEvent,
+    QDragMoveEvent,
+    QDropEvent,
+    QGuiApplication,
+)
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -36,6 +44,12 @@ from PyQt6.QtWidgets import (
 from sisters_mascot import USER_SPRITES_DIR
 from sisters_mascot.agents.base import ModelChoice
 from sisters_mascot.agents.router import AGENT_IDS, AgentRouter
+from sisters_mascot.attachments import (
+    AttachmentItem,
+    MAX_ATTACHMENTS,
+    build_attachment_item,
+    format_attachments_for_chat_display,
+)
 from sisters_mascot.config import (
     PANEL_HEIGHT_MAX,
     PANEL_HEIGHT_MIN,
@@ -61,6 +75,7 @@ from sisters_mascot.ui.platform import supports_window_positioning
 from sisters_mascot.ui.widgets import (
     ChatInputEdit,
     LauncherItemDialog,
+    extract_local_paths_from_mime,
     markdown_to_bubble_html,
 )
 
@@ -226,7 +241,8 @@ class BubblePanel(QWidget):
 
         self._updating_controls: bool = False
         self._ui_ready: bool = False
-        self._messages: list[dict[str, str]] = []
+        self._messages: list[dict[str, Any]] = []
+        self._attachments: list[AttachmentItem] = []
         self._streaming_text: str | None = None
         self._discovered_choices: dict[str, list[ModelChoice]] = {}
         self._manual_refresh_pending: set[str] = set()
@@ -239,6 +255,7 @@ class BubblePanel(QWidget):
         init_h = max(PANEL_HEIGHT_MIN, min(PANEL_HEIGHT_MAX, int(getattr(self._config, "panel_height", 600) or 600)))
         self.resize(init_w, init_h)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAcceptDrops(True)
         self._apply_window_flags(initial=True)
 
         self._stream_flush_timer = QTimer(self)
@@ -255,6 +272,11 @@ class BubblePanel(QWidget):
         self._move_save_timer.setSingleShot(True)
         self._move_save_timer.setInterval(260)
         self._move_save_timer.timeout.connect(self._emit_position_changed)
+
+        self._drop_overlay_hide_timer = QTimer(self)
+        self._drop_overlay_hide_timer.setSingleShot(True)
+        self._drop_overlay_hide_timer.setInterval(45)
+        self._drop_overlay_hide_timer.timeout.connect(self._hide_drop_overlay)
 
         self._build_ui()
         self._ui_ready = True
@@ -376,6 +398,24 @@ class BubblePanel(QWidget):
         )
         layout.addLayout(grip_row)
 
+        self._drop_overlay = QLabel(
+            "📎 ここにドロップして添付\nファイル・フォルダ（複数OK）",
+            self._frame,
+        )
+        self._drop_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._drop_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._drop_overlay.setStyleSheet(
+            "background-color: rgba(15, 23, 42, 224); "
+            "color: #e0e7ff; "
+            "border: 2px dashed #818cf8; "
+            "border-radius: 16px; "
+            "font-size: 14px; "
+            "font-weight: 700; "
+            "padding: 16px;"
+        )
+        self._drop_overlay.hide()
+        self._layout_drop_overlay()
+
     def _build_chat_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -384,6 +424,9 @@ class BubblePanel(QWidget):
 
         self._chat_browser = QTextBrowser(tab)
         self._chat_browser.setOpenExternalLinks(True)
+        self._chat_browser.setAcceptDrops(False)
+        if self._chat_browser.viewport() is not None:
+            self._chat_browser.viewport().setAcceptDrops(False)
         layout.addWidget(self._chat_browser, 1)
 
         self._status_bar = QLabel(tab)
@@ -407,13 +450,50 @@ class BubblePanel(QWidget):
         self._chips_scroll.setWidget(self._chips_container)
         layout.addWidget(self._chips_scroll)
 
+        # Queued file/folder attachment chips bar
+        self._attachments_bar = QWidget(tab)
+        att_bar_lay = QHBoxLayout(self._attachments_bar)
+        att_bar_lay.setContentsMargins(0, 0, 0, 0)
+        att_bar_lay.setSpacing(4)
+
+        self._attachments_scroll = QScrollArea(self._attachments_bar)
+        self._attachments_scroll.setWidgetResizable(True)
+        self._attachments_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._attachments_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._attachments_scroll.setFixedHeight(36)
+        self._attachments_container = QWidget()
+        self._attachments_layout = QHBoxLayout(self._attachments_container)
+        self._attachments_layout.setContentsMargins(0, 2, 0, 2)
+        self._attachments_layout.setSpacing(5)
+        self._attachments_scroll.setWidget(self._attachments_container)
+        att_bar_lay.addWidget(self._attachments_scroll, 1)
+
+        self._clear_attachments_btn = QToolButton(self._attachments_bar)
+        self._clear_attachments_btn.setText("✕")
+        self._clear_attachments_btn.setFixedSize(24, 24)
+        self._clear_attachments_btn.setToolTip("添付をすべて解除")
+        self._clear_attachments_btn.clicked.connect(self.clear_attachments)
+        att_bar_lay.addWidget(self._clear_attachments_btn)
+
+        self._attachments_bar.hide()
+        layout.addWidget(self._attachments_bar)
+
         # Input row
         input_row = QHBoxLayout()
         input_row.setSpacing(6)
 
+        self._attach_btn = QToolButton(tab)
+        self._attach_btn.setText("📎")
+        self._attach_btn.setFixedSize(34, 58)
+        self._attach_btn.setToolTip("ファイル・フォルダを添付（ドラッグ＆ドロップも可）")
+        self._attach_btn.clicked.connect(self._on_attach_button_clicked)
+        input_row.addWidget(self._attach_btn)
+
         self._chat_input = ChatInputEdit(tab)
         self._chat_input.setFixedHeight(58)
         self._chat_input.send_requested.connect(self._on_send_or_stop)
+        self._chat_input.files_dropped.connect(self._on_files_dropped_in_panel)
+        self._chat_input.file_drag_changed.connect(self._on_child_file_drag_changed)
         input_row.addWidget(self._chat_input, 1)
 
         btn_col = QVBoxLayout()
@@ -939,6 +1019,243 @@ class BubblePanel(QWidget):
             self._config.panel_y = y
             self.config_updated.emit()
 
+    # Attachment management & drag-and-drop
+    def _layout_drop_overlay(self) -> None:
+        if hasattr(self, "_drop_overlay") and hasattr(self, "_frame"):
+            self._drop_overlay.setGeometry(self._frame.rect().adjusted(8, 8, -8, -8))
+
+    def _show_drop_overlay(self, count: int = 0) -> None:
+        if count > 1:
+            self._drop_overlay.setText(
+                f"📎 {count}件をここにドロップして添付\nファイル・フォルダ（複数OK）"
+            )
+        else:
+            self._drop_overlay.setText(
+                "📎 ここにドロップして添付\nファイル・フォルダ（複数OK）"
+            )
+        self._layout_drop_overlay()
+        self._drop_overlay.show()
+        self._drop_overlay.raise_()
+
+    def _hide_drop_overlay(self) -> None:
+        self._drop_overlay.hide()
+
+    def _on_child_file_drag_changed(self, active: bool) -> None:
+        if active:
+            self._drop_overlay_hide_timer.stop()
+            self._show_drop_overlay()
+        else:
+            self._drop_overlay_hide_timer.start()
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        paths = extract_local_paths_from_mime(event.mimeData())
+        if paths:
+            self._drop_overlay_hide_timer.stop()
+            event.acceptProposedAction()
+            self._show_drop_overlay(len(paths))
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        if extract_local_paths_from_mime(event.mimeData()):
+            self._drop_overlay_hide_timer.stop()
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
+        self._drop_overlay_hide_timer.start()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        self._drop_overlay_hide_timer.stop()
+        self._hide_drop_overlay()
+        paths = extract_local_paths_from_mime(event.mimeData())
+        if paths:
+            event.acceptProposedAction()
+            self._on_files_dropped_in_panel(paths)
+            return
+        super().dropEvent(event)
+
+    def _on_files_dropped_in_panel(self, paths: list[str]) -> None:
+        self._tabs.setCurrentIndex(0)
+        self.add_attachments(paths, notify=True)
+        self._chat_input.setFocus()
+
+    def get_attachments(self) -> list[AttachmentItem]:
+        """Return a shallow copy of the currently queued attachments."""
+        return list(self._attachments)
+
+    def add_attachments(
+        self, paths: Sequence[str | Path], *, notify: bool = False
+    ) -> list[AttachmentItem]:
+        """Validate, deduplicate, and queue local files or folders as attachments."""
+        existing = {att.path for att in self._attachments}
+        added: list[AttachmentItem] = []
+        duplicates = 0
+        invalid = 0
+        capped = False
+
+        for raw_path in paths:
+            item = build_attachment_item(raw_path)
+            if item is None:
+                invalid += 1
+                continue
+            if item.path in existing:
+                duplicates += 1
+                continue
+            if len(self._attachments) >= MAX_ATTACHMENTS:
+                capped = True
+                break
+            self._attachments.append(item)
+            existing.add(item.path)
+            added.append(item)
+
+        if added:
+            self._rebuild_attachment_chips()
+
+        if notify:
+            if added:
+                if len(added) == 1:
+                    self.toast_requested.emit(f"📎 {added[0].name} を添付しました", False)
+                else:
+                    self.toast_requested.emit(f"📎 {len(added)}件を添付しました", False)
+            elif capped:
+                self.toast_requested.emit(f"添付は最大 {MAX_ATTACHMENTS} 件までです。", True)
+            elif duplicates > 0 and invalid == 0:
+                self.toast_requested.emit("すでに添付されています。", False)
+            elif invalid > 0:
+                self.toast_requested.emit(
+                    "添付できるローカルファイル・フォルダが見つかりませんでした。", True
+                )
+
+            if added and capped:
+                self.toast_requested.emit(
+                    f"上限（{MAX_ATTACHMENTS}件）のため一部のみ添付しました。", True
+                )
+
+        return added
+
+    def remove_attachment(self, path: str) -> None:
+        """Remove the attachment matching `path` from the pending queue."""
+        before = len(self._attachments)
+        self._attachments = [att for att in self._attachments if att.path != path]
+        if len(self._attachments) != before:
+            self._rebuild_attachment_chips()
+
+    def clear_attachments(self) -> None:
+        """Remove all pending attachments from the queue."""
+        if not self._attachments:
+            return
+        self._attachments.clear()
+        self._rebuild_attachment_chips()
+
+    def _rebuild_attachment_chips(self) -> None:
+        self._clear_layout(self._attachments_layout)
+        for att in self._attachments:
+            if att.is_folder:
+                bg = "rgba(245, 158, 11, 0.16)"
+                border = "rgba(251, 191, 36, 0.45)"
+            elif att.is_image:
+                bg = "rgba(6, 182, 212, 0.16)"
+                border = "rgba(34, 211, 238, 0.45)"
+            else:
+                bg = "rgba(99, 102, 241, 0.20)"
+                border = "rgba(129, 140, 248, 0.48)"
+
+            chip = QFrame(self._attachments_container)
+            chip.setToolTip(att.tooltip_text)
+            chip.setStyleSheet(
+                f"QFrame {{ background-color: {bg}; border: 1px solid {border}; "
+                "border-radius: 12px; }"
+            )
+            chip_lay = QHBoxLayout(chip)
+            chip_lay.setContentsMargins(8, 2, 4, 2)
+            chip_lay.setSpacing(4)
+
+            lbl = QLabel(att.chip_label(), chip)
+            lbl.setStyleSheet(
+                "border: none; background: transparent; color: #f8fafc; font-size: 11px;"
+            )
+            chip_lay.addWidget(lbl)
+
+            rm_btn = QToolButton(chip)
+            rm_btn.setText("×")
+            rm_btn.setFixedSize(16, 16)
+            rm_btn.setToolTip(f"{att.name} を削除")
+            rm_btn.setStyleSheet(
+                "QToolButton { border: none; background: transparent; color: #cbd5e1; "
+                "font-size: 12px; font-weight: 700; padding: 0; border-radius: 8px; }"
+                "QToolButton:hover { background-color: rgba(244, 63, 94, 0.45); color: #fff; }"
+            )
+            rm_btn.clicked.connect(lambda _=False, p=att.path: self.remove_attachment(p))
+            chip_lay.addWidget(rm_btn)
+
+            self._attachments_layout.addWidget(chip)
+
+        self._attachments_layout.addStretch(1)
+        has_items = bool(self._attachments)
+        self._attachments_bar.setVisible(has_items)
+        if has_items:
+            self._attach_btn.setStyleSheet(
+                "border-color: rgba(129, 140, 248, 0.80); "
+                "background-color: rgba(79, 70, 229, 0.35);"
+            )
+            self._attach_btn.setToolTip(
+                f"ファイル・フォルダを添付中 ({len(self._attachments)}件)"
+            )
+        else:
+            self._attach_btn.setStyleSheet("")
+            self._attach_btn.setToolTip(
+                "ファイル・フォルダを添付（ドラッグ＆ドロップも可）"
+            )
+
+    def _on_attach_button_clicked(self) -> None:
+        menu = QMenu(self._attach_btn)
+        menu.setStyleSheet(
+            "QMenu { background:#14192b; color:#f1f5f9; border:1px solid #334155; border-radius:8px; padding:4px; }"
+            "QMenu::item { padding:5px 12px; border-radius:5px; }"
+            "QMenu::item:selected { background:#4f46e5; }"
+        )
+        file_act = QAction("📄 ファイルを添付…", menu)
+        file_act.triggered.connect(self._pick_files_to_attach)
+        menu.addAction(file_act)
+
+        dir_act = QAction("📁 フォルダを添付…", menu)
+        dir_act.triggered.connect(self._pick_folder_to_attach)
+        menu.addAction(dir_act)
+
+        if self._attachments:
+            menu.addSeparator()
+            clear_act = QAction(f"🗑️ 添付をすべて解除 ({len(self._attachments)}件)", menu)
+            clear_act.triggered.connect(self.clear_attachments)
+            menu.addAction(clear_act)
+
+        menu.exec(self._attach_btn.mapToGlobal(QPoint(0, 0)))
+
+    def _pick_files_to_attach(self) -> None:
+        start_dir = self._config.working_dir or str(Path.home())
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "添付するファイルを選択",
+            start_dir,
+            "All Files (*)",
+        )
+        if paths:
+            self.add_attachments(paths, notify=True)
+            self._chat_input.setFocus()
+
+    def _pick_folder_to_attach(self) -> None:
+        start_dir = self._config.working_dir or str(Path.home())
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "添付するフォルダを選択",
+            start_dir,
+        )
+        if chosen:
+            self.add_attachments([chosen], notify=True)
+            self._chat_input.setFocus()
+
     # Chat & Router handling
     def _append_system_or_greeting(self) -> None:
         greeting = (self._sister.greeting or "").strip() or (
@@ -1134,7 +1451,7 @@ class BubblePanel(QWidget):
         sb = self._chat_browser.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def _format_message_block(self, msg: dict[str, str]) -> str:
+    def _format_message_block(self, msg: dict[str, Any]) -> str:
         role = msg.get("role", "sister")
         author = html.escape(msg.get("author", ""))
         ts = html.escape(msg.get("time", ""))
@@ -1142,13 +1459,41 @@ class BubblePanel(QWidget):
         body_html = markdown_to_bubble_html(msg.get("text", ""), accent)
 
         if role == "user":
+            att_list = msg.get("attachments") or []
+            att_html = ""
+            if att_list:
+                badges: list[str] = []
+                for att in att_list:
+                    icon = html.escape(str(att.get("icon", "📎")))
+                    name = html.escape(str(att.get("name", "")))
+                    path = html.escape(str(att.get("path", "")))
+                    meta = html.escape(str(att.get("meta", "")))
+                    meta_span = (
+                        f' <span style="color:#94a3b8;">({meta})</span>' if meta else ""
+                    )
+                    badges.append(
+                        f'<span title="{path}" style="background-color:#1e293b; '
+                        'border:1px solid #475569; padding:1px 6px; font-size:10.5px; '
+                        f'color:#e2e8f0;">{icon} {name}{meta_span}</span>'
+                    )
+                att_html = (
+                    '<div style="margin-bottom:4px;">' + " ".join(badges) + "</div>"
+                )
+            raw_text = str(msg.get("text", "") or "").strip()
+            if raw_text:
+                rendered_body = body_html
+            elif att_list:
+                rendered_body = '<span style="color:#cbd5e1; font-size:11.5px;">（添付内容の確認を依頼）</span>'
+            else:
+                rendered_body = body_html
             return (
                 '<table width="100%" cellspacing="0" cellpadding="7" '
                 'style="background-color:#262f52; border:1px solid #4338ca; margin:4px 0 6px 26px;">'
                 "<tr><td>"
                 f'<div style="font-size:10.5px; color:#c7d2fe; font-weight:bold; margin-bottom:2px;">'
                 f'美緒ちゃん <span style="color:#94a3b8; font-weight:normal;">{ts}</span></div>'
-                f'<div style="color:#f8fafc;">{body_html}</div>'
+                f"{att_html}"
+                f'<div style="color:#f8fafc;">{rendered_body}</div>'
                 "</td></tr></table>"
             )
         if role == "error":
@@ -1170,13 +1515,27 @@ class BubblePanel(QWidget):
             "</td></tr></table>"
         )
 
-    def send_prompt(self, text: str, *, preferred_agent: str = "") -> None:
+    def send_prompt(
+        self,
+        text: str,
+        *,
+        preferred_agent: str = "",
+        attachments: Sequence[AttachmentItem] | None = None,
+    ) -> None:
         prompt = (text or "").strip()
-        if not prompt:
+        using_queued = attachments is None
+        resolved_attachments = (
+            list(self._attachments) if using_queued else list(attachments or ())
+        )
+        if not prompt and not resolved_attachments:
             return
         if self._router.is_running():
             self.toast_requested.emit("現在応答中です。停止してから送信してください。", True)
             return
+
+        if using_queued and self._attachments:
+            self._attachments.clear()
+            self._rebuild_attachment_chips()
 
         if preferred_agent and preferred_agent in AGENT_IDS and preferred_agent != self._config.agent_id:
             self._config.agent_id = preferred_agent
@@ -1189,6 +1548,7 @@ class BubblePanel(QWidget):
                 "author": "美緒ちゃん",
                 "accent": "#6366f1",
                 "text": prompt,
+                "attachments": format_attachments_for_chat_display(resolved_attachments),
                 "time": datetime.now().strftime("%H:%M"),
             }
         )
@@ -1206,6 +1566,7 @@ class BubblePanel(QWidget):
             model=model,
             cwd=cwd,
             auto_approve=bool(self._config.auto_approve),
+            attachments=resolved_attachments,
         )
 
     def _on_send_or_stop(self) -> None:
@@ -1227,7 +1588,7 @@ class BubblePanel(QWidget):
             return
 
         text = self._chat_input.toPlainText().strip()
-        if not text:
+        if not text and not self._attachments:
             return
         self._chat_input.clear()
         self.send_prompt(text)
@@ -1370,6 +1731,11 @@ class BubblePanel(QWidget):
             pw_act.triggered.connect(lambda: self._investigate_bookmark_with_playwright(item))
             menu.addAction(pw_act)
             menu.addSeparator()
+        elif kind == "folder":
+            attach_act = QAction("📎 チャットに添付", menu)
+            attach_act.triggered.connect(lambda: self._attach_launcher_folder(item))
+            menu.addAction(attach_act)
+            menu.addSeparator()
 
         edit_act = QAction("✏️ 編集", menu)
         edit_act.triggered.connect(lambda: self._edit_launcher_item(kind, item))
@@ -1388,6 +1754,11 @@ class BubblePanel(QWidget):
             "を開き、現在のページ内容や重要なポイントを簡潔に調査して報告してください。"
         )
         self.send_prompt(prompt)
+
+    def _attach_launcher_folder(self, folder: FolderItem) -> None:
+        self._tabs.setCurrentIndex(0)
+        self.add_attachments([folder.path], notify=True)
+        self._chat_input.setFocus()
 
     def _edit_launcher_item(self, kind: str, item) -> None:  # noqa: ANN001
         dlg = LauncherItemDialog(kind, item, self)
@@ -1606,6 +1977,7 @@ class BubblePanel(QWidget):
 
     def resizeEvent(self, event) -> None:  # noqa: ANN001
         super().resizeEvent(event)
+        self._layout_drop_overlay()
         if self._ui_ready:
             self._resize_save_timer.start()
 
@@ -1624,4 +1996,5 @@ class BubblePanel(QWidget):
         self._stream_flush_timer.stop()
         self._resize_save_timer.stop()
         self._move_save_timer.stop()
+        self._drop_overlay_hide_timer.stop()
         super().closeEvent(event)

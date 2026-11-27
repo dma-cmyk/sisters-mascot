@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import html
+import os
 import re
 import uuid
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QMimeData, QPoint, QRect, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
+    QDragEnterEvent,
+    QDragLeaveEvent,
+    QDragMoveEvent,
+    QDropEvent,
     QFont,
     QGuiApplication,
     QInputMethodEvent,
@@ -436,6 +441,31 @@ class ToastBubble(QWidget):
         painter.drawPath(united)
 
 
+def extract_local_paths_from_mime(mime_data: QMimeData | None) -> list[str]:
+    """Extract deduplicated existing local file/folder paths from Qt MIME data."""
+    if mime_data is None or not mime_data.hasUrls():
+        return []
+    paths: list[str] = []
+    seen: set[str] = set()
+    for url in mime_data.urls():
+        if not url.isLocalFile():
+            continue
+        local = url.toLocalFile()
+        if not local:
+            continue
+        norm = os.path.abspath(local)
+        if norm in seen:
+            continue
+        try:
+            if not Path(norm).exists():
+                continue
+        except OSError:
+            continue
+        seen.add(norm)
+        paths.append(norm)
+    return paths
+
+
 class ChatInputEdit(QPlainTextEdit):
     """Multi-line chat composer: Enter sends, Shift+Enter inserts newline.
 
@@ -447,10 +477,12 @@ class ChatInputEdit(QPlainTextEdit):
     """
 
     send_requested = pyqtSignal()
+    files_dropped = pyqtSignal(list)
+    file_drag_changed = pyqtSignal(bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setPlaceholderText("メッセージを入力… (Enterで送信 / Shift+Enterで改行)")
+        self.setPlaceholderText("メッセージを入力… (D&D添付可 / Enter送信 / Shift+Enter改行)")
         self.setTabChangesFocus(True)
         self._composing = False
         self._commit_guard = False
@@ -458,6 +490,44 @@ class ChatInputEdit(QPlainTextEdit):
         self._commit_guard_timer.setSingleShot(True)
         self._commit_guard_timer.setInterval(0)
         self._commit_guard_timer.timeout.connect(self._clear_commit_guard)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if extract_local_paths_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+            self.file_drag_changed.emit(True)
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        if extract_local_paths_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
+        self.file_drag_changed.emit(False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        paths = extract_local_paths_from_mime(event.mimeData())
+        if paths:
+            event.acceptProposedAction()
+            self.file_drag_changed.emit(False)
+            self.files_dropped.emit(paths)
+            return
+        super().dropEvent(event)
+
+    def canInsertFromMimeData(self, source: QMimeData | None) -> bool:
+        if extract_local_paths_from_mime(source):
+            return True
+        return super().canInsertFromMimeData(source)
+
+    def insertFromMimeData(self, source: QMimeData | None) -> None:
+        paths = extract_local_paths_from_mime(source)
+        if paths:
+            self.files_dropped.emit(paths)
+            return
+        super().insertFromMimeData(source)
 
     def inputMethodEvent(self, event: QInputMethodEvent) -> None:
         self._composing = bool(event.preeditString())
