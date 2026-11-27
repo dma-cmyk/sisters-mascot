@@ -17,6 +17,7 @@ from sisters_mascot.agents.claude_adapter import ClaudeAdapter
 from sisters_mascot.agents.codex_adapter import CodexAdapter
 from sisters_mascot.agents.opencode_adapter import OpenCodeAdapter
 from sisters_mascot.attachments import AttachmentItem, build_prompt_with_attachments
+from sisters_mascot.conversation import COMPACT_SYSTEM_PROMPT
 from sisters_mascot.sisters_loader import SisterProfile
 
 AGENT_IDS: tuple[str, ...] = ("agy", "claude", "codex", "opencode")
@@ -30,6 +31,8 @@ class AgentRouter(QObject):
     status_changed = pyqtSignal(str)
     reply_finished = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
+    compact_finished = pyqtSignal(str)
+    compact_error = pyqtSignal(str)
     models_discovered = pyqtSignal(str, list)
     model_choices_discovered = pyqtSignal(str, list)
 
@@ -77,12 +80,44 @@ class AgentRouter(QObject):
         with self._lock:
             return self._running
 
+    def has_session(self, agent_id: str, sister_id: str) -> bool:
+        """Return True if `(agent_id, sister_id)` already has a native CLI session ID."""
+        with self._lock:
+            return bool(self._sessions.get((agent_id, sister_id)))
+
+    def clear_session(self, agent_id: str, sister_id: str) -> None:
+        """Remove a single `(agent_id, sister_id)` session ID."""
+        with self._lock:
+            self._sessions.pop((agent_id, sister_id), None)
+
+    def export_sessions(self) -> dict[str, str]:
+        """Serialize active CLI session IDs into `{agent:sister: session_id}`."""
+        with self._lock:
+            return {
+                f"{aid}:{sid}": sess_id
+                for (aid, sid), sess_id in self._sessions.items()
+                if sess_id
+            }
+
+    def import_sessions(self, sessions: dict[str, str]) -> None:
+        """Restore previously persisted CLI session IDs."""
+        with self._lock:
+            self._sessions.clear()
+            for key, sess_id in sessions.items():
+                if not isinstance(key, str) or ":" not in key:
+                    continue
+                aid, sid = key.split(":", 1)
+                val = str(sess_id or "").strip()
+                if aid in self._adapters and sid and val:
+                    self._sessions[(aid, sid)] = val
+
     def _build_persona_context(self, sister: SisterProfile) -> str:
         return (
             f"{sister.persona_prompt}\n\n"
             "【デスクトップ・マスコットとしての対話環境】\n"
             "- あなたは現在、美緒ちゃん（マスター）のデスクトップ上のマスコットランチャーから話しかけられています。\n"
             "- キャラクターの口調と温かさを保ちつつ、簡潔でわかりやすい日本語で応答してください。\n"
+            "- `<conversation_handoff>` が含まれている場合は、これまでの会話や他の姉妹・AIとのやり取りを引き継いで、自然な続きとして応答してください。\n"
             "- ユーザーからファイルやフォルダが添付された場合は、提示された絶対パスを直接読み込み・確認して丁寧にサポートしてください。\n"
             "- Webページの調査・操作やGoogle Chromeでの確認を求められた場合は、利用可能な Playwright / Chrome MCP ツール（`browser_*` 等）を優先して使用してください。"
         )
@@ -97,6 +132,7 @@ class AgentRouter(QObject):
         cwd: str = "",
         auto_approve: bool = True,
         attachments: Sequence[AttachmentItem] = (),
+        handoff_context: str = "",
     ) -> None:
         """Start an asynchronous streaming agent turn."""
         if agent_id not in self._adapters:
@@ -116,13 +152,15 @@ class AgentRouter(QObject):
                 return
             self._running = True
             self._cancel_requested = False
+            session_id = self._sessions.get((agent_id, sister.id))
 
-        session_key = (agent_id, sister.id)
-        session_id = self._sessions.get(session_key)
         persona_context = self._build_persona_context(sister)
 
         att_tuple = tuple(attachments)
         user_prompt = build_prompt_with_attachments(prompt, att_tuple)
+        clean_handoff = (handoff_context or "").strip()
+        if clean_handoff:
+            user_prompt = f"{clean_handoff}\n\n{user_prompt}"
 
         system_prompt_arg = ""
         effective_prompt = user_prompt
@@ -154,6 +192,64 @@ class AgentRouter(QObject):
         )
         worker.start()
 
+    def compact_conversation(
+        self,
+        agent_id: str,
+        compact_prompt: str,
+        *,
+        model: str = "",
+        cwd: str = "",
+    ) -> bool:
+        """Run an isolated non-session AI turn to summarize/compact conversation history."""
+        if agent_id not in self._adapters:
+            self.compact_error.emit(f"未対応のエージェントです: {agent_id}")
+            return False
+
+        adapter = self._adapters[agent_id]
+        if not adapter.is_available():
+            self.compact_error.emit(
+                f"{adapter.spec.display_name} のCLI ({adapter.spec.binary}) が見つかりません。"
+            )
+            return False
+
+        with self._lock:
+            if self._running:
+                self.compact_error.emit("現在応答を生成中です。停止してから実行してください。")
+                return False
+            self._running = True
+            self._cancel_requested = False
+
+        system_prompt_arg = ""
+        effective_prompt = compact_prompt
+        if adapter.spec.supports_system_prompt:
+            system_prompt_arg = COMPACT_SYSTEM_PROMPT
+        else:
+            effective_prompt = (
+                f"<system_instructions>\n{COMPACT_SYSTEM_PROMPT}\n</system_instructions>\n\n"
+                f"<user_message>\n{compact_prompt}\n</user_message>"
+            )
+
+        effective_cwd = cwd.strip() or str(Path.home())
+        adapter.reset_state()
+        cmd, stdin_text = adapter.build_command(
+            effective_prompt,
+            model=model,
+            session_id=None,
+            cwd=effective_cwd,
+            system_prompt=system_prompt_arg,
+            auto_approve=False,
+            attachments=(),
+        )
+
+        worker = threading.Thread(
+            target=self._run_subprocess,
+            args=(agent_id, "", adapter, cmd, stdin_text, effective_cwd),
+            kwargs={"compact_mode": True},
+            daemon=True,
+        )
+        worker.start()
+        return True
+
     def _run_subprocess(
         self,
         agent_id: str,
@@ -162,13 +258,17 @@ class AgentRouter(QObject):
         cmd: list[str],
         stdin_text: str | None,
         cwd: str,
+        *,
+        compact_mode: bool = False,
     ) -> None:
         resolved_cwd = cwd if (cwd and Path(cwd).is_dir()) else str(Path.home())
         full_text = ""
         saw_error = False
         stderr_lines: list[str] = []
 
-        self.status_changed.emit("✨ 考え中...")
+        self.status_changed.emit(
+            "🗜️ 会話をコンパクト化中…" if compact_mode else "✨ 考え中..."
+        )
 
         popen_kwargs: dict = {
             "cwd": resolved_cwd,
@@ -192,7 +292,11 @@ class AgentRouter(QObject):
                 self._running = False
                 self._process = None
             self.status_changed.emit("")
-            self.error_occurred.emit(f"CLIの起動に失敗しました: {exc}")
+            err_msg = f"CLIの起動に失敗しました: {exc}"
+            if compact_mode:
+                self.compact_error.emit(err_msg)
+            else:
+                self.error_occurred.emit(err_msg)
             return
 
         with self._lock:
@@ -225,19 +329,26 @@ class AgentRouter(QObject):
                         if self._cancel_requested:
                             break
                     for ev in adapter.parse_line(line):
-                        if ev.kind == "session" and ev.session_id:
-                            self._sessions[(agent_id, sister_id)] = ev.session_id
+                        if ev.kind == "session" and ev.session_id and not compact_mode:
+                            with self._lock:
+                                self._sessions[(agent_id, sister_id)] = ev.session_id
                         elif ev.kind == "delta" and ev.text:
                             full_text += ev.text
-                            self.delta_received.emit(ev.text)
+                            if not compact_mode:
+                                self.delta_received.emit(ev.text)
                         elif ev.kind == "replace":
                             full_text = ev.text
-                            self.replace_received.emit(ev.text)
-                        elif ev.kind in ("tool", "status") and ev.text:
+                            if not compact_mode:
+                                self.replace_received.emit(ev.text)
+                        elif ev.kind in ("tool", "status") and ev.text and not compact_mode:
                             self.status_changed.emit(ev.text)
                         elif ev.kind == "error":
                             saw_error = True
-                            self.error_occurred.emit(ev.text or f"{agent_id} でエラーが発生しました。")
+                            msg = ev.text or f"{agent_id} でエラーが発生しました。"
+                            if compact_mode:
+                                self.compact_error.emit(msg)
+                            else:
+                                self.error_occurred.emit(msg)
         finally:
             returncode = proc.wait()
             stderr_thread.join(timeout=1.0)
@@ -249,13 +360,31 @@ class AgentRouter(QObject):
 
         self.status_changed.emit("")
 
+        if compact_mode:
+            if cancelled:
+                self.compact_error.emit("コンパクト化を中断しました。")
+                return
+            if saw_error:
+                return
+            if returncode != 0 and not full_text.strip():
+                err_detail = "\n".join(stderr_lines[-6:]).strip()
+                self.compact_error.emit(
+                    err_detail
+                    or f"{adapter.spec.display_name} が終了コード {returncode} で終了しました。"
+                )
+                return
+            self.compact_finished.emit(full_text.strip())
+            return
+
         if cancelled:
             self.reply_finished.emit(full_text)
             return
 
         if returncode != 0 and not saw_error and not full_text.strip():
             err_detail = "\n".join(stderr_lines[-6:]).strip()
-            self.error_occurred.emit(err_detail or f"{adapter.spec.display_name} が終了コード {returncode} で終了しました。")
+            self.error_occurred.emit(
+                err_detail or f"{adapter.spec.display_name} が終了コード {returncode} で終了しました。"
+            )
             return
 
         self.reply_finished.emit(full_text)
@@ -299,11 +428,12 @@ class AgentRouter(QObject):
 
     def new_session(self, agent_id: str | None = None) -> None:
         """Clear saved conversation/session IDs for one agent or all agents."""
-        if agent_id is None:
-            self._sessions.clear()
-            return
-        for key in [k for k in self._sessions if k[0] == agent_id]:
-            self._sessions.pop(key, None)
+        with self._lock:
+            if agent_id is None:
+                self._sessions.clear()
+                return
+            for key in [k for k in self._sessions if k[0] == agent_id]:
+                self._sessions.pop(key, None)
 
     def get_cached_model_choices(self, agent_id: str) -> list[ModelChoice] | None:
         """Return cached ModelChoices for `agent_id`, or None if not discovered yet."""

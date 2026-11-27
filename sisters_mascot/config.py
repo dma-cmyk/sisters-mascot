@@ -171,6 +171,8 @@ class AppConfig:
     models_by_agent: dict[str, str] = field(default_factory=dict)
     working_dir: str = field(default_factory=lambda: str(Path.home()))
     auto_approve: bool = True
+    auto_compact_enabled: bool = False
+    auto_compact_chars: int = 18000
     mascot_x: int | None = None
     mascot_y: int | None = None
     mascot_scale: str = "medium"
@@ -240,6 +242,8 @@ def load_config(path: Path | None = None) -> AppConfig:
         "agent_id",
         "working_dir",
         "auto_approve",
+        "auto_compact_enabled",
+        "auto_compact_chars",
         "mascot_x",
         "mascot_y",
         "mascot_scale",
@@ -285,6 +289,8 @@ def load_config(path: Path | None = None) -> AppConfig:
 
     cfg.panel_width = _clamp_int(cfg.panel_width, 440, PANEL_WIDTH_MIN, PANEL_WIDTH_MAX)
     cfg.panel_height = _clamp_int(cfg.panel_height, 600, PANEL_HEIGHT_MIN, PANEL_HEIGHT_MAX)
+    cfg.auto_compact_enabled = bool(cfg.auto_compact_enabled)
+    cfg.auto_compact_chars = _clamp_int(cfg.auto_compact_chars, 18000, 4000, 100000)
     if cfg.animation_mode not in ANIMATION_MODES:
         cfg.animation_mode = "rich"
 

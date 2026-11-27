@@ -20,6 +20,8 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -29,6 +31,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizeGrip,
@@ -49,6 +52,11 @@ from sisters_mascot.attachments import (
     MAX_ATTACHMENTS,
     build_attachment_item,
     format_attachments_for_chat_display,
+)
+from sisters_mascot.conversation import (
+    COMPACT_HIGH_CHARS,
+    COMPACT_WARN_CHARS,
+    ConversationState,
 )
 from sisters_mascot.config import (
     PANEL_HEIGHT_MAX,
@@ -73,6 +81,7 @@ from sisters_mascot.sisters_loader import (
 from sisters_mascot.sprites.renderer import clear_sprite_cache
 from sisters_mascot.ui.platform import supports_window_positioning
 from sisters_mascot.ui.widgets import (
+    DARK_DIALOG_QSS,
     ChatInputEdit,
     LauncherItemDialog,
     extract_local_paths_from_mime,
@@ -222,6 +231,7 @@ class BubblePanel(QWidget):
     reset_corner_requested = pyqtSignal()
     test_tts_requested = pyqtSignal()
     toast_requested = pyqtSignal(str, bool)
+    conversation_changed = pyqtSignal()
 
     def __init__(
         self,
@@ -243,6 +253,14 @@ class BubblePanel(QWidget):
         self._ui_ready: bool = False
         self._messages: list[dict[str, Any]] = []
         self._attachments: list[AttachmentItem] = []
+        self._conversation: ConversationState = ConversationState()
+        self._compacting: bool = False
+        self._compact_warned_gen: int = -1
+        self._pending_turn_agent_id: str = ""
+        self._pending_turn_sister_id: str = ""
+        self._pending_turn_sister_name: str = ""
+        self._pending_turn_summary_gen: int = 0
+        self._pending_turn_had_session: bool = False
         self._streaming_text: str | None = None
         self._discovered_choices: dict[str, list[ModelChoice]] = {}
         self._manual_refresh_pending: set[str] = set()
@@ -282,6 +300,7 @@ class BubblePanel(QWidget):
         self._ui_ready = True
         self.sync_from_config(self._sister)
         self._append_system_or_greeting()
+        self._refresh_context_bar()
 
     def _update_maximum_size(self) -> None:
         """Let the panel grow up to the current screen's available area."""
@@ -421,6 +440,52 @@ class BubblePanel(QWidget):
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 6, 0, 0)
         layout.setSpacing(7)
+
+        # Slim context meter & compaction bar
+        self._context_bar = QFrame(tab)
+        self._context_bar.setStyleSheet(
+            "QFrame { background-color: rgba(23, 28, 48, 190); "
+            "border: 1px solid rgba(148, 163, 184, 0.20); border-radius: 10px; }"
+        )
+        ctx_lay = QHBoxLayout(self._context_bar)
+        ctx_lay.setContentsMargins(8, 3, 6, 3)
+        ctx_lay.setSpacing(4)
+
+        self._context_lbl = QLabel("", self._context_bar)
+        self._context_lbl.setStyleSheet(
+            "border: none; background: transparent; font-size: 11px; color: #94a3b8;"
+        )
+        ctx_lay.addWidget(self._context_lbl, 1)
+
+        self._compact_btn = QToolButton(self._context_bar)
+        self._compact_btn.setText("🗜️ コンパクト")
+        self._compact_btn.setToolTip("会話履歴を要約してコンテキストを圧縮します（クリックでAI要約）")
+        self._compact_btn.setStyleSheet(
+            "QToolButton { background-color: rgba(51, 65, 95, 190); "
+            "border: 1px solid rgba(148, 163, 184, 0.25); "
+            "border-radius: 7px; padding: 2px 8px; font-size: 11px; color: #e2e8f0; }"
+            "QToolButton:hover { background-color: rgba(99, 102, 241, 0.45); "
+            "border-color: rgba(165, 180, 252, 0.65); }"
+            "QToolButton:disabled { color: #64748b; background-color: rgba(30, 36, 56, 140); }"
+        )
+        self._compact_btn.clicked.connect(lambda: self.request_compact(mode="ai"))
+        ctx_lay.addWidget(self._compact_btn)
+
+        self._compact_menu_btn = QToolButton(self._context_bar)
+        self._compact_menu_btn.setText("▾")
+        self._compact_menu_btn.setFixedSize(22, 22)
+        self._compact_menu_btn.setToolTip("コンパクト方法の選択・現在の引き継ぎ要約を表示")
+        self._compact_menu_btn.setStyleSheet(
+            "QToolButton { background-color: rgba(51, 65, 95, 190); "
+            "border: 1px solid rgba(148, 163, 184, 0.25); "
+            "border-radius: 7px; padding: 0; font-size: 11px; color: #e2e8f0; }"
+            "QToolButton:hover { background-color: rgba(99, 102, 241, 0.45); "
+            "border-color: rgba(165, 180, 252, 0.65); }"
+        )
+        self._compact_menu_btn.clicked.connect(self._on_compact_menu_clicked)
+        ctx_lay.addWidget(self._compact_menu_btn)
+
+        layout.addWidget(self._context_bar)
 
         self._chat_browser = QTextBrowser(tab)
         self._chat_browser.setOpenExternalLinks(True)
@@ -754,6 +819,10 @@ class BubblePanel(QWidget):
         self._auto_approve_check.toggled.connect(self._on_display_setting_changed)
         di_lay.addWidget(self._auto_approve_check)
 
+        self._auto_compact_check = QCheckBox("コンテキスト肥大化時に自動でコンパクト化", disp_card)
+        self._auto_compact_check.toggled.connect(self._on_display_setting_changed)
+        di_lay.addWidget(self._auto_compact_check)
+
         self._always_on_top_check = QCheckBox("常に最前面に表示", disp_card)
         self._always_on_top_check.toggled.connect(self._on_display_setting_changed)
         di_lay.addWidget(self._always_on_top_check)
@@ -831,6 +900,7 @@ class BubblePanel(QWidget):
                 self._anim_mode_combo.setCurrentIndex(am_idx)
 
             self._auto_approve_check.setChecked(bool(self._config.auto_approve))
+            self._auto_compact_check.setChecked(bool(getattr(self._config, "auto_compact_enabled", False)))
             self._always_on_top_check.setChecked(bool(self._config.always_on_top))
 
             self._update_sprite_status_label()
@@ -1299,6 +1369,8 @@ class BubblePanel(QWidget):
             self._send_btn.setText("送信")
             self._send_btn.setStyleSheet("")
             self._status_bar.hide()
+        if hasattr(self, "_compact_btn"):
+            self._refresh_context_bar()
 
     def set_status_text(self, text: str) -> None:
         if text:
@@ -1323,31 +1395,75 @@ class BubblePanel(QWidget):
         self._stream_flush_timer.stop()
         final_text = (full_text or self._streaming_text or "").strip()
         self._streaming_text = None
+
+        turn_agent = self._pending_turn_agent_id or self._config.agent_id
+        turn_sister = self._pending_turn_sister_id or self._sister.id
+        turn_name = self._pending_turn_sister_name or _short_name(self._sister.display_name)
+        turn_accent = self._sister.accent_color
+        if turn_sister != self._sister.id:
+            matched = next((s for s in self._sisters if s.id == turn_sister), None)
+            if matched is not None:
+                turn_accent = matched.accent_color
+
+        now_str = datetime.now().strftime("%H:%M")
         if final_text:
+            self._conversation.add_sister_turn(
+                final_text,
+                author=turn_name,
+                sister_id=turn_sister,
+                agent_id=turn_agent,
+                time_str=now_str,
+            )
             self._messages.append(
                 {
                     "role": "sister",
-                    "author": f"💠 {_short_name(self._sister.display_name)} ({self._config.agent_id})",
-                    "accent": self._sister.accent_color,
+                    "author": f"💠 {turn_name} ({turn_agent})",
+                    "accent": turn_accent,
                     "text": final_text,
-                    "time": datetime.now().strftime("%H:%M"),
+                    "time": now_str,
                 }
             )
+            if self._router.has_session(turn_agent, turn_sister):
+                self._conversation.mark_session_synced(
+                    turn_agent,
+                    turn_sister,
+                    summary_gen=self._pending_turn_summary_gen,
+                )
+
         self.set_running_state(False)
         self._render_chat_log()
+        self._refresh_context_bar()
+        self.conversation_changed.emit()
+        self._maybe_warn_or_auto_compact()
 
     def append_error_message(self, err: str) -> None:
         self._stream_flush_timer.stop()
+        now_str = datetime.now().strftime("%H:%M")
         if self._streaming_text:
+            turn_agent = self._pending_turn_agent_id or self._config.agent_id
+            turn_sister = self._pending_turn_sister_id or self._sister.id
+            turn_name = self._pending_turn_sister_name or _short_name(self._sister.display_name)
+            self._conversation.add_sister_turn(
+                self._streaming_text,
+                author=turn_name,
+                sister_id=turn_sister,
+                agent_id=turn_agent,
+                time_str=now_str,
+            )
             self._messages.append(
                 {
                     "role": "sister",
-                    "author": f"💠 {_short_name(self._sister.display_name)} ({self._config.agent_id})",
+                    "author": f"💠 {turn_name} ({turn_agent})",
                     "accent": self._sister.accent_color,
                     "text": self._streaming_text,
-                    "time": datetime.now().strftime("%H:%M"),
+                    "time": now_str,
                 }
             )
+        elif self._pending_turn_had_session and self._pending_turn_agent_id and self._pending_turn_sister_id:
+            # Drop potentially stale/expired native session so next turn retries with handoff.
+            self._router.clear_session(self._pending_turn_agent_id, self._pending_turn_sister_id)
+            self._conversation.clear_session_sync(self._pending_turn_agent_id, self._pending_turn_sister_id)
+
         self._streaming_text = None
         self._messages.append(
             {
@@ -1355,11 +1471,13 @@ class BubblePanel(QWidget):
                 "author": "⚠️ エラー",
                 "accent": "#fb7185",
                 "text": err,
-                "time": datetime.now().strftime("%H:%M"),
+                "time": now_str,
             }
         )
         self.set_running_state(False)
         self._render_chat_log()
+        self._refresh_context_bar()
+        self.conversation_changed.emit()
 
     def on_model_choices_discovered(self, agent_id: str, choices: list) -> None:
         normalized: list[ModelChoice] = []
@@ -1419,7 +1537,7 @@ class BubblePanel(QWidget):
         cursor = self._chat_input.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         self._chat_input.setTextCursor(cursor)
-        if self._config.stt_auto_send and not self._router.is_running():
+        if self._config.stt_auto_send and not self._router.is_running() and not self._compacting:
             self.send_prompt(combined)
             self._chat_input.clear()
 
@@ -1496,6 +1614,16 @@ class BubblePanel(QWidget):
                 f'<div style="color:#f8fafc;">{rendered_body}</div>'
                 "</td></tr></table>"
             )
+        if role == "compact":
+            return (
+                '<table width="100%" cellspacing="0" cellpadding="7" '
+                'style="background-color:#132a2e; border:1px solid #14b8a6; margin:6px 4px;">'
+                "<tr><td>"
+                f'<div style="font-size:10.5px; color:#5eead4; font-weight:bold; margin-bottom:2px;">'
+                f'{author} <span style="color:#94a3b8; font-weight:normal;">{ts}</span></div>'
+                f'<div style="color:#e2e8f0; font-size:11.5px;">{body_html}</div>'
+                "</td></tr></table>"
+            )
         if role == "error":
             return (
                 '<table width="100%" cellspacing="0" cellpadding="7" '
@@ -1515,6 +1643,259 @@ class BubblePanel(QWidget):
             "</td></tr></table>"
         )
 
+    # Conversation continuity & compaction
+    def export_conversation_payload(
+        self,
+    ) -> tuple[ConversationState, list[dict[str, Any]], dict[str, str]]:
+        """Return `(ConversationState, display_messages, sessions)` for persistence."""
+        return self._conversation, list(self._messages), self._router.export_sessions()
+
+    def restore_conversation(
+        self,
+        state: ConversationState,
+        display_messages: Sequence[dict[str, Any]],
+        sessions: dict[str, str],
+    ) -> None:
+        """Restore persisted conversation history, summary, and CLI session IDs."""
+        self._conversation = state
+        self._router.import_sessions(sessions)
+        self._compact_warned_gen = -1
+        if display_messages:
+            self._messages = [dict(m) for m in display_messages]
+            self._render_chat_log()
+        else:
+            self._messages.clear()
+            self._append_system_or_greeting()
+        self._refresh_context_bar()
+
+    def _refresh_context_bar(self) -> None:
+        if not hasattr(self, "_context_lbl") or not hasattr(self, "_compact_btn"):
+            return
+        turns = self._conversation.active_turns
+        chars_txt = self._conversation.format_char_count()
+        level = self._conversation.context_level(
+            warn_chars=COMPACT_WARN_CHARS,
+            high_chars=COMPACT_HIGH_CHARS,
+        )
+        summary_tag = (
+            f" · 要約{self._conversation.compacted_count}回"
+            if self._conversation.compacted_summary
+            else ""
+        )
+
+        if self._compacting:
+            self._context_lbl.setText("🗜️ 会話をコンパクト化中…")
+            self._context_lbl.setStyleSheet(
+                "border: none; background: transparent; font-size: 11px; "
+                "color: #a5b4fc; font-weight: 600;"
+            )
+        elif turns == 0 and not self._conversation.compacted_summary:
+            self._context_lbl.setText("💬 引き継ぎ準備完了（姉妹・AI切替OK）")
+            self._context_lbl.setStyleSheet(
+                "border: none; background: transparent; font-size: 11px; color: #94a3b8;"
+            )
+        elif level == "high":
+            self._context_lbl.setText(
+                f"🔴 文脈: {turns}発言 / {chars_txt}{summary_tag}（圧縮推奨）"
+            )
+            self._context_lbl.setStyleSheet(
+                "border: none; background: transparent; font-size: 11px; "
+                "color: #fda4af; font-weight: 600;"
+            )
+        elif level == "warn":
+            self._context_lbl.setText(f"🟡 文脈: {turns}発言 / {chars_txt}{summary_tag}")
+            self._context_lbl.setStyleSheet(
+                "border: none; background: transparent; font-size: 11px; "
+                "color: #fcd34d; font-weight: 600;"
+            )
+        else:
+            self._context_lbl.setText(f"🟢 文脈: {turns}発言 / {chars_txt}{summary_tag}")
+            self._context_lbl.setStyleSheet(
+                "border: none; background: transparent; font-size: 11px; color: #cbd5e1;"
+            )
+
+        summary_len = len(self._conversation.compacted_summary)
+        self._context_lbl.setToolTip(
+            f"アクティブ履歴: {turns}発言 ({self._conversation.active_chars}文字)\n"
+            f"コンパクト済み要約: {summary_len}文字 ({self._conversation.compacted_count}回実行)\n"
+            "AIエージェントや姉妹を切り替えても会話の続きが自動で引き継がれます。"
+        )
+        can_click = (
+            self._conversation.can_compact
+            and not self._compacting
+            and not self._router.is_running()
+        )
+        self._compact_btn.setEnabled(can_click)
+
+    def _on_compact_menu_clicked(self) -> None:
+        menu = QMenu(self._compact_menu_btn)
+        menu.setStyleSheet(
+            "QMenu { background:#14192b; color:#f1f5f9; border:1px solid #334155; border-radius:8px; padding:4px; }"
+            "QMenu::item { padding:5px 12px; border-radius:5px; }"
+            "QMenu::item:selected { background:#4f46e5; }"
+        )
+        can_run = (
+            self._conversation.can_compact
+            and not self._compacting
+            and not self._router.is_running()
+        )
+
+        ai_act = QAction("🗜️ AIでコンパクト化（おすすめ）", menu)
+        ai_act.setEnabled(can_run)
+        ai_act.triggered.connect(lambda: self.request_compact(mode="ai"))
+        menu.addAction(ai_act)
+
+        local_act = QAction("⚡ ローカルで即時コンパクト化", menu)
+        local_act.setEnabled(can_run)
+        local_act.triggered.connect(lambda: self.request_compact(mode="local"))
+        menu.addAction(local_act)
+
+        menu.addSeparator()
+
+        view_act = QAction("👁️ 現在の引き継ぎ要約を見る", menu)
+        view_act.setEnabled(bool(self._conversation.compacted_summary))
+        view_act.triggered.connect(self._show_compacted_summary_dialog)
+        menu.addAction(view_act)
+
+        menu.exec(self._compact_menu_btn.mapToGlobal(QPoint(0, self._compact_menu_btn.height())))
+
+    def _show_compacted_summary_dialog(self) -> None:
+        summary = self._conversation.compacted_summary
+        if not summary:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("引き継ぎ中のコンパクト要約")
+        dlg.resize(440, 340)
+        dlg.setStyleSheet(DARK_DIALOG_QSS)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(14, 14, 14, 12)
+        lay.setSpacing(10)
+
+        view = QPlainTextEdit(dlg)
+        view.setReadOnly(True)
+        view.setPlainText(summary)
+        lay.addWidget(view, 1)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dlg)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        lay.addWidget(btns)
+        dlg.exec()
+
+    def _maybe_warn_or_auto_compact(self) -> None:
+        if not self._conversation.can_compact:
+            return
+        level = self._conversation.context_level(
+            warn_chars=COMPACT_WARN_CHARS,
+            high_chars=COMPACT_HIGH_CHARS,
+        )
+        if level == "ok":
+            return
+        threshold = int(getattr(self._config, "auto_compact_chars", 18000) or 18000)
+        if (
+            getattr(self._config, "auto_compact_enabled", False)
+            and self._conversation.active_chars >= threshold
+            and self._compact_warned_gen != self._conversation.summary_generation
+        ):
+            self._compact_warned_gen = self._conversation.summary_generation
+            QTimer.singleShot(250, lambda: self.request_compact(mode="ai", auto=True))
+            return
+        if self._compact_warned_gen != self._conversation.summary_generation:
+            self._compact_warned_gen = self._conversation.summary_generation
+            self.toast_requested.emit(
+                "💡 会話が長くなってきました。必要なら「🗜️ コンパクト」で圧縮できます。",
+                False,
+            )
+
+    def request_compact(self, *, mode: str = "ai", auto: bool = False) -> bool:
+        """Compact the active conversation using the AI CLI or instant local summarizer."""
+        if not self._conversation.can_compact:
+            if not auto:
+                self.toast_requested.emit("まだコンパクト化するほどの会話履歴がありません。", False)
+            return False
+        if self._router.is_running() or self._compacting:
+            if not auto:
+                self.toast_requested.emit("現在処理中です。終わってから実行してください。", True)
+            return False
+
+        if mode == "local":
+            summary = self._conversation.build_local_fallback_summary()
+            self.apply_compacted_summary(summary, method_label="ローカル即時圧縮")
+            return True
+
+        agent_id = self._config.agent_id
+        adapter = self._router.get_adapter(agent_id)
+        if not adapter.is_available():
+            summary = self._conversation.build_local_fallback_summary()
+            self.apply_compacted_summary(summary, method_label="自動ローカル圧縮")
+            return True
+
+        compact_prompt = self._conversation.build_compaction_prompt()
+        model = (self._config.models_by_agent.get(agent_id, "") or "").strip()
+        cwd = (self._config.working_dir or str(Path.home())).strip() or str(Path.home())
+
+        self._compacting = True
+        self.set_running_state(True, "🗜️ 会話をコンパクト化中…")
+        started = self._router.compact_conversation(
+            agent_id,
+            compact_prompt,
+            model=model,
+            cwd=cwd,
+        )
+        if not started:
+            self._compacting = False
+            self.set_running_state(False)
+            return False
+        return True
+
+    def handle_compact_finished(self, summary: str) -> None:
+        """Apply AI-generated compaction summary (falling back locally if empty)."""
+        self._compacting = False
+        self.set_running_state(False)
+        clean = (summary or "").strip()
+        if not clean:
+            clean = self._conversation.build_local_fallback_summary()
+            label = "自動ローカル圧縮"
+        else:
+            label = f"{self._config.agent_id} AI要約"
+        self.apply_compacted_summary(clean, method_label=label)
+
+    def handle_compact_error(self, err: str) -> None:
+        """Reset compaction state and inform user when AI compaction fails."""
+        self._compacting = False
+        self.set_running_state(False)
+        self._refresh_context_bar()
+        self.toast_requested.emit(f"コンパクト化に失敗しました: {err}", True)
+
+    def apply_compacted_summary(
+        self, summary: str, *, method_label: str = ""
+    ) -> tuple[int, int]:
+        """Store compacted summary, clear all CLI sessions, and log a compact card."""
+        before_chars, after_chars = self._conversation.apply_compaction(summary)
+        self._router.new_session(None)
+        self._compact_warned_gen = -1
+
+        before_txt = self._conversation.format_char_count(before_chars)
+        after_txt = self._conversation.format_char_count(after_chars)
+        tag = f" ({method_label})" if method_label else ""
+        self._messages.append(
+            {
+                "role": "compact",
+                "author": f"🗜️ コンテキストをコンパクト化{tag} · {before_txt} → {after_txt}",
+                "accent": "#14b8a6",
+                "text": self._conversation.compacted_summary,
+                "time": datetime.now().strftime("%H:%M"),
+            }
+        )
+        self._render_chat_log()
+        self._refresh_context_bar()
+        self.conversation_changed.emit()
+        self.toast_requested.emit(
+            f"🗜️ 会話をコンパクト化しました ({before_txt} → {after_txt})",
+            False,
+        )
+        return before_chars, after_chars
+
     def send_prompt(
         self,
         text: str,
@@ -1529,8 +1910,8 @@ class BubblePanel(QWidget):
         )
         if not prompt and not resolved_attachments:
             return
-        if self._router.is_running():
-            self.toast_requested.emit("現在応答中です。停止してから送信してください。", True)
+        if self._router.is_running() or self._compacting:
+            self.toast_requested.emit("現在処理中です。停止してから送信してください。", True)
             return
 
         if using_queued and self._attachments:
@@ -1542,6 +1923,26 @@ class BubblePanel(QWidget):
             self.agent_changed.emit(preferred_agent)
             self.sync_from_config(self._sister)
 
+        agent_id = self._config.agent_id
+        sister_id = self._sister.id
+        sister_name = _short_name(self._sister.display_name)
+        had_session = self._router.has_session(agent_id, sister_id)
+        handoff = self._conversation.build_handoff_context(
+            agent_id, sister_id, has_session=had_session
+        )
+
+        now_str = datetime.now().strftime("%H:%M")
+        self._pending_turn_agent_id = agent_id
+        self._pending_turn_sister_id = sister_id
+        self._pending_turn_sister_name = sister_name
+        self._pending_turn_summary_gen = self._conversation.summary_generation
+        self._pending_turn_had_session = had_session
+
+        att_labels = [f"{att.icon} {att.name}" for att in resolved_attachments]
+        self._conversation.add_user_turn(
+            prompt, attachments=att_labels, time_str=now_str
+        )
+
         self._messages.append(
             {
                 "role": "user",
@@ -1549,14 +1950,13 @@ class BubblePanel(QWidget):
                 "accent": "#6366f1",
                 "text": prompt,
                 "attachments": format_attachments_for_chat_display(resolved_attachments),
-                "time": datetime.now().strftime("%H:%M"),
+                "time": now_str,
             }
         )
         self._streaming_text = ""
         self._render_chat_log()
         self.set_running_state(True, "✨ 考え中…")
 
-        agent_id = self._config.agent_id
         model = (self._config.models_by_agent.get(agent_id, "") or "").strip()
         cwd = (self._config.working_dir or str(Path.home())).strip() or str(Path.home())
         self._router.send_message(
@@ -1567,24 +1967,41 @@ class BubblePanel(QWidget):
             cwd=cwd,
             auto_approve=bool(self._config.auto_approve),
             attachments=resolved_attachments,
+            handoff_context=handoff,
         )
+        self.conversation_changed.emit()
 
     def _on_send_or_stop(self) -> None:
-        if self._router.is_running():
+        if self._router.is_running() or self._compacting:
+            was_compacting = self._compacting
+            self._compacting = False
             self._router.cancel()
             self.set_running_state(False)
-            if self._streaming_text:
+            if not was_compacting and self._streaming_text:
+                now_str = datetime.now().strftime("%H:%M")
+                turn_agent = self._pending_turn_agent_id or self._config.agent_id
+                turn_sister = self._pending_turn_sister_id or self._sister.id
+                turn_name = self._pending_turn_sister_name or _short_name(self._sister.display_name)
+                self._conversation.add_sister_turn(
+                    self._streaming_text,
+                    author=turn_name,
+                    sister_id=turn_sister,
+                    agent_id=turn_agent,
+                    time_str=now_str,
+                )
                 self._messages.append(
                     {
                         "role": "sister",
-                        "author": f"💠 {_short_name(self._sister.display_name)} (中断)",
+                        "author": f"💠 {turn_name} (中断)",
                         "accent": self._sister.accent_color,
                         "text": self._streaming_text,
-                        "time": datetime.now().strftime("%H:%M"),
+                        "time": now_str,
                     }
                 )
+                self.conversation_changed.emit()
             self._streaming_text = None
             self._render_chat_log()
+            self._refresh_context_bar()
             return
 
         text = self._chat_input.toPlainText().strip()
@@ -1846,13 +2263,18 @@ class BubblePanel(QWidget):
         self.ensure_models_discovered(aid, force=True)
 
     def _on_new_session(self) -> None:
-        if self._router.is_running():
+        if self._router.is_running() or self._compacting:
+            self._compacting = False
             self._router.cancel()
             self.set_running_state(False)
         self._streaming_text = None
-        self._router.new_session(self._config.agent_id)
+        self._router.new_session(None)
+        self._conversation.reset()
+        self._compact_warned_gen = -1
         self._messages.clear()
         self._append_system_or_greeting()
+        self._refresh_context_bar()
+        self.conversation_changed.emit()
 
     # Settings handlers
     def _update_sprite_status_label(self) -> None:
@@ -1971,6 +2393,7 @@ class BubblePanel(QWidget):
         self._config.working_dir = self._cwd_edit.text().strip() or str(Path.home())
         self._config.animation_mode = str(self._anim_mode_combo.currentData() or "rich")
         self._config.auto_approve = self._auto_approve_check.isChecked()
+        self._config.auto_compact_enabled = self._auto_compact_check.isChecked()
         self._config.always_on_top = self._always_on_top_check.isChecked()
         self._apply_window_flags()
         self.config_updated.emit()

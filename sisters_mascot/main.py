@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QTimer
+from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
 
@@ -19,6 +20,7 @@ from sisters_mascot.attachments import MAX_ATTACHMENTS
 from sisters_mascot.audio.stt import VoiceRecorder
 from sisters_mascot.audio.tts import TTSManager
 from sisters_mascot.config import AppConfig, load_config, save_config
+from sisters_mascot.conversation import load_conversation, save_conversation
 from sisters_mascot.sisters_loader import SisterProfile, get_sister_map, load_all_sisters
 from sisters_mascot.ui.bubble_panel import BubblePanel
 from sisters_mascot.ui.mascot_window import MascotWindow
@@ -158,6 +160,7 @@ class MascotAppController(QObject):
         self._local_server = QLocalServer(self)
         self._setup_single_instance_server()
         self._connect_signals()
+        self._load_conversation_safe()
 
         self.tray.update_tooltip(f"{current.rank_label} · {current.display_name}", self.config.agent_id)
         if QSystemTrayIcon.isSystemTrayAvailable():
@@ -178,6 +181,29 @@ class MascotAppController(QObject):
             save_config(self.config)
         except OSError as exc:
             self.mascot.show_toast(f"設定の保存に失敗しました: {exc}", is_error=True)
+
+    @staticmethod
+    def _should_persist_conversation() -> bool:
+        return QGuiApplication.platformName() != "offscreen"
+
+    def _load_conversation_safe(self) -> None:
+        if not self._should_persist_conversation():
+            return
+        try:
+            state, msgs, sessions = load_conversation()
+        except Exception:
+            return
+        if state.turns or state.compacted_summary or msgs or sessions:
+            self.panel.restore_conversation(state, msgs, sessions)
+
+    def _save_conversation_safe(self) -> None:
+        if not self._should_persist_conversation():
+            return
+        try:
+            state, msgs, sessions = self.panel.export_conversation_payload()
+            save_conversation(state, display_messages=msgs, sessions=sessions)
+        except OSError:
+            pass
 
     def _setup_single_instance_server(self) -> None:
         QLocalServer.removeServer(_SINGLETON_NAME)
@@ -227,6 +253,7 @@ class MascotAppController(QObject):
         self.panel.toast_requested.connect(
             lambda msg, err: self.mascot.show_toast(msg, is_error=err)
         )
+        self.panel.conversation_changed.connect(self._save_conversation_safe)
 
         # Tray
         self.tray.toggle_panel_requested.connect(self._toggle_panel)
@@ -240,6 +267,8 @@ class MascotAppController(QObject):
         self.router.status_changed.connect(self._on_agent_status)
         self.router.reply_finished.connect(self._on_agent_finished)
         self.router.error_occurred.connect(self._on_agent_error)
+        self.router.compact_finished.connect(self._on_compact_finished)
+        self.router.compact_error.connect(self._on_compact_error)
         self.router.model_choices_discovered.connect(self.panel.on_model_choices_discovered)
 
         # TTS
@@ -411,6 +440,16 @@ class MascotAppController(QObject):
         self.mascot.set_activity("idle")
         self.mascot.show_toast(err, is_error=True, duration_ms=4500)
 
+    def _on_compact_finished(self, summary: str) -> None:
+        self.panel.handle_compact_finished(summary)
+        if not self.tts.is_speaking():
+            self.mascot.set_activity("idle")
+
+    def _on_compact_error(self, err: str) -> None:
+        self.panel.handle_compact_error(err)
+        self.mascot.set_activity("idle")
+        self.mascot.show_toast(err, is_error=True, duration_ms=4500)
+
     def _sync_mascot_idle_or_speaking(self, speaking: bool) -> None:
         if self.recorder.is_recording() or self.router.is_running():
             return
@@ -470,6 +509,10 @@ class MascotAppController(QObject):
             pass
         try:
             save_config(self.config)
+        except Exception:
+            pass
+        try:
+            self._save_conversation_safe()
         except Exception:
             pass
 

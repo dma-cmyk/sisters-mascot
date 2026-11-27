@@ -51,6 +51,12 @@ from sisters_mascot.attachments import (  # noqa: E402
     collect_image_paths,
 )
 from sisters_mascot.audio.stt import VoiceRecorder  # noqa: E402
+from sisters_mascot.conversation import (  # noqa: E402
+    MAX_HANDOFF_CHARS,
+    ConversationState,
+    load_conversation,
+    save_conversation,
+)
 from sisters_mascot.audio.tts import (  # noqa: E402
     DEFAULT_EDGE_VOICE,
     SUPPORTED_EDGE_JA_VOICES,
@@ -1650,6 +1656,288 @@ class TestAttachmentsAndDragDrop(unittest.TestCase):
                 controller.panel.close()
                 controller.mascot.close()
                 app.processEvents()
+
+
+class TestConversationContinuityAndCompact(unittest.TestCase):
+    """Cross-agent/sister conversation handoff, AI/local compaction, and persistence."""
+
+    def test_handoff_delta_compaction_and_persistence(self) -> None:
+        state = ConversationState()
+        state.add_user_turn("まずプロジェクト構造を教えて")
+        state.add_sister_turn(
+            "真白だよ！src/main.py があるよ。",
+            author="真白",
+            sister_id="mashiro",
+            agent_id="opencode",
+        )
+        state.mark_session_synced("opencode", "mashiro")
+
+        # Synced same (agent, sister) needs zero redundant handoff
+        self.assertEqual(
+            state.build_handoff_context("opencode", "mashiro", has_session=True),
+            "",
+        )
+
+        # Switching to another sister & agent receives full prior context
+        handoff_aoi = state.build_handoff_context("agy", "aoi", has_session=False)
+        self.assertIn("<conversation_handoff>", handoff_aoi)
+        self.assertIn("まずプロジェクト構造を教えて", handoff_aoi)
+        self.assertIn("真白 (opencode)", handoff_aoi)
+        self.assertIn("src/main.py", handoff_aoi)
+
+        # Continue on (agy, aoi), then switch back to (opencode, mashiro) -> delta only
+        state.add_user_turn("テストも確認して", attachments=("📄 test_core.py",))
+        state.add_sister_turn(
+            "碧です。43件全部OKです。",
+            author="碧",
+            sister_id="aoi",
+            agent_id="agy",
+        )
+        state.mark_session_synced("agy", "aoi")
+
+        delta_back = state.build_handoff_context("opencode", "mashiro", has_session=True)
+        self.assertIn("テストも確認して", delta_back)
+        self.assertIn("test_core.py", delta_back)
+        self.assertIn("碧 (agy)", delta_back)
+        self.assertNotIn("まずプロジェクト構造を教えて", delta_back)
+
+        # Compaction shrinks active chars, clears sync, and passes summary to all sessions
+        local_sum = state.build_local_fallback_summary()
+        self.assertIn("真白", local_sum)
+        before_chars, after_chars = state.apply_compaction(local_sum)
+        self.assertGreater(before_chars, 0)
+        self.assertEqual(state.active_turns, 0)
+        self.assertEqual(state.summary_generation, 1)
+        self.assertEqual(state.compacted_count, 1)
+        self.assertEqual(after_chars, len(local_sum))
+
+        post_compact = state.build_handoff_context("opencode", "mashiro", has_session=True)
+        self.assertIn("コンパクト済み", post_compact)
+        self.assertIn(local_sum[:40], post_compact)
+
+        # Very long histories are bounded near MAX_HANDOFF_CHARS
+        long_state = ConversationState()
+        for idx in range(12):
+            long_state.add_user_turn(f"U{idx}: " + ("あ" * 1800))
+            long_state.add_sister_turn(
+                f"S{idx}: " + ("い" * 1800),
+                author="碧",
+                sister_id="aoi",
+                agent_id="agy",
+            )
+        bounded = long_state.build_handoff_context("claude", "ruri", has_session=False)
+        self.assertLessEqual(len(bounded), MAX_HANDOFF_CHARS + 300)
+        self.assertIn("省略", bounded)
+        self.assertIn("S11:", bounded)
+
+        # Atomic persistence round-trip & corrupt/missing fallback
+        with tempfile.TemporaryDirectory() as tmpdir:
+            conv_path = Path(tmpdir) / "conversation.json"
+            self.assertEqual(load_conversation(conv_path)[1], [])
+
+            sample_msgs = [{"role": "user", "author": "美緒ちゃん", "text": "hi"}]
+            sample_sessions = {"opencode:mashiro": "oc-123", "agy:aoi": "agy-456"}
+            save_conversation(
+                long_state,
+                display_messages=sample_msgs,
+                sessions=sample_sessions,
+                path=conv_path,
+            )
+            loaded_state, loaded_msgs, loaded_sessions = load_conversation(conv_path)
+            self.assertEqual(loaded_state.active_turns, long_state.active_turns)
+            self.assertEqual(loaded_msgs, sample_msgs)
+            self.assertEqual(loaded_sessions, sample_sessions)
+
+            conv_path.write_text("{corrupt json", encoding="utf-8")
+            bad_state, bad_msgs, bad_sessions = load_conversation(conv_path)
+            self.assertEqual(bad_state.active_turns, 0)
+            self.assertEqual(bad_msgs, [])
+            self.assertEqual(bad_sessions, {})
+
+    def test_config_auto_compact_round_trip_and_clamp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = Path(tmpdir) / "config.json"
+            cfg = AppConfig(auto_compact_enabled=True, auto_compact_chars=25000)
+            save_config(cfg, cfg_path)
+            loaded = load_config(cfg_path)
+            self.assertTrue(loaded.auto_compact_enabled)
+            self.assertEqual(loaded.auto_compact_chars, 25000)
+
+            cfg_path.write_text(
+                json.dumps({"auto_compact_chars": 100, "auto_compact_enabled": 1}),
+                encoding="utf-8",
+            )
+            clamped_low = load_config(cfg_path)
+            self.assertTrue(clamped_low.auto_compact_enabled)
+            self.assertEqual(clamped_low.auto_compact_chars, 4000)
+
+    def test_router_handoff_and_compact_conversation(self) -> None:
+        app = _ensure_qapp()
+        router = AgentRouter()
+        codex = router.get_adapter("codex")
+        aoi = load_all_sisters()[0]
+        captured: dict = {}
+
+        def _fake_build(prompt, **kwargs):
+            captured["prompt"] = prompt
+            captured["kwargs"] = kwargs
+            return ["codex", "exec", "-"], prompt
+
+        with (
+            patch.object(codex, "is_available", return_value=True),
+            patch.object(codex, "build_command", side_effect=_fake_build),
+            patch.object(router, "_run_subprocess"),
+        ):
+            router.send_message(
+                "codex",
+                "次の質問",
+                sister=aoi,
+                handoff_context="<conversation_handoff>前の話</conversation_handoff>",
+            )
+        self.assertIn("<conversation_handoff>前の話</conversation_handoff>", captured["prompt"])
+        self.assertIn("次の質問", captured["prompt"])
+
+        # Isolated compact_conversation run must emit compact_finished without mutating sessions
+        compact_router = AgentRouter()
+        codex_compact = compact_router.get_adapter("codex")
+        compact_router._sessions[("agy", "aoi")] = "keep-until-panel-clears"
+        finished_summaries: list[str] = []
+        compact_errors: list[str] = []
+        compact_router.compact_finished.connect(finished_summaries.append)
+        compact_router.compact_error.connect(compact_errors.append)
+
+        fake_stdout = iter(
+            [
+                '{"type":"thread.started","thread_id":"should-not-be-saved"}\n',
+                '{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":"### 要約\\n完了"}}\n',
+                '{"type":"turn.completed"}\n',
+            ]
+        )
+
+        class _FakeProc:
+            stdin = None
+            stdout = fake_stdout
+            stderr = iter(())
+
+            def wait(self) -> int:
+                return 0
+
+            def poll(self):
+                return 0
+
+        class _SyncThread:
+            def __init__(self, target=None, args=(), kwargs=None, daemon=None) -> None:
+                self._target = target
+                self._args = args
+                self._kwargs = kwargs or {}
+
+            def start(self) -> None:
+                if self._target:
+                    self._target(*self._args, **self._kwargs)
+
+            def join(self, timeout=None) -> None:  # noqa: ANN001
+                _ = timeout
+
+        with (
+            patch.object(codex_compact, "is_available", return_value=True),
+            patch("sisters_mascot.agents.router.subprocess.Popen", return_value=_FakeProc()),
+            patch("sisters_mascot.agents.router.threading.Thread", _SyncThread),
+        ):
+            started = compact_router.compact_conversation("codex", "要約してください")
+
+        self.assertTrue(started)
+        app.processEvents()
+        self.assertEqual(compact_errors, [])
+        self.assertEqual(finished_summaries, ["### 要約\n完了"])
+        self.assertEqual(compact_router.export_sessions(), {"agy:aoi": "keep-until-panel-clears"})
+
+    def test_bubble_panel_cross_agent_continuity_and_compact_ui(self) -> None:
+        app = _ensure_qapp()
+        sisters = load_all_sisters()
+        sister_map = {s.id: s for s in sisters}
+        cfg = AppConfig(tts_engine="off", agent_id="opencode", sister_id="mashiro")
+        router = AgentRouter()
+        recorder = VoiceRecorder()
+        panel = BubblePanel(sisters, sister_map["mashiro"], cfg, router, recorder)
+
+        sent_calls: list[dict] = []
+
+        def _fake_send(agent_id, prompt, **kwargs):
+            sent_calls.append({"agent_id": agent_id, "prompt": prompt, **kwargs})
+            router._sessions[(agent_id, kwargs["sister"].id)] = f"sess-{len(sent_calls)}"
+
+        try:
+            panel.show()
+
+            # Turn 1 on (opencode, mashiro)
+            with patch.object(router, "send_message", side_effect=_fake_send):
+                panel.send_prompt("最初の相談")
+            self.assertEqual(sent_calls[-1]["handoff_context"], "")
+            panel.finalize_stream_reply("了解！ファイルを確認したよ。")
+            self.assertIn("2発言", panel._context_lbl.text())
+            self.assertTrue(panel._compact_btn.isEnabled())
+
+            # Switch to (agy, aoi) -> receives full handoff of Turn 1
+            cfg.agent_id = "agy"
+            panel.notify_sister_switched(sister_map["aoi"])
+            with patch.object(router, "send_message", side_effect=_fake_send):
+                panel.send_prompt("その続きをお願い")
+            handoff2 = sent_calls[-1]["handoff_context"]
+            self.assertIn("最初の相談", handoff2)
+            self.assertIn("真白 (opencode)", handoff2)
+            panel.finalize_stream_reply("碧が引き継ぎました。")
+
+            # Switch back to (opencode, mashiro) -> receives delta of Turn 2 only
+            cfg.agent_id = "opencode"
+            panel.notify_sister_switched(sister_map["mashiro"])
+            with patch.object(router, "send_message", side_effect=_fake_send):
+                panel.send_prompt("さらに確認")
+            handoff3 = sent_calls[-1]["handoff_context"]
+            self.assertIn("その続きをお願い", handoff3)
+            self.assertIn("碧 (agy)", handoff3)
+            self.assertNotIn("最初の相談", handoff3)
+            panel.finalize_stream_reply("真白に戻ったよ。")
+
+            # Local compaction clears all CLI sessions and records compact bubble
+            self.assertTrue(panel.request_compact(mode="local"))
+            self.assertEqual(router.export_sessions(), {})
+            self.assertEqual(panel._conversation.active_turns, 0)
+            self.assertEqual(panel._conversation.compacted_count, 1)
+            self.assertIn("コンパクト化", panel._chat_browser.toHtml())
+
+            # Next turn on any agent/sister receives compacted summary
+            with patch.object(router, "send_message", side_effect=_fake_send):
+                panel.send_prompt("次は何をしよう？")
+            handoff4 = sent_calls[-1]["handoff_context"]
+            self.assertIn("コンパクト済み", handoff4)
+            self.assertIn("真白", handoff4)
+            panel.finalize_stream_reply("次はテストだね。")
+
+            # AI compaction flow
+            with patch.object(router, "send_message", side_effect=_fake_send):
+                panel.send_prompt("了解")
+            panel.finalize_stream_reply("進めます。")
+
+            with patch.object(router, "compact_conversation", return_value=True) as mock_compact:
+                self.assertTrue(panel.request_compact(mode="ai"))
+            self.assertTrue(panel._compacting)
+            mock_compact.assert_called_once()
+            panel.handle_compact_finished("### 🎯 AI要約\n完了したテスト")
+            self.assertFalse(panel._compacting)
+            self.assertEqual(panel._conversation.compacted_count, 2)
+            self.assertEqual(panel._conversation.compacted_summary, "### 🎯 AI要約\n完了したテスト")
+            self.assertEqual(router.export_sessions(), {})
+
+            # New session clears summary, turns, and sessions
+            panel._on_new_session()
+            self.assertEqual(panel._conversation.active_turns, 0)
+            self.assertEqual(panel._conversation.compacted_summary, "")
+            self.assertEqual(router.export_sessions(), {})
+
+            app.processEvents()
+        finally:
+            panel.close()
+            app.processEvents()
 
 
 if __name__ == "__main__":
