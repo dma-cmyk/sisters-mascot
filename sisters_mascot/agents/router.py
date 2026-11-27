@@ -110,6 +110,11 @@ def _terminate_process(proc: subprocess.Popen[str] | None) -> None:
     timer.start()
 
 
+def _format_process_error(summary: str, stderr_lines: list[str]) -> str:
+    err_detail = "\n".join(stderr_lines[-6:]).strip()
+    return f"{summary}\n{err_detail}" if err_detail else summary
+
+
 class AgentRouter(QObject):
     """Manage agent selection, per-session persona injection, and streaming subprocess I/O."""
 
@@ -528,13 +533,29 @@ class AgentRouter(QObject):
             self.turn_cancelled.emit(full_text)
             return
 
-        if returncode != 0 and not saw_error:
+        if saw_error:
+            return
+
+        if returncode != 0:
             self._emit_activity("error", f"❌ プロセス異常終了 (exit={returncode}, {elapsed:.1f}s)")
-            err_detail = "\n".join(stderr_lines[-6:]).strip()
-            summary_msg = f"{adapter.spec.display_name} が途中で終了しました (exit={returncode})"
-            if err_detail:
-                summary_msg = f"{summary_msg}\n{err_detail}"
-            self.error_occurred.emit(summary_msg)
+            self.error_occurred.emit(
+                _format_process_error(
+                    f"{adapter.spec.display_name} が途中で終了しました (exit={returncode})",
+                    stderr_lines,
+                )
+            )
+            return
+
+        if not full_text.strip():
+            self._emit_activity(
+                "error", f"❌ 応答本文が空のまま終了しました (exit={returncode}, {elapsed:.1f}s)"
+            )
+            self.error_occurred.emit(
+                _format_process_error(
+                    f"{adapter.spec.display_name} から応答テキストを取得できませんでした (exit={returncode})",
+                    stderr_lines,
+                )
+            )
             return
 
         self._emit_activity("done", f"✔ 完了 (exit={returncode}, {elapsed:.1f}s)")
@@ -721,14 +742,28 @@ class AgentRouter(QObject):
             self._emit_activity(
                 "error", f"{log_prefix}❌ プロセス異常終了 (exit={returncode}, {elapsed:.1f}s)"
             )
-            err_detail = "\n".join(stderr_lines[-6:]).strip()
-            summary_msg = f"{adapter.spec.display_name} が途中で終了しました (exit={returncode})"
-            if err_detail:
-                summary_msg = f"{summary_msg}\n{err_detail}"
             return IsolatedTurnResult(
                 text=full_text.strip(),
                 returncode=returncode,
-                error=summary_msg,
+                error=_format_process_error(
+                    f"{adapter.spec.display_name} が途中で終了しました (exit={returncode})",
+                    stderr_lines,
+                ),
+                elapsed=elapsed,
+            )
+
+        if not full_text.strip():
+            self._emit_activity(
+                "error",
+                f"{log_prefix}❌ 応答本文が空のまま終了しました (exit={returncode}, {elapsed:.1f}s)",
+            )
+            return IsolatedTurnResult(
+                text="",
+                returncode=returncode,
+                error=_format_process_error(
+                    f"{adapter.spec.display_name} から応答テキストを取得できませんでした (exit={returncode})",
+                    stderr_lines,
+                ),
                 elapsed=elapsed,
             )
 

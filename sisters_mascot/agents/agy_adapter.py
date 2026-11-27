@@ -14,6 +14,7 @@ from sisters_mascot.agents.base import (
     BaseAgentAdapter,
     ModelChoice,
     StreamEvent,
+    extract_effective_tool_name,
     make_tool_event,
     make_tool_result_event,
 )
@@ -22,6 +23,8 @@ from sisters_mascot.attachments import AttachmentItem, collect_attachment_dirs
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _MODEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,}$")
 _SKIP_PREFIXES = ("fetching", "loading", "available", "models", "usage", "#", "-", "=")
+_DONE_STATES = frozenset({"DONE", "COMPLETED", "SUCCESS"})
+_ERROR_STATES = frozenset({"ERROR", "FAILED", "FAILURE", "CANCELED", "CANCELLED", "DENIED"})
 
 
 def _default_agy_binary() -> str:
@@ -30,6 +33,21 @@ def _default_agy_binary() -> str:
         return found
     preferred = Path.home() / ".local" / "bin" / "agy"
     return str(preferred)
+
+
+def _extract_session_id(data: dict[str, Any]) -> str | None:
+    """Find session/conversation ID across top-level and nested agy event objects."""
+    containers: list[dict[str, Any]] = [data]
+    for nested_key in ("init", "step_update", "result"):
+        nested = data.get(nested_key)
+        if isinstance(nested, dict):
+            containers.append(nested)
+    for obj in containers:
+        for key in ("session_id", "conversation_id", "conversationId"):
+            val = obj.get(key)
+            if isinstance(val, str) and val:
+                return val
+    return None
 
 
 class AgyAdapter(BaseAgentAdapter):
@@ -41,19 +59,26 @@ class AgyAdapter(BaseAgentAdapter):
             display_name="Antigravity (agy)",
             binary=_default_agy_binary(),
             default_models=[
-                "gemini-2.5-pro",
-                "gemini-2.5-flash",
-                "claude-sonnet-4-6",
-                "claude-opus-4-6",
+                "gemini-4-hydrogen-low",
+                "gemini-4-hydrogen-high",
+                "gemini-4-neon-high",
+                "gemini-3.8-flash-low",
+                "claude-sonnet-5-5-high",
             ],
             supports_system_prompt=False,
         )
         self._saw_stream_delta = False
         self._emitted_any_text = False
+        self._last_text_step_index: int | None = None
+        self._last_text_ended_newline: bool = True
+        self._seen_tool_steps: dict[int, str] = {}
 
     def reset_state(self) -> None:
         self._saw_stream_delta = False
         self._emitted_any_text = False
+        self._last_text_step_index = None
+        self._last_text_ended_newline = True
+        self._seen_tool_steps.clear()
 
     def discover_model_choices(self) -> list[ModelChoice]:
         fallback = [ModelChoice(id=m, label=m) for m in self.spec.default_models]
@@ -65,7 +90,7 @@ class AgyAdapter(BaseAgentAdapter):
                 [self.resolved_binary(), "models"],
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=25,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError):
@@ -77,17 +102,17 @@ class AgyAdapter(BaseAgentAdapter):
         discovered: list[ModelChoice] = []
         seen: set[str] = set()
         for raw_line in proc.stdout.splitlines():
-            clean = _ANSI_RE.sub("", raw_line).strip()
+            clean = _ANSI_RE.sub("", raw_line.split("\r")[-1]).strip()
             if not clean:
                 continue
             lowered = clean.lower()
             if lowered.startswith(_SKIP_PREFIXES) or clean.endswith("..."):
                 continue
 
-            if "\t" in clean:
-                parts = [p.strip() for p in clean.split("\t") if p.strip()]
-                model_id = parts[0]
-                display = parts[1] if len(parts) >= 2 else ""
+            cols = [p.strip() for p in re.split(r"\t+|\s{2,}", clean, maxsplit=1) if p.strip()]
+            if len(cols) >= 2:
+                model_id = cols[0].rstrip(",")
+                display = cols[1]
             else:
                 parts = clean.lstrip("*•- ").split()
                 if len(parts) != 1:
@@ -129,7 +154,7 @@ class AgyAdapter(BaseAgentAdapter):
         if session_id:
             cmd.extend(["--conversation", session_id])
         if auto_approve:
-            cmd.extend(["--mode", "auto"])
+            cmd.append("--dangerously-skip-permissions")
         for extra_dir in collect_attachment_dirs(attachments, cwd):
             cmd.extend(["--add-dir", extra_dir])
         return cmd, None
@@ -146,10 +171,61 @@ class AgyAdapter(BaseAgentAdapter):
             return []
 
         events: list[StreamEvent] = []
-        session_id = data.get("session_id") or data.get("conversation_id") or data.get("conversationId")
-        if isinstance(session_id, str) and session_id:
+        session_id = _extract_session_id(data)
+        if session_id:
             events.append(StreamEvent(kind="session", session_id=session_id))
 
+        # Current Antigravity CLI stream-json schema (`"event": "init" | "step_update" | "result"`)
+        ev_name = data.get("event", "")
+        if ev_name == "init":
+            return events
+
+        if ev_name == "step_update":
+            step = data.get("step_update")
+            if isinstance(step, dict):
+                events.extend(self._parse_step_update(step))
+            return events
+
+        if ev_name == "result":
+            res = data.get("result") if isinstance(data.get("result"), dict) else data
+            status = str(res.get("status") or "").upper()
+            finished_reason = str(res.get("finished_reason") or "").lower()
+            err_text = str(res.get("error") or "").strip()
+            resp_text = res.get("response")
+            is_err = (
+                status in ("ERROR", "FAILED", "FAILURE")
+                or finished_reason == "error"
+                or bool(err_text)
+            )
+            if is_err:
+                events.append(
+                    StreamEvent(
+                        kind="error",
+                        text=err_text or str(resp_text or "Antigravity CLI がエラーを返しました。"),
+                    )
+                )
+            else:
+                if isinstance(resp_text, str) and resp_text and not self._emitted_any_text:
+                    self._emitted_any_text = True
+                    events.append(StreamEvent(kind="delta", text=resp_text))
+                if finished_reason == "print_timeout":
+                    events.append(
+                        StreamEvent(
+                            kind="log",
+                            level="warn",
+                            text="⚠️ タイムアウトにより途中までの応答で終了しました。",
+                        )
+                    )
+                events.append(StreamEvent(kind="done"))
+            return events
+
+        if ev_name == "error":
+            err = data.get("error")
+            msg = err.get("message") if isinstance(err, dict) else (err or data.get("message") or "Unknown error")
+            events.append(StreamEvent(kind="error", text=str(msg)))
+            return events
+
+        # Legacy Claude-compatible stream-json schema fallback (`"type": ...`)
         ev_type = data.get("type", "")
         if ev_type == "stream_event":
             inner = data.get("event")
@@ -225,6 +301,87 @@ class AgyAdapter(BaseAgentAdapter):
             err = data.get("error")
             msg = err.get("message") if isinstance(err, dict) else (err or data.get("message") or "Unknown error")
             events.append(StreamEvent(kind="error", text=str(msg)))
+        return events
+
+    def _parse_step_update(self, step: dict[str, Any]) -> list[StreamEvent]:
+        events: list[StreamEvent] = []
+        step_type = str(step.get("step_type") or "")
+        state_upper = str(step.get("state") or "").upper()
+        step_index = step.get("step_index")
+        is_int_step = isinstance(step_index, int) and not isinstance(step_index, bool)
+
+        text_delta = step.get("text_delta")
+        if isinstance(text_delta, str) and text_delta:
+            emit_text = text_delta
+            if (
+                self._emitted_any_text
+                and is_int_step
+                and self._last_text_step_index is not None
+                and step_index != self._last_text_step_index
+                and not self._last_text_ended_newline
+                and not text_delta.startswith("\n")
+            ):
+                emit_text = f"\n\n{text_delta}"
+            self._saw_stream_delta = True
+            self._emitted_any_text = True
+            self._last_text_ended_newline = text_delta.endswith("\n")
+            if is_int_step:
+                self._last_text_step_index = step_index
+            events.append(StreamEvent(kind="delta", text=emit_text))
+
+        if step_type in ("tool", "subagent"):
+            if state_upper in _DONE_STATES:
+                phase = "done"
+            elif state_upper in _ERROR_STATES:
+                phase = "error"
+            else:
+                phase = "start"
+
+            if is_int_step:
+                if self._seen_tool_steps.get(step_index) == phase:
+                    return events
+                self._seen_tool_steps[step_index] = phase
+
+            if step_type == "tool":
+                tool_info = step.get("tool_info") if isinstance(step.get("tool_info"), dict) else {}
+                raw_tool = str(step.get("tool_name") or tool_info.get("name") or "tool")
+                payload = tool_info if tool_info else step
+                resolved_tool = extract_effective_tool_name(raw_tool, payload)
+                if phase == "start":
+                    events.append(make_tool_event(resolved_tool, payload))
+                elif phase == "error":
+                    detail = (
+                        step.get("error")
+                        or step.get("error_message")
+                        or tool_info.get("error")
+                        or tool_info.get("output")
+                        or state_upper
+                    )
+                    events.append(make_tool_result_event(resolved_tool, is_error=True, detail=detail))
+                else:
+                    tool_err = step.get("error") or step.get("error_message") or tool_info.get("error")
+                    is_err = bool(tool_info.get("is_error")) or bool(tool_err)
+                    detail = tool_err if is_err else (tool_info.get("output") or "")
+                    events.append(make_tool_result_event(resolved_tool, is_error=is_err, detail=detail))
+                return events
+
+            sub = step.get("subagent_info") if isinstance(step.get("subagent_info"), dict) else {}
+            label = str(sub.get("role") or sub.get("type_name") or step.get("tool_name") or "subagent")
+            if phase == "start":
+                events.append(StreamEvent(kind="status", text=f"🤖 サブエージェント実行中 ({label})..."))
+            else:
+                detail = step.get("error") or step.get("error_message") or ""
+                events.append(
+                    make_tool_result_event(f"subagent:{label}", is_error=(phase == "error"), detail=detail)
+                )
+            return events
+
+        if step_type == "error" or (
+            state_upper in ("ERROR", "FAILED") and (step.get("error") or step.get("error_message"))
+        ):
+            err_msg = step.get("error") or step.get("error_message") or "Antigravity CLI でエラーが発生しました。"
+            events.append(StreamEvent(kind="error", text=str(err_msg)))
+
         return events
 
     def _parse_stream_event(self, inner: dict[str, Any]) -> list[StreamEvent]:

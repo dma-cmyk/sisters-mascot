@@ -323,21 +323,194 @@ class TestAgentAdapters(unittest.TestCase):
         adapter = AgyAdapter()
         cmd, stdin_text = adapter.build_command(
             "hello",
-            model="gemini-2.5-pro",
+            model="gemini-4-hydrogen-low",
             session_id="conv-123",
             auto_approve=True,
         )
         self.assertIsNone(stdin_text)
         self.assertIn("--model", cmd)
-        self.assertIn("gemini-2.5-pro", cmd)
+        self.assertIn("gemini-4-hydrogen-low", cmd)
         self.assertIn("--conversation", cmd)
         self.assertIn("conv-123", cmd)
-        self.assertIn("--mode", cmd)
-        self.assertIn("auto", cmd)
+        self.assertIn("--dangerously-skip-permissions", cmd)
+        self.assertNotIn("--mode", cmd)
 
         cmd_no_auto, _ = adapter.build_command("hi", auto_approve=False)
+        self.assertNotIn("--dangerously-skip-permissions", cmd_no_auto)
         self.assertNotIn("--mode", cmd_no_auto)
 
+        # Current Antigravity CLI stream-json schema (`"event": "init" | "step_update" | "result"`)
+        adapter.reset_state()
+        evs_init = adapter.parse_line(
+            '{"event":"init","conversation_id":"conv-v15","init":{"model":"gemini-4-hydrogen-low","permission_mode":"always-proceed"}}'
+        )
+        self.assertEqual([(e.kind, e.session_id) for e in evs_init], [("session", "conv-v15")])
+
+        evs_d1 = adapter.parse_line(
+            '{"event":"step_update","step_update":{"conversation_id":"conv-v15","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"確認します"}}'
+        )
+        self.assertTrue(any(e.kind == "delta" and e.text == "確認します" for e in evs_d1))
+
+        # Tool ACTIVE emitted twice for same step_index -> deduplicated, parameters extracted
+        tool_active_line = json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "conv-v15",
+                    "step_index": 2,
+                    "state": "ACTIVE",
+                    "step_type": "tool",
+                    "tool_name": "read_file",
+                    "tool_info": {
+                        "name": "read_file",
+                        "parameters": {"Path": "/tmp/demo.txt", "StartLine": 1},
+                    },
+                },
+            }
+        )
+        evs_t1 = adapter.parse_line(tool_active_line)
+        tool_evs = [e for e in evs_t1 if e.kind == "tool"]
+        self.assertEqual(len(tool_evs), 1)
+        self.assertEqual(tool_evs[0].tool_name, "read_file")
+        self.assertEqual(tool_evs[0].detail, "/tmp/demo.txt")
+
+        evs_t1_dup = adapter.parse_line(tool_active_line)
+        self.assertFalse(any(e.kind == "tool" for e in evs_t1_dup))
+
+        evs_t1_done = adapter.parse_line(
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": "conv-v15",
+                        "step_index": 2,
+                        "state": "DONE",
+                        "step_type": "tool",
+                        "tool_name": "read_file",
+                        "tool_info": {"name": "read_file", "output": "4 lines, 67 bytes"},
+                    },
+                }
+            )
+        )
+        log_done = [e for e in evs_t1_done if e.kind == "log"]
+        self.assertEqual(len(log_done), 1)
+        self.assertEqual(log_done[0].level, "info")
+        self.assertIn("4 lines, 67 bytes", log_done[0].text)
+
+        # Playwright MCP call via call_mcp_tool + PascalCase parameters
+        evs_pw = adapter.parse_line(
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": "conv-v15",
+                        "step_index": 3,
+                        "state": "ACTIVE",
+                        "step_type": "tool",
+                        "tool_name": "call_mcp_tool",
+                        "tool_info": {
+                            "name": "call_mcp_tool",
+                            "parameters": {
+                                "ServerName": "playwright",
+                                "ToolName": "browser_navigate",
+                                "Arguments": {"url": "https://example.com"},
+                            },
+                        },
+                    },
+                }
+            )
+        )
+        pw_evs = [e for e in evs_pw if e.kind == "tool"]
+        self.assertEqual(len(pw_evs), 1)
+        self.assertEqual(pw_evs[0].tool_name, "playwright.browser_navigate")
+        self.assertIn("Playwright", pw_evs[0].text)
+        self.assertEqual(pw_evs[0].detail, "https://example.com")
+
+        # Tool ERROR -> error log
+        evs_tool_err = adapter.parse_line(
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": "conv-v15",
+                        "step_index": 4,
+                        "state": "ERROR",
+                        "step_type": "tool",
+                        "tool_name": "run_command",
+                        "error_message": "permission denied",
+                    },
+                }
+            )
+        )
+        err_logs = [e for e in evs_tool_err if e.kind == "log"]
+        self.assertEqual(len(err_logs), 1)
+        self.assertEqual(err_logs[0].level, "error")
+        self.assertIn("permission denied", err_logs[0].text)
+
+        # Subagent start & completion
+        evs_sub_start = adapter.parse_line(
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "step_index": 5,
+                        "state": "ACTIVE",
+                        "step_type": "subagent",
+                        "subagent_info": {"role": "Codebase Researcher"},
+                    },
+                }
+            )
+        )
+        self.assertTrue(any(e.kind == "status" and "Codebase Researcher" in e.text for e in evs_sub_start))
+        evs_sub_done = adapter.parse_line(
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "step_index": 5,
+                        "state": "DONE",
+                        "step_type": "subagent",
+                        "subagent_info": {"role": "Codebase Researcher"},
+                    },
+                }
+            )
+        )
+        self.assertTrue(any(e.kind == "log" and e.level == "info" for e in evs_sub_done))
+
+        # Next agent_response step after tool inserts paragraph break when prior text had no trailing newline
+        evs_d2 = adapter.parse_line(
+            '{"event":"step_update","step_update":{"conversation_id":"conv-v15","step_index":6,"state":"ACTIVE","step_type":"agent_response","text_delta":"完了しました。"}}'
+        )
+        d2 = [e for e in evs_d2 if e.kind == "delta"]
+        self.assertEqual(len(d2), 1)
+        self.assertEqual(d2[0].text, "\n\n完了しました。")
+
+        # result SUCCESS must NOT duplicate streamed text
+        evs_res_ok = adapter.parse_line(
+            '{"event":"result","result":{"conversation_id":"conv-v15","status":"SUCCESS","response":"確認します\\n\\n完了しました。"}}'
+        )
+        self.assertFalse(any(e.kind == "delta" for e in evs_res_ok))
+        self.assertTrue(any(e.kind == "done" for e in evs_res_ok))
+
+        # result SUCCESS falls back to response if no text_delta was emitted
+        adapter.reset_state()
+        evs_res_fb = adapter.parse_line(
+            '{"event":"result","result":{"conversation_id":"conv-fb","status":"SUCCESS","response":"一括応答"}}'
+        )
+        self.assertTrue(any(e.kind == "delta" and e.text == "一括応答" for e in evs_res_fb))
+        self.assertTrue(any(e.kind == "done" for e in evs_res_fb))
+
+        # result ERROR emits error event
+        adapter.reset_state()
+        evs_res_err = adapter.parse_line(
+            '{"event":"result","result":{"conversation_id":"","status":"ERROR","response":"","error":"invalid model selection","finished_reason":"error"}}'
+        )
+        self.assertEqual(
+            [(e.kind, e.text) for e in evs_res_err],
+            [("error", "invalid model selection")],
+        )
+
+        # Legacy Claude-compatible schema fallback
         adapter.reset_state()
         evs = adapter.parse_line('{"type":"stream_event","session_id":"conv-99","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"こん"}}}')
         self.assertTrue(any(e.kind == "session" and e.session_id == "conv-99" for e in evs))
@@ -504,6 +677,23 @@ class TestAgentAdapters(unittest.TestCase):
         self.assertEqual([c.id for c in agy_choices], ["gemini-4-hydrogen-high", "claude-sonnet-5-5-high"])
         self.assertIn("Gemini 4 Hydrogen (High)", agy_choices[0].label)
         self.assertNotIn("gemini-2.5-pro", [c.id for c in agy_choices])
+
+        # Space-separated columns + CR spinner prefix from real `agy models`
+        agy_space_stdout = (
+            "\r⠋ Fetching available models...\r"
+            "gemini-4-neon-xhigh            Gemini 4 Neon (XHigh)\n"
+            "claude-opus-5-5-high           Claude Opus 5.5 (High)\n"
+        )
+        with (
+            patch.object(agy, "is_available", return_value=True),
+            patch("sisters_mascot.agents.agy_adapter.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=["agy", "models"], returncode=0, stdout=agy_space_stdout, stderr=""
+            )
+            agy_space_choices = agy.discover_model_choices()
+        self.assertEqual([c.id for c in agy_space_choices], ["gemini-4-neon-xhigh", "claude-opus-5-5-high"])
+        self.assertEqual(agy_space_choices[0].label, "Gemini 4 Neon (XHigh) (gemini-4-neon-xhigh)")
 
         oc = OpenCodeAdapter()
         oc_stdout = "opencode/big-pickle\nopencode/mimo-v2.6-flash-free\n"
@@ -2208,6 +2398,103 @@ class TestActivityMonitoringAndErrorVisibility(unittest.TestCase):
         self.assertEqual(r2_replies, [])
         self.assertEqual(len(r2_cancelled), 1)
 
+        # 3. Exit=0 with empty text must emit error_occurred and NOT reply_finished
+        r3 = AgentRouter()
+        agy3 = r3.get_adapter("agy")
+        r3_replies: list[str] = []
+        r3_errors: list[str] = []
+        r3.reply_finished.connect(r3_replies.append)
+        r3.error_occurred.connect(r3_errors.append)
+
+        class _SilentEmptyProc:
+            stdin = None
+            stdout = iter(['{"event":"init","conversation_id":"c-empty"}\n'])
+            stderr = iter(())
+
+            def wait(self) -> int:
+                return 0
+
+            def poll(self):
+                return 0
+
+        with (
+            patch.object(agy3, "is_available", return_value=True),
+            patch("sisters_mascot.agents.router.subprocess.Popen", return_value=_SilentEmptyProc()),
+            patch("sisters_mascot.agents.router.threading.Thread", _SyncThread),
+        ):
+            r3.send_message("agy", "こんにちは", sister=load_all_sisters()[0])
+
+        app.processEvents()
+        self.assertEqual(r3_replies, [])
+        self.assertEqual(len(r3_errors), 1)
+        self.assertIn("応答テキストを取得できませんでした", r3_errors[0])
+
+        # Isolated turn also flags empty exit=0 output as an error
+        with (
+            patch.object(agy3, "is_available", return_value=True),
+            patch("sisters_mascot.agents.router.subprocess.Popen", return_value=_SilentEmptyProc()),
+            patch("sisters_mascot.agents.router.threading.Thread", _SyncThread),
+        ):
+            iso_res = r3.run_isolated_turn("agy", "計画して")
+        self.assertEqual(iso_res.text, "")
+        self.assertIn("応答テキストを取得できませんでした", iso_res.error)
+
+        # 4. Explicit stdout error event must NOT also emit reply_finished
+        r4 = AgentRouter()
+        agy4 = r4.get_adapter("agy")
+        r4_replies: list[str] = []
+        r4_errors: list[str] = []
+        r4.reply_finished.connect(r4_replies.append)
+        r4.error_occurred.connect(r4_errors.append)
+
+        class _StreamErrorProc:
+            stdin = None
+            stdout = iter(
+                ['{"event":"result","result":{"status":"ERROR","error":"bad model","finished_reason":"error"}}\n']
+            )
+            stderr = iter(())
+
+            def wait(self) -> int:
+                return 0
+
+            def poll(self):
+                return 0
+
+        with (
+            patch.object(agy4, "is_available", return_value=True),
+            patch("sisters_mascot.agents.router.subprocess.Popen", return_value=_StreamErrorProc()),
+            patch("sisters_mascot.agents.router.threading.Thread", _SyncThread),
+        ):
+            r4.send_message("agy", "テスト", sister=load_all_sisters()[0])
+
+        app.processEvents()
+        self.assertEqual(r4_replies, [])
+        self.assertEqual(r4_errors, ["bad model"])
+
+    def test_launch_app_wraps_tui_cli_in_linux_terminal(self) -> None:
+        from sisters_mascot.launcher.actions import launch_app
+
+        spawn_calls: list[tuple[list[str], str | None]] = []
+
+        def _fake_spawn(argv: list[str], cwd: str | None = None) -> tuple[bool, str]:
+            spawn_calls.append((argv, cwd))
+            return True, "ok"
+
+        def _fake_which(name: str) -> str | None:
+            return {"agy": "/home/dma/.local/bin/agy", "konsole": "/usr/bin/konsole"}.get(name)
+
+        with (
+            patch("sisters_mascot.launcher.actions.sys.platform", "linux"),
+            patch("sisters_mascot.launcher.actions.shutil.which", side_effect=_fake_which),
+            patch("sisters_mascot.launcher.actions._spawn_detached", side_effect=_fake_spawn),
+        ):
+            ok, _msg = launch_app("agy")
+
+        self.assertTrue(ok)
+        self.assertEqual(len(spawn_calls), 1)
+        self.assertEqual(spawn_calls[0][0], ["/usr/bin/konsole", "-e", "/home/dma/.local/bin/agy"])
+        self.assertEqual(spawn_calls[0][1], str(Path.home()))
+
     def test_bubble_panel_activity_drawer_heartbeat_stall_and_cancel_dedup(self) -> None:
         import time as _time
 
@@ -2569,14 +2856,25 @@ class TestOrchestratorMode(unittest.TestCase):
             model_datas = [ruri_row.model_combo.itemData(i) for i in range(ruri_row.model_combo.count())]
             self.assertIn("gpt-5.4", model_datas)
             ruri_row.model_combo.setCurrentIndex(ruri_row.model_combo.findData("gpt-5.4"))
+            self.assertIsNotNone(ruri_row.model_combo.lineEdit())
+            self.assertEqual(ruri_row.model_combo.lineEdit().cursorPosition(), 0)
             dlg._confirm_plan_check.setChecked(True)
             dlg._rows["homura"].enabled_check.setChecked(False)
+            self.assertFalse(dlg._rows["homura"].agent_combo.isEnabled())
+            self.assertFalse(dlg._rows["homura"].model_combo.isEnabled())
+            self.assertIn("15 / 16", dlg._active_count_lbl.text())
             dlg.apply_to_config()
 
             self.assertTrue(cfg.orchestrator_confirm_plan)
             self.assertEqual(cfg.sister_assignments["ruri"].agent_id, "codex")
             self.assertEqual(cfg.sister_assignments["ruri"].model, "gpt-5.4")
             self.assertFalse(cfg.sister_assignments["homura"].enabled)
+
+            dlg._disable_all_sisters()
+            self.assertIn("0 / 16", dlg._active_count_lbl.text())
+            dlg._enable_all_sisters()
+            self.assertIn("16 / 16", dlg._active_count_lbl.text())
+            self.assertTrue(dlg._rows["homura"].agent_combo.isEnabled())
         finally:
             dlg.close()
 

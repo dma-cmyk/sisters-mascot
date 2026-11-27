@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QMimeData, QPoint, QRect, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QMimeData, QPoint, QPointF, QRect, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QDragEnterEvent,
@@ -38,7 +38,10 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
+    QProxyStyle,
     QPushButton,
+    QStyle,
+    QStyleOption,
     QVBoxLayout,
     QWidget,
 )
@@ -90,7 +93,110 @@ QCheckBox {
     spacing: 8px;
     font-size: 12px;
 }
+QScrollArea, QScrollArea > QWidget > QWidget, QWidget#qt_scrollarea_viewport {
+    background: transparent;
+    border: none;
+}
+QComboBox QAbstractItemView {
+    background-color: #171c2f;
+    color: #f8fafc;
+    selection-background-color: #4f46e5;
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    outline: none;
+    padding: 4px;
+}
+QScrollBar:vertical {
+    background: transparent;
+    width: 7px;
+    margin: 2px 0;
+}
+QScrollBar::handle:vertical {
+    background: rgba(148, 163, 184, 0.35);
+    border-radius: 3px;
+    min-height: 24px;
+}
+QScrollBar::handle:vertical:hover {
+    background: rgba(129, 140, 248, 0.6);
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+    background: transparent;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
+}
 """
+
+
+class DarkCheckBoxStyle(QProxyStyle):
+    """Draw crisp rounded dark-theme checkboxes instead of Fusion's white box."""
+
+    def drawPrimitive(  # noqa: N802
+        self,
+        element: QStyle.PrimitiveElement,
+        option: QStyleOption | None,
+        painter: QPainter | None,
+        widget: QWidget | None = None,
+    ) -> None:
+        if element == QStyle.PrimitiveElement.PE_IndicatorCheckBox and option is not None and painter is not None:
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            rect = QRectF(option.rect)
+            side = min(16.0, rect.width(), rect.height())
+            box = QRectF(
+                rect.x() + (rect.width() - side) / 2.0,
+                rect.y() + (rect.height() - side) / 2.0,
+                side,
+                side,
+            ).adjusted(0.75, 0.75, -0.75, -0.75)
+
+            state = option.state
+            checked = bool(state & QStyle.StateFlag.State_On)
+            enabled = bool(state & QStyle.StateFlag.State_Enabled)
+            hovered = bool(state & QStyle.StateFlag.State_MouseOver)
+
+            if checked:
+                fill = QColor("#6366f1") if enabled else QColor("#3b4166")
+                border = QColor("#a5b4fc") if enabled else QColor("#525a7a")
+                painter.setPen(QPen(border, 1.3))
+                painter.setBrush(fill)
+                painter.drawRoundedRect(box, 4.0, 4.0)
+
+                tick_color = QColor("#ffffff") if enabled else QColor("#cbd5e1")
+                tick_pen = QPen(
+                    tick_color,
+                    2.0,
+                    Qt.PenStyle.SolidLine,
+                    Qt.PenCapStyle.RoundCap,
+                    Qt.PenJoinStyle.RoundJoin,
+                )
+                painter.setPen(tick_pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                path = QPainterPath()
+                path.moveTo(box.x() + box.width() * 0.24, box.y() + box.height() * 0.52)
+                path.lineTo(box.x() + box.width() * 0.43, box.y() + box.height() * 0.72)
+                path.lineTo(box.x() + box.width() * 0.77, box.y() + box.height() * 0.30)
+                painter.drawPath(path)
+            else:
+                fill = QColor("#161c32") if enabled else QColor("#111525")
+                border = (
+                    QColor("#818cf8")
+                    if (enabled and hovered)
+                    else QColor(148, 163, 184, 153 if enabled else 80)
+                )
+                painter.setPen(QPen(border, 1.3))
+                painter.setBrush(fill)
+                painter.drawRoundedRect(box, 4.0, 4.0)
+
+            painter.restore()
+            return
+        super().drawPrimitive(element, option, painter, widget)
+
+
+def apply_dark_checkbox_style(root: QWidget, style: QStyle) -> None:
+    """Apply `style` to every QCheckBox descendant under `root`."""
+    for checkbox in root.findChildren(QCheckBox):
+        checkbox.setStyle(style)
 
 
 def _safe_css_color(color: str, fallback: str = "#818cf8") -> str:

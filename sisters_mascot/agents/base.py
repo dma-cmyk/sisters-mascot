@@ -60,11 +60,40 @@ def _clip_single_line(text: Any, max_chars: int = 90) -> str:
     return collapsed[: max(1, max_chars - 1)] + "…"
 
 
+def _iter_param_dicts(payload: Any) -> list[dict[str, Any]]:
+    """Collect parameter dicts from nested `parameters` or `tool_info.parameters`."""
+    if not isinstance(payload, dict):
+        return []
+    params_list: list[dict[str, Any]] = []
+    direct = payload.get("parameters")
+    if isinstance(direct, dict):
+        params_list.append(direct)
+    tool_info = payload.get("tool_info")
+    if isinstance(tool_info, dict):
+        nested = tool_info.get("parameters")
+        if isinstance(nested, dict):
+            params_list.append(nested)
+    return params_list
+
+
 def extract_effective_tool_name(tool_name: str, payload: Any = None) -> str:
-    """Resolve wrapped tool names (e.g. OpenCode `execute` wrapping `playwright.*`)."""
+    """Resolve wrapped tool names (e.g. OpenCode `execute` or `agy` `call_mcp_tool`)."""
     clean = (tool_name or "").strip() or "tool"
     if not isinstance(payload, dict):
         return clean
+
+    for params in _iter_param_dicts(payload):
+        inner = str(params.get("ToolName") or params.get("tool_name") or "").strip()
+        if inner:
+            server = str(params.get("ServerName") or params.get("server_name") or "").strip()
+            if (
+                server
+                and "." not in inner
+                and not inner.startswith(f"{server}.")
+                and not inner.startswith("mcp")
+            ):
+                return f"{server}.{inner}"
+            return inner
 
     state = payload.get("state")
     if isinstance(state, dict):
@@ -100,6 +129,11 @@ def is_playwright_tool(tool_name: str, payload: Any = None) -> bool:
             val = payload.get(key)
             if isinstance(val, str) and any(kw in val.lower() for kw in PLAYWRIGHT_TOOL_KEYWORDS):
                 return True
+        for params in _iter_param_dicts(payload):
+            for key in ("ServerName", "server_name", "ToolName", "tool_name"):
+                val = params.get(key)
+                if isinstance(val, str) and any(kw in val.lower() for kw in PLAYWRIGHT_TOOL_KEYWORDS):
+                    return True
         state = payload.get("state")
         if isinstance(state, dict):
             st_input = state.get("input")
@@ -117,6 +151,15 @@ def summarize_tool_payload(tool_name: str, payload: Any = None, *, max_chars: in
         return ""
 
     candidates: list[dict[str, Any]] = [payload]
+    tool_info = payload.get("tool_info")
+    if isinstance(tool_info, dict):
+        candidates.append(tool_info)
+    for params in _iter_param_dicts(payload):
+        candidates.append(params)
+        args_obj = params.get("Arguments")
+        if isinstance(args_obj, dict):
+            candidates.append(args_obj)
+
     state = payload.get("state")
     if isinstance(state, dict):
         meta = state.get("metadata")
@@ -136,12 +179,24 @@ def summarize_tool_payload(tool_name: str, payload: Any = None, *, max_chars: in
     for src in candidates:
         for field_name in (
             "command",
+            "CommandLine",
             "cmd",
             "url",
+            "Url",
+            "URL",
             "path",
+            "Path",
             "file_path",
+            "FilePath",
+            "TargetFile",
+            "AbsolutePath",
+            "DirectoryPath",
+            "SearchPath",
             "element",
             "query",
+            "Query",
+            "Prompt",
+            "prompt",
             "text",
             "target",
             "code",

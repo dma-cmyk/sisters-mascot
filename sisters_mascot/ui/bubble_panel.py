@@ -92,7 +92,9 @@ from sisters_mascot.ui.platform import supports_window_positioning
 from sisters_mascot.ui.widgets import (
     DARK_DIALOG_QSS,
     ChatInputEdit,
+    DarkCheckBoxStyle,
     LauncherItemDialog,
+    apply_dark_checkbox_style,
     extract_local_paths_from_mime,
     markdown_to_bubble_html,
 )
@@ -190,7 +192,7 @@ QPushButton:hover, QToolButton:hover {
 QPushButton:pressed, QToolButton:pressed {
     background-color: rgba(30, 36, 60, 240);
 }
-QScrollArea {
+QScrollArea, QScrollArea > QWidget > QWidget, QWidget#qt_scrollarea_viewport {
     background: transparent;
     border: none;
 }
@@ -363,7 +365,9 @@ class BubblePanel(QWidget):
         self._activity_tick_timer.setInterval(1000)
         self._activity_tick_timer.timeout.connect(self._on_activity_tick)
 
+        self._checkbox_style = DarkCheckBoxStyle()
         self._build_ui()
+        apply_dark_checkbox_style(self, self._checkbox_style)
         self._connect_orchestrator_signals()
         self._ui_ready = True
         self.sync_from_config(self._sister)

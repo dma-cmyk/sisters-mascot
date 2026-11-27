@@ -6,16 +6,17 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QPainter
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QDialogButtonBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -24,9 +25,15 @@ from sisters_mascot.agents.base import ModelChoice
 from sisters_mascot.agents.router import AGENT_IDS, AgentRouter
 from sisters_mascot.config import AppConfig, SisterAgentAssignment
 from sisters_mascot.sisters_loader import SisterProfile
-from sisters_mascot.ui.widgets import DARK_DIALOG_QSS
+from sisters_mascot.ui.widgets import (
+    DARK_DIALOG_QSS,
+    DarkCheckBoxStyle,
+    apply_dark_checkbox_style,
+)
 
 _DEFAULT_MODEL_LABEL = "（エージェント既定）"
+_AGENT_COMBO_WIDTH = 172
+_MODEL_COMBO_WIDTH = 250
 
 
 def _short_name(display_name: str) -> str:
@@ -38,6 +45,37 @@ def _short_name(display_name: str) -> str:
     return name or display_name
 
 
+class _ElidedLabel(QLabel):
+    """Single-line label that elides overflow text without pushing sibling controls."""
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self._full_text = text
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        self._full_text = text
+        super().setText(text)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: ANN001
+        _ = event
+        painter = QPainter(self)
+        painter.setFont(self.font())
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        elided = self.fontMetrics().elidedText(
+            self._full_text,
+            Qt.TextElideMode.ElideRight,
+            max(1, self.width()),
+        )
+        painter.drawText(
+            self.rect(),
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            elided,
+        )
+
+
 @dataclass
 class _SisterRowControls:
     sister_id: str
@@ -45,6 +83,9 @@ class _SisterRowControls:
     enabled_check: QCheckBox | None
     agent_combo: QComboBox
     model_combo: QComboBox
+    card: QFrame | None = None
+    name_lbl: QLabel | None = None
+    role_lbl: QLabel | None = None
 
 
 class OrchestratorTeamDialog(QDialog):
@@ -64,25 +105,66 @@ class OrchestratorTeamDialog(QDialog):
         self._rows: dict[str, _SisterRowControls] = {}
         self._discovered_choices: dict[str, list[ModelChoice]] = {}
         self._updating_rows: bool = False
+        self._checkbox_style = DarkCheckBoxStyle()
 
         self.setWindowTitle("👥 碧オーケストレーター・姉妹別AI編成")
-        self.resize(740, 620)
+        self.resize(840, 680)
+        self.setMinimumSize(740, 520)
         self.setStyleSheet(
             DARK_DIALOG_QSS
             + """
+            QDialog {
+                background-color: #0f1322;
+            }
             QFrame#TeamTopCard {
-                background-color: rgba(24, 30, 54, 215);
-                border: 1px solid rgba(129, 140, 248, 0.35);
+                background-color: #171d35;
+                border: 1px solid rgba(129, 140, 248, 0.38);
                 border-radius: 12px;
             }
-            QFrame.SisterRowCard {
-                background-color: rgba(23, 28, 48, 185);
+            QFrame#SisterRowCard {
+                background-color: #161c32;
                 border: 1px solid rgba(148, 163, 184, 0.16);
-                border-radius: 9px;
+                border-radius: 10px;
             }
-            QScrollArea {
-                background: transparent;
+            QFrame#SisterRowCard:hover {
+                border-color: rgba(129, 140, 248, 0.48);
+                background-color: #1b223d;
+            }
+            QFrame#SisterRowCard[inactive="true"] {
+                background-color: #121626;
+                border-color: rgba(148, 163, 184, 0.08);
+            }
+            QFrame#CardDivider {
+                background-color: rgba(148, 163, 184, 0.16);
                 border: none;
+            }
+            QScrollArea#RosterScroll, QWidget#RosterBody {
+                background-color: #0f1322;
+                border: none;
+            }
+            QPushButton#BulkActionBtn {
+                background-color: #1e2540;
+                border: 1px solid rgba(148, 163, 184, 0.22);
+                border-radius: 7px;
+                padding: 4px 10px;
+                font-size: 11.5px;
+                color: #e2e8f0;
+            }
+            QPushButton#BulkActionBtn:hover {
+                background-color: #2a3357;
+                border-color: rgba(165, 180, 252, 0.55);
+            }
+            QPushButton#PrimarySaveBtn {
+                background-color: #4f46e5;
+                color: #ffffff;
+                border: 1px solid #818cf8;
+                border-radius: 8px;
+                padding: 7px 16px;
+                font-size: 12.5px;
+                font-weight: 700;
+            }
+            QPushButton#PrimarySaveBtn:hover {
+                background-color: #6366f1;
             }
             """
         )
@@ -111,33 +193,58 @@ class OrchestratorTeamDialog(QDialog):
 
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(14, 14, 14, 12)
+        outer.setContentsMargins(16, 14, 16, 14)
         outer.setSpacing(10)
 
-        intro = QLabel(
-            "長女・碧がタスクの指揮者（オーケストレーター）となり、専門の姉妹へ担当を振り分けます。\n"
-            "各姉妹に「どの AI エージェント」と「どのモデル」を使わせるか個別に指定できます。"
-        )
-        intro.setWordWrap(True)
-        intro.setStyleSheet("color: #cbd5e1; font-size: 12px;")
-        outer.addWidget(intro)
+        # Title header + active participant pill
+        header_row = QHBoxLayout()
+        header_row.setSpacing(10)
+        title_box = QVBoxLayout()
+        title_box.setContentsMargins(0, 0, 0, 0)
+        title_box.setSpacing(2)
 
-        # Top card: Aoi + execution options + bulk controls
+        title_lbl = QLabel("✨ 碧オーケストレーター · 姉妹別AI編成", self)
+        title_lbl.setStyleSheet("font-size: 15px; font-weight: 700; color: #f8fafc; background: transparent;")
+        subtitle_lbl = QLabel(
+            "長女・碧が指揮者となり、参加中の姉妹へ個別AI・モデルで分担指揮します。",
+            self,
+        )
+        subtitle_lbl.setStyleSheet("font-size: 11.5px; color: #94a3b8; background: transparent;")
+        title_box.addWidget(title_lbl)
+        title_box.addWidget(subtitle_lbl)
+        header_row.addLayout(title_box, 1)
+
+        self._active_count_lbl = QLabel("", self)
+        self._active_count_lbl.setStyleSheet(
+            "background-color: rgba(79, 70, 229, 0.34); color: #e0e7ff; "
+            "border: 1px solid rgba(129, 140, 248, 0.55); border-radius: 11px; "
+            "padding: 4px 11px; font-size: 11.5px; font-weight: 700;"
+        )
+        header_row.addWidget(self._active_count_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        outer.addLayout(header_row)
+
+        # Top card: Aoi + execution options
         top_card = QFrame(self)
         top_card.setObjectName("TeamTopCard")
         top_lay = QVBoxLayout(top_card)
         top_lay.setContentsMargins(12, 10, 12, 10)
-        top_lay.setSpacing(8)
+        top_lay.setSpacing(9)
 
         aoi = next((s for s in self._sisters if s.id == "aoi"), self._sisters[0])
         top_lay.addWidget(self._create_sister_row(aoi, is_orchestrator=True, parent=top_card))
 
-        opts_row = QHBoxLayout()
-        opts_row.setSpacing(12)
+        divider = QFrame(top_card)
+        divider.setObjectName("CardDivider")
+        divider.setFixedHeight(1)
+        top_lay.addWidget(divider)
+
+        opts_row1 = QHBoxLayout()
+        opts_row1.setSpacing(10)
 
         par_lbl = QLabel("同時実行数:", top_card)
-        par_lbl.setStyleSheet("color: #cbd5e1; font-size: 11.5px;")
+        par_lbl.setStyleSheet("color: #cbd5e1; font-size: 11.5px; background: transparent;")
         self._max_parallel_combo = QComboBox(top_card)
+        self._max_parallel_combo.setFixedWidth(185)
         for val, text in (
             (1, "1 (順番に実行)"),
             (2, "2 (バランス・おすすめ)"),
@@ -150,44 +257,59 @@ class OrchestratorTeamDialog(QDialog):
         if p_idx >= 0:
             self._max_parallel_combo.setCurrentIndex(p_idx)
 
-        opts_row.addWidget(par_lbl)
-        opts_row.addWidget(self._max_parallel_combo)
-
         self._confirm_plan_check = QCheckBox("実行前に碧の計画を確認してから動かす", top_card)
         self._confirm_plan_check.setChecked(bool(getattr(self._config, "orchestrator_confirm_plan", False)))
-        opts_row.addWidget(self._confirm_plan_check, 1)
-        top_lay.addLayout(opts_row)
+        opts_row1.addWidget(par_lbl)
+        opts_row1.addWidget(self._max_parallel_combo)
+        opts_row1.addSpacing(8)
+        opts_row1.addWidget(self._confirm_plan_check, 1)
+        top_lay.addLayout(opts_row1)
 
         opts_row2 = QHBoxLayout()
         opts_row2.setSpacing(8)
-        self._switch_mascot_check = QCheckBox("作業中の担当姉妹にマスコットを切り替える（セリフ・演出付き）", top_card)
+        self._switch_mascot_check = QCheckBox(
+            "作業中の担当姉妹にマスコットを切り替える（セリフ・演出付き）",
+            top_card,
+        )
         self._switch_mascot_check.setChecked(bool(getattr(self._config, "orchestrator_switch_mascot", True)))
         opts_row2.addWidget(self._switch_mascot_check, 1)
-
-        refresh_btn = QPushButton("↻ 全AIモデル再取得", top_card)
-        refresh_btn.clicked.connect(lambda: self._kickoff_missing_discovery(force=True))
-        enable_all_btn = QPushButton("全員参加 ON", top_card)
-        enable_all_btn.clicked.connect(self._enable_all_sisters)
-        reset_all_btn = QPushButton("全員を既定AIへ戻す", top_card)
-        reset_all_btn.clicked.connect(self._reset_all_to_default)
-        opts_row2.addWidget(refresh_btn)
-        opts_row2.addWidget(enable_all_btn)
-        opts_row2.addWidget(reset_all_btn)
         top_lay.addLayout(opts_row2)
 
         outer.addWidget(top_card)
 
-        # Column header
+        # Roster toolbar + aligned column headers
+        worker_count = sum(1 for s in self._sisters if s.id != "aoi")
+        toolbar_row = QHBoxLayout()
+        toolbar_row.setContentsMargins(2, 2, 2, 0)
+        toolbar_row.setSpacing(6)
+
+        sec_lbl = QLabel(f"👥 担当シスターズ（{worker_count}名）", self)
+        sec_lbl.setStyleSheet("font-size: 12.5px; font-weight: 700; color: #e2e8f0; background: transparent;")
+        toolbar_row.addWidget(sec_lbl)
+        toolbar_row.addStretch(1)
+
+        for label, handler in (
+            ("↻ モデル再取得", lambda: self._kickoff_missing_discovery(force=True)),
+            ("全員 ON", self._enable_all_sisters),
+            ("全員 OFF", self._disable_all_sisters),
+            ("既定AIへ戻す", self._reset_all_to_default),
+        ):
+            btn = QPushButton(label, self)
+            btn.setObjectName("BulkActionBtn")
+            btn.clicked.connect(handler)
+            toolbar_row.addWidget(btn)
+        outer.addLayout(toolbar_row)
+
         hdr_row = QHBoxLayout()
-        hdr_row.setContentsMargins(8, 0, 14, 0)
-        hdr_row.setSpacing(8)
+        hdr_row.setContentsMargins(12, 2, 20, 0)
+        hdr_row.setSpacing(10)
         for text, stretch, width in (
-            ("参加 / 姉妹・役割", 1, 0),
-            ("AIエージェント", 0, 175),
-            ("モデル", 0, 230),
+            ("参加 / 姉妹 · 役割", 1, 0),
+            ("AIエージェント", 0, _AGENT_COMBO_WIDTH),
+            ("モデル", 0, _MODEL_COMBO_WIDTH),
         ):
             lbl = QLabel(text, self)
-            lbl.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 700;")
+            lbl.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 700; background: transparent;")
             if width:
                 lbl.setFixedWidth(width)
             hdr_row.addWidget(lbl, stretch)
@@ -195,34 +317,53 @@ class OrchestratorTeamDialog(QDialog):
 
         # Scrollable 16-sister roster
         scroll = QScrollArea(self)
+        scroll.setObjectName("RosterScroll")
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setStyleSheet("background-color: #0f1322;")
+
         roster_body = QWidget(scroll)
+        roster_body.setObjectName("RosterBody")
+        roster_body.setStyleSheet("background-color: #0f1322;")
         roster_lay = QVBoxLayout(roster_body)
-        roster_lay.setContentsMargins(0, 0, 4, 4)
+        roster_lay.setContentsMargins(0, 0, 8, 6)
         roster_lay.setSpacing(6)
 
         for sister in self._sisters:
             if sister.id == "aoi":
                 continue
             row_card = QFrame(roster_body)
-            row_card.setProperty("class", "SisterRowCard")
+            row_card.setObjectName("SisterRowCard")
             row_lay = QVBoxLayout(row_card)
-            row_lay.setContentsMargins(8, 6, 8, 6)
-            row_lay.addWidget(self._create_sister_row(sister, is_orchestrator=False, parent=row_card))
+            row_lay.setContentsMargins(10, 8, 10, 8)
+            row_lay.addWidget(
+                self._create_sister_row(sister, is_orchestrator=False, parent=row_card, card=row_card)
+            )
             roster_lay.addWidget(row_card)
 
         roster_lay.addStretch(1)
         scroll.setWidget(roster_body)
         outer.addWidget(scroll, 1)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel,
-            self,
-        )
-        buttons.accepted.connect(self._on_save)
-        buttons.rejected.connect(self.reject)
-        outer.addWidget(buttons)
+        # Footer action bar
+        footer_row = QHBoxLayout()
+        footer_row.setSpacing(10)
+        note_lbl = QLabel("※「既定」を選ぶとパネル上部の選択AI・モデルを引き継ぎます", self)
+        note_lbl.setStyleSheet("color: #94a3b8; font-size: 11px; background: transparent;")
+        footer_row.addWidget(note_lbl, 1)
+
+        cancel_btn = QPushButton("キャンセル", self)
+        cancel_btn.clicked.connect(self.reject)
+        save_btn = QPushButton("💾 設定を保存", self)
+        save_btn.setObjectName("PrimarySaveBtn")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self._on_save)
+        footer_row.addWidget(cancel_btn)
+        footer_row.addWidget(save_btn)
+        outer.addLayout(footer_row)
+
+        apply_dark_checkbox_style(self, self._checkbox_style)
+        self._update_active_count()
 
     def _create_sister_row(
         self,
@@ -230,53 +371,59 @@ class OrchestratorTeamDialog(QDialog):
         *,
         is_orchestrator: bool,
         parent: QWidget,
+        card: QFrame | None = None,
     ) -> QWidget:
         row_widget = QWidget(parent)
+        row_widget.setStyleSheet("background: transparent;")
         lay = QHBoxLayout(row_widget)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
+        lay.setSpacing(10)
 
         assignments = getattr(self._config, "sister_assignments", {}) or {}
         assignment = assignments.get(sister.id)
+        is_enabled = True if is_orchestrator else (bool(assignment.enabled) if assignment is not None else True)
 
         enabled_check: QCheckBox | None = None
         if is_orchestrator:
-            badge = QLabel("🎼 統括", row_widget)
-            badge.setFixedWidth(56)
+            badge = QLabel("👑 統括", row_widget)
+            badge.setFixedWidth(62)
             badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
             badge.setStyleSheet(
-                "background-color: rgba(79, 70, 229, 0.38); color: #e0e7ff; "
-                "border: 1px solid rgba(165, 180, 252, 0.5); border-radius: 6px; "
-                "font-size: 10.5px; font-weight: 700; padding: 2px 4px;"
+                "background-color: rgba(79, 70, 229, 0.55); color: #ffffff; "
+                "border: 1px solid #818cf8; border-radius: 7px; "
+                "font-size: 11px; font-weight: 700; padding: 3px 6px;"
             )
             lay.addWidget(badge)
         else:
             enabled_check = QCheckBox(row_widget)
-            enabled_check.setChecked(bool(assignment.enabled) if assignment is not None else True)
+            enabled_check.setChecked(is_enabled)
             enabled_check.setToolTip(f"{_short_name(sister.display_name)}をオーケストレーターの委譲先にする")
             lay.addWidget(enabled_check)
 
-        dot = QLabel(row_widget)
-        dot.setFixedSize(10, 10)
-        dot.setStyleSheet(
-            f"background-color: {sister.accent_color}; border-radius: 5px; border: none;"
+        accent_bar = QFrame(row_widget)
+        accent_bar.setFixedSize(4, 32)
+        accent_bar.setStyleSheet(
+            f"background-color: {sister.accent_color}; border-radius: 2px; border: none;"
         )
-        lay.addWidget(dot)
+        lay.addWidget(accent_bar)
 
         info_box = QVBoxLayout()
         info_box.setContentsMargins(0, 0, 0, 0)
-        info_box.setSpacing(1)
+        info_box.setSpacing(2)
         name_suffix = "（オーケストレーター）" if is_orchestrator else ""
-        name_lbl = QLabel(f"{sister.rank_label} · {_short_name(sister.display_name)}{name_suffix}", row_widget)
-        name_lbl.setStyleSheet("font-weight: 700; font-size: 12px; color: #f8fafc; background: transparent;")
-        role_lbl = QLabel(sister.role, row_widget)
+        name_lbl = _ElidedLabel(
+            f"{sister.rank_label} · {_short_name(sister.display_name)}{name_suffix}",
+            row_widget,
+        )
+        role_lbl = _ElidedLabel(sister.role, row_widget)
+        role_lbl.setToolTip(sister.role)
         role_lbl.setStyleSheet("font-size: 10.5px; color: #94a3b8; background: transparent;")
         info_box.addWidget(name_lbl)
         info_box.addWidget(role_lbl)
         lay.addLayout(info_box, 1)
 
         agent_combo = QComboBox(row_widget)
-        agent_combo.setFixedWidth(175)
+        agent_combo.setFixedWidth(_AGENT_COMBO_WIDTH)
         agent_combo.addItem(f"既定 ({self._config.agent_id})", "")
         for aid in AGENT_IDS:
             agent_combo.addItem(self._agent_label(aid), aid)
@@ -285,9 +432,10 @@ class OrchestratorTeamDialog(QDialog):
         agent_combo.setCurrentIndex(a_idx if a_idx >= 0 else 0)
 
         model_combo = QComboBox(row_widget)
-        model_combo.setFixedWidth(230)
+        model_combo.setFixedWidth(_MODEL_COMBO_WIDTH)
         model_combo.setEditable(True)
         model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        model_combo.view().setMinimumWidth(340)
         if model_combo.lineEdit() is not None:
             model_combo.lineEdit().setPlaceholderText(_DEFAULT_MODEL_LABEL)
 
@@ -297,6 +445,9 @@ class OrchestratorTeamDialog(QDialog):
             enabled_check=enabled_check,
             agent_combo=agent_combo,
             model_combo=model_combo,
+            card=card,
+            name_lbl=name_lbl,
+            role_lbl=role_lbl,
         )
         self._rows[sister.id] = controls
 
@@ -305,10 +456,57 @@ class OrchestratorTeamDialog(QDialog):
         agent_combo.currentIndexChanged.connect(
             lambda _idx, sid=sister.id: self._on_row_agent_changed(sid)
         )
+        model_combo.currentIndexChanged.connect(
+            lambda _idx, mc=model_combo: self._sync_model_combo_display(mc)
+        )
+        if enabled_check is not None:
+            enabled_check.toggled.connect(
+                lambda checked, sid=sister.id: self._on_row_enabled_toggled(sid, checked)
+            )
+        self._apply_row_visual_state(controls, is_enabled)
 
         lay.addWidget(agent_combo)
         lay.addWidget(model_combo)
         return row_widget
+
+    @staticmethod
+    def _sync_model_combo_display(combo: QComboBox) -> None:
+        if combo.lineEdit() is not None:
+            combo.lineEdit().setCursorPosition(0)
+            combo.lineEdit().deselect()
+        combo.setToolTip(combo.currentText().strip() or _DEFAULT_MODEL_LABEL)
+
+    def _apply_row_visual_state(self, ctrl: _SisterRowControls, checked: bool) -> None:
+        ctrl.agent_combo.setEnabled(checked)
+        ctrl.model_combo.setEnabled(checked)
+        if ctrl.name_lbl is not None:
+            color = "#f8fafc" if checked else "#64748b"
+            ctrl.name_lbl.setStyleSheet(
+                f"font-weight: 700; font-size: 12px; color: {color}; background: transparent;"
+            )
+        if ctrl.role_lbl is not None:
+            r_color = "#94a3b8" if checked else "#475569"
+            ctrl.role_lbl.setStyleSheet(f"font-size: 10.5px; color: {r_color}; background: transparent;")
+        if ctrl.card is not None:
+            ctrl.card.setProperty("inactive", not checked)
+            ctrl.card.style().unpolish(ctrl.card)
+            ctrl.card.style().polish(ctrl.card)
+
+    def _on_row_enabled_toggled(self, sister_id: str, checked: bool) -> None:
+        ctrl = self._rows.get(sister_id)
+        if ctrl is not None:
+            self._apply_row_visual_state(ctrl, checked)
+        self._update_active_count()
+
+    def _update_active_count(self) -> None:
+        worker_rows = [ctrl for ctrl in self._rows.values() if not ctrl.is_orchestrator]
+        total = len(worker_rows)
+        active = sum(
+            1
+            for ctrl in worker_rows
+            if ctrl.enabled_check is None or ctrl.enabled_check.isChecked()
+        )
+        self._active_count_lbl.setText(f"参加中 {active} / {total}名")
 
     def _effective_agent_for_row(self, ctrl: _SisterRowControls) -> str:
         chosen = str(ctrl.agent_combo.currentData() or "").strip()
@@ -388,6 +586,7 @@ class OrchestratorTeamDialog(QDialog):
             else:
                 combo.setCurrentIndex(0)
                 combo.setEditText("")
+            self._sync_model_combo_display(combo)
         finally:
             self._updating_rows = False
 
@@ -429,6 +628,11 @@ class OrchestratorTeamDialog(QDialog):
         for ctrl in self._rows.values():
             if ctrl.enabled_check is not None:
                 ctrl.enabled_check.setChecked(True)
+
+    def _disable_all_sisters(self) -> None:
+        for ctrl in self._rows.values():
+            if ctrl.enabled_check is not None:
+                ctrl.enabled_check.setChecked(False)
 
     def _reset_all_to_default(self) -> None:
         self._updating_rows = True

@@ -10,6 +10,20 @@ import sys
 import webbrowser
 from pathlib import Path
 
+_TUI_CLI_NAMES = frozenset({"agy", "claude", "codex", "opencode"})
+_NON_INTERACTIVE_ARGS = frozenset(
+    {"-p", "--print", "--prompt", "exec", "run", "models", "help", "--help", "--version"}
+)
+_LINUX_TERMINALS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("konsole", ("-e",)),
+    ("alacritty", ("-e",)),
+    ("kitty", ("--",)),
+    ("wezterm", ("start", "--")),
+    ("gnome-terminal", ("--",)),
+    ("xfce4-terminal", ("-x",)),
+    ("xterm", ("-e",)),
+)
+
 
 def _spawn_detached(argv: list[str], cwd: str | None = None) -> tuple[bool, str]:
     popen_kwargs: dict = {
@@ -59,6 +73,16 @@ def launch_app(command: str) -> tuple[bool, str]:
         if not which_path:
             return False, f"コマンドが見つかりません: {exe}"
         argv[0] = which_path
+
+    if sys.platform.startswith("linux") and Path(argv[0]).name.lower() in _TUI_CLI_NAMES:
+        if not any(arg in _NON_INTERACTIVE_ARGS for arg in argv[1:]):
+            for term_bin, term_flags in _LINUX_TERMINALS:
+                term_path = shutil.which(term_bin)
+                if term_path:
+                    return _spawn_detached(
+                        [term_path, *term_flags, *argv],
+                        cwd=str(Path.home()),
+                    )
 
     return _spawn_detached(argv)
 
