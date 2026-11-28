@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
+import sqlite3
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -23,6 +26,7 @@ EFFORT_LEVELS: tuple[str, ...] = (
     "xhigh",
     "max",
     "ultra",
+    "thinking",
 )
 
 EFFORT_SHORT_LABELS: dict[str, str] = {
@@ -35,6 +39,7 @@ EFFORT_SHORT_LABELS: dict[str, str] = {
     "xhigh": "XHigh",
     "max": "Max",
     "ultra": "Ultra",
+    "thinking": "Think",
 }
 
 EFFORT_DISPLAY_LABELS: dict[str, str] = {
@@ -47,6 +52,7 @@ EFFORT_DISPLAY_LABELS: dict[str, str] = {
     "xhigh": "XHigh (超深め)",
     "max": "Max (最大)",
     "ultra": "Ultra (極大)",
+    "thinking": "Thinking (思考ON)",
 }
 
 
@@ -311,6 +317,96 @@ def _fallback_binary(name: str) -> str | None:
     return None
 
 
+_CATALOG_LOCK = threading.Lock()
+_CATALOG_CACHE: dict[str, tuple[tuple[int, int], dict[str, dict[str, dict[str, Any]]]]] = {}
+
+
+def _load_opencode_catalog_index(
+    db_path: Path | None = None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Load `{provider_id: {model_id: reasoning_dict}}` from OpenCode's catalog DB with mtime cache."""
+    target = db_path or (Path.home() / ".local" / "share" / "opencode" / "opencode.db")
+    try:
+        st = target.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {}
+
+    cache_key = str(target)
+    with _CATALOG_LOCK:
+        cached = _CATALOG_CACHE.get(cache_key)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+
+    index: dict[str, dict[str, dict[str, Any]]] = {}
+    try:
+        conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True, timeout=0.8)
+        try:
+            row = conn.execute(
+                "SELECT value FROM kv WHERE key='models-dev:v3:catalog'"
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return {}
+        outer = json.loads(row[0])
+        body_raw = outer.get("body") if isinstance(outer, dict) else None
+        cat = json.loads(body_raw) if isinstance(body_raw, str) else outer
+        if isinstance(cat, dict):
+            for prov_id, prov_obj in cat.items():
+                if not isinstance(prov_obj, dict):
+                    continue
+                raw_models = prov_obj.get("models")
+                if not isinstance(raw_models, dict):
+                    continue
+                prov_map: dict[str, dict[str, Any]] = {}
+                for mid, m_info in raw_models.items():
+                    if not isinstance(m_info, dict):
+                        continue
+                    cap = m_info.get("capabilities")
+                    reasoning = cap.get("reasoning") if isinstance(cap, dict) else None
+                    prov_map[str(mid)] = dict(reasoning) if isinstance(reasoning, dict) else {}
+                index[str(prov_id)] = prov_map
+    except (OSError, sqlite3.Error, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+
+    with _CATALOG_LOCK:
+        _CATALOG_CACHE[cache_key] = (sig, index)
+    return index
+
+
+def lookup_catalog_reasoning(
+    provider_id: str,
+    model_id: str,
+    *,
+    db_path: Path | None = None,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Return `(found, reasoning_dict)` for `(provider_id, model_id)` in OpenCode's catalog."""
+    index = _load_opencode_catalog_index(db_path)
+    prov_map = index.get(provider_id)
+    if not isinstance(prov_map, dict) or model_id not in prov_map:
+        return False, None
+    return True, prov_map[model_id]
+
+
+def find_catalog_models_by_prefix(
+    provider_id: str,
+    prefix: str,
+    *,
+    db_path: Path | None = None,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Return all `(model_id, reasoning_dict)` entries matching `prefix` under `provider_id`."""
+    index = _load_opencode_catalog_index(db_path)
+    prov_map = index.get(provider_id)
+    if not isinstance(prov_map, dict):
+        return []
+    return [
+        (mid, reasoning)
+        for mid, reasoning in prov_map.items()
+        if mid.startswith(prefix)
+    ]
+
+
 class BaseAgentAdapter:
     """Common interface implemented by all CLI agent adapters."""
 
@@ -358,6 +454,19 @@ class BaseAgentAdapter:
         """Return supported reasoning effort levels for this agent/model."""
         _ = model
         return ["low", "medium", "high", "xhigh", "max"]
+
+    def default_effort_hint(self, model: str = "") -> str:
+        """Return the model's default reasoning effort label if known, else ''."""
+        _ = model
+        return ""
+
+    def sanitize_effort(self, model: str, effort: str) -> str:
+        """Return `effort` if supported by `model`, otherwise '' (safe fallback)."""
+        clean = (effort or "").strip().lower()
+        if not clean:
+            return ""
+        supported = self.supported_efforts(model)
+        return clean if clean in supported else ""
 
     def build_command(
         self,

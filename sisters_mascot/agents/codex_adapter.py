@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import threading
 from pathlib import Path
 from typing import Sequence
 
@@ -26,6 +27,96 @@ from sisters_mascot.attachments import (
 _CONFIG_MODEL_RE = re.compile(r'^\s*model\s*=\s*["\']([^"\']+)["\']')
 _VALID_CODEX_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 _DEFAULT_CODEX_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"]
+
+
+_CODEX_LOCK = threading.Lock()
+_CODEX_CACHE_INDEX: dict[str, tuple[tuple[int, int], tuple[dict[str, list[str]], dict[str, str], str]]] = {}
+
+
+def _load_codex_models_index(
+    cache_path: Path | None = None,
+) -> tuple[dict[str, list[str]], dict[str, str], str]:
+    """Load `(efforts_by_slug, defaults_by_slug, top_visible_slug)` from Codex `models_cache.json`."""
+    target = cache_path or (Path.home() / ".codex" / "models_cache.json")
+    try:
+        st = target.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {}, {}, ""
+
+    cache_key = str(target)
+    with _CODEX_LOCK:
+        cached = _CODEX_CACHE_INDEX.get(cache_key)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+
+    efforts_by_slug: dict[str, list[str]] = {}
+    defaults_by_slug: dict[str, str] = {}
+    visible_candidates: list[tuple[int, int, str]] = []
+
+    try:
+        data = json.loads(target.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return {}, {}, ""
+
+    raw_models = data.get("models") if isinstance(data, dict) else None
+    if isinstance(raw_models, list):
+        for idx, entry in enumerate(raw_models):
+            if not isinstance(entry, dict):
+                continue
+            slug = str(entry.get("slug") or "").strip()
+            if not slug:
+                continue
+            levels = entry.get("supported_reasoning_levels")
+            if isinstance(levels, list):
+                found: list[str] = []
+                for lv in levels:
+                    if not isinstance(lv, dict):
+                        continue
+                    eff = str(lv.get("effort") or "").strip().lower()
+                    if eff in _VALID_CODEX_EFFORTS and eff not in found:
+                        found.append(eff)
+                efforts_by_slug[slug] = found
+
+            def_eff = str(
+                entry.get("default_reasoning_level")
+                or entry.get("default_reasoning_effort")
+                or ""
+            ).strip().lower()
+            allowed = efforts_by_slug.get(slug, list(_VALID_CODEX_EFFORTS))
+            if def_eff and def_eff in allowed:
+                defaults_by_slug[slug] = def_eff
+
+            vis = str(entry.get("visibility") or "list").strip().lower()
+            if vis != "hide":
+                try:
+                    prio = int(entry.get("priority", 9999))
+                except (TypeError, ValueError):
+                    prio = 9999
+                visible_candidates.append((prio, idx, slug))
+
+    visible_candidates.sort(key=lambda item: (item[0], item[1]))
+    top_visible = visible_candidates[0][2] if visible_candidates else ""
+    result = (efforts_by_slug, defaults_by_slug, top_visible)
+    with _CODEX_LOCK:
+        _CODEX_CACHE_INDEX[cache_key] = (sig, result)
+    return result
+
+
+def _read_codex_config_model() -> str:
+    cfg_path = Path.home() / ".codex" / "config.toml"
+    if not cfg_path.is_file():
+        return ""
+    try:
+        for line in cfg_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = _CONFIG_MODEL_RE.match(line)
+            if match:
+                val = match.group(1).strip()
+                if val:
+                    return val
+    except OSError:
+        pass
+    return ""
 
 
 class CodexAdapter(BaseAgentAdapter):
@@ -123,31 +214,16 @@ class CodexAdapter(BaseAgentAdapter):
         return [choice.id for choice in self.discover_model_choices()]
 
     def supported_efforts(self, model: str = "") -> list[str]:
-        target_slug = (model or "").strip()
-        cache_path = Path.home() / ".codex" / "models_cache.json"
-        if target_slug and cache_path.is_file():
-            try:
-                data = json.loads(cache_path.read_text(encoding="utf-8", errors="replace"))
-            except (OSError, json.JSONDecodeError):
-                data = None
-            raw_models = data.get("models") if isinstance(data, dict) else None
-            if isinstance(raw_models, list):
-                for entry in raw_models:
-                    if not isinstance(entry, dict):
-                        continue
-                    if str(entry.get("slug") or "").strip() != target_slug:
-                        continue
-                    levels = entry.get("supported_reasoning_levels")
-                    if isinstance(levels, list):
-                        found = [
-                            str(lv.get("effort") or "").strip().lower()
-                            for lv in levels
-                            if isinstance(lv, dict)
-                            and str(lv.get("effort") or "").strip().lower() in _VALID_CODEX_EFFORTS
-                        ]
-                        if found:
-                            return found
+        efforts_by_slug, _defaults, top_visible = _load_codex_models_index()
+        target_slug = (model or "").strip() or _read_codex_config_model() or top_visible
+        if target_slug and target_slug in efforts_by_slug:
+            return list(efforts_by_slug[target_slug])
         return list(_DEFAULT_CODEX_EFFORTS)
+
+    def default_effort_hint(self, model: str = "") -> str:
+        _efforts, defaults_by_slug, top_visible = _load_codex_models_index()
+        target_slug = (model or "").strip() or _read_codex_config_model() or top_visible
+        return defaults_by_slug.get(target_slug, "")
 
     def build_command(
         self,
@@ -164,9 +240,7 @@ class CodexAdapter(BaseAgentAdapter):
         _ = system_prompt
         binary = self.resolved_binary()
         cleaned_model = model.strip()
-        cleaned_effort = (effort or "").strip().lower()
-        if cleaned_effort not in _VALID_CODEX_EFFORTS:
-            cleaned_effort = ""
+        cleaned_effort = self.sanitize_effort(cleaned_model, effort)
         effective_cwd = cwd.strip() or str(Path.home())
         images = collect_image_paths(attachments)
 

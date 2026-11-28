@@ -21,7 +21,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from sisters_mascot.agents.base import EFFORT_DISPLAY_LABELS, ModelChoice
+from sisters_mascot.agents.base import (
+    EFFORT_DISPLAY_LABELS,
+    EFFORT_SHORT_LABELS,
+    ModelChoice,
+)
 from sisters_mascot.agents.router import AGENT_IDS, AgentRouter
 from sisters_mascot.config import AppConfig, SisterAgentAssignment, normalize_effort
 from sisters_mascot.sisters_loader import SisterProfile
@@ -89,6 +93,7 @@ class _SisterRowControls:
     card: QFrame | None = None
     name_lbl: QLabel | None = None
     role_lbl: QLabel | None = None
+    effort_supported: bool = True
 
 
 class OrchestratorTeamDialog(QDialog):
@@ -492,7 +497,7 @@ class OrchestratorTeamDialog(QDialog):
     def _apply_row_visual_state(self, ctrl: _SisterRowControls, checked: bool) -> None:
         ctrl.agent_combo.setEnabled(checked)
         ctrl.model_combo.setEnabled(checked)
-        ctrl.effort_combo.setEnabled(checked)
+        ctrl.effort_combo.setEnabled(checked and ctrl.effort_supported)
         if ctrl.name_lbl is not None:
             color = "#f8fafc" if checked else "#64748b"
             ctrl.name_lbl.setStyleSheet(
@@ -622,23 +627,37 @@ class OrchestratorTeamDialog(QDialog):
         )
         adapter = self._router.get_adapter(effective_agent)
         levels = list(adapter.supported_efforts(effective_model))
-        if target_effort and target_effort not in levels:
-            levels.append(target_effort)
+        checked_state = ctrl.enabled_check.isChecked() if ctrl.enabled_check is not None else True
 
         combo = ctrl.effort_combo
         self._updating_rows = True
         try:
             combo.clear()
-            combo.addItem(_DEFAULT_EFFORT_LABEL, "")
-            for lv in levels:
-                combo.addItem(EFFORT_DISPLAY_LABELS.get(lv, lv), lv)
-            if target_effort:
-                idx = combo.findData(target_effort)
-                combo.setCurrentIndex(idx if idx >= 0 else 0)
-            else:
+            if not levels:
+                ctrl.effort_supported = False
+                is_oc_empty = effective_agent == "opencode" and not effective_model
+                label = "（モデル指定要）" if is_oc_empty else "（非対応）"
+                combo.addItem(label, "")
                 combo.setCurrentIndex(0)
+            else:
+                ctrl.effort_supported = True
+                hint = adapter.default_effort_hint(effective_model)
+                def_label = (
+                    f"（既定: {EFFORT_SHORT_LABELS.get(hint, hint)}）"
+                    if hint
+                    else _DEFAULT_EFFORT_LABEL
+                )
+                combo.addItem(def_label, "")
+                for lv in levels:
+                    combo.addItem(EFFORT_DISPLAY_LABELS.get(lv, lv), lv)
+                if target_effort and target_effort in levels:
+                    idx = combo.findData(target_effort)
+                    combo.setCurrentIndex(idx if idx >= 0 else 0)
+                else:
+                    combo.setCurrentIndex(0)
         finally:
             self._updating_rows = False
+        combo.setEnabled(checked_state and ctrl.effort_supported)
 
     def _on_row_model_changed(self, sister_id: str, combo: QComboBox) -> None:
         self._sync_model_combo_display(combo)
@@ -679,6 +698,7 @@ class OrchestratorTeamDialog(QDialog):
         for sid, ctrl in self._rows.items():
             if self._effective_agent_for_row(ctrl) == agent_id:
                 self._populate_row_models(sid)
+                self._populate_row_efforts(sid)
 
     def _enable_all_sisters(self) -> None:
         for ctrl in self._rows.values():

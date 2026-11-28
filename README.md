@@ -116,7 +116,7 @@
 | **`opencode`** | OpenCode | `opencode models` 出力 |
 
 - **動的モデル取得＆切り替え**: 起動時およびエージェント切り替え時に各 CLI の利用可能モデル一覧をバックグラウンドで自動取得してプルダウンへ反映します。`↻` ボタンでの強制再取得や自由入力も可能です（選択はエージェントごとに `~/.config/sisters-mascot/config.json` に保存されます）。
-- **思考エフォート設定（4 CLI 対応）**: パネル上部のエフォートプルダウンおよび `👥 姉妹別AI編成` から、各 CLI・選択モデルに対応した推論強度（`low` / `medium` / `high` / `xhigh` / `max` 等）を個別に指定できます（`agy --effort`・`claude --effort`・`codex -c model_reasoning_effort`・`opencode -m provider/model#variant`、既定値は `efforts_by_agent` に保存）。
+- **思考エフォート設定（全4 CLI・モデル別自動最適化対応）**: パネル上部のエフォートプルダウンおよび `👥 姉妹別AI編成` から、各 CLI・**選択中モデルごとに対応する推論段階だけ**を自動取得して指定できます（`opencode` のローカル `/api/model`・カタログ DB による `none` / `thinking` 等やモデル未指定時ガード、`codex` の `models_cache.json` / `config.toml`、`agy` の `agy models` 派生段階、`claude` の世代別・環境変数エイリアス解決に対応。非対応モデルは自動無効化、既定値ヒント `既定(...)` 表示、実行時サニタイズ付き）。既定値は `efforts_by_agent` に保存されます。
 - **`agy` (Antigravity CLI) 連携 & ランチャー端末起動**:
   - Antigravity CLI の最新 `stream-json` イベント形式（`init` / `step_update` / `result`、および `call_mcp_tool` 経由の Playwright 呼び出し検出）に対応し、自動承認 ON 時は `--dangerously-skip-permissions` でスムーズにツール実行まで完結します。
   - `🚀 ランチャー` タブから **`Antigravity CLI`**（`agy`）や `claude` / `codex` / `opencode` 等の対話型 TUI CLI を起動すると、Linux では `konsole` 等のインストール済み端末エミュレータ経由で対話セッションとして開きます。

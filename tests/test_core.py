@@ -4027,5 +4027,422 @@ class TestInteractiveAndEffortUI(unittest.TestCase):
             app.processEvents()
 
 
+class TestPerModelEffortDiscoveryAndSanitization(unittest.TestCase):
+    @staticmethod
+    def _write_catalog_db(db_path: Path, providers: dict) -> None:
+        import sqlite3
+
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
+            payload = json.dumps({"body": json.dumps(providers)})
+            conn.execute(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)",
+                ("models-dev:v3:catalog", payload),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_opencode_per_model_effort_from_catalog_and_server(self) -> None:
+        import http.server
+        import threading
+        from sisters_mascot.agents.opencode_adapter import _derive_opencode_variants_from_reasoning
+
+        # Direct rule derivation checks
+        self.assertEqual(_derive_opencode_variants_from_reasoning(None), ([], ""))
+        self.assertEqual(_derive_opencode_variants_from_reasoning({"supported": False, "effort": ["high"]}), ([], ""))
+        self.assertEqual(_derive_opencode_variants_from_reasoning({"supported": True}), ([], ""))
+        self.assertEqual(
+            _derive_opencode_variants_from_reasoning({"supported": True, "toggle": True}),
+            (["none", "thinking"], ""),
+        )
+        self.assertEqual(
+            _derive_opencode_variants_from_reasoning(
+                {"supported": True, "toggle": True, "effort": ["low", "high"], "default": {"type": "effort", "value": "high"}}
+            ),
+            (["none", "low", "high"], "high"),
+        )
+        self.assertEqual(
+            _derive_opencode_variants_from_reasoning({"supported": True, "budget": {"min": 1024}}),
+            (["high", "max"], ""),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            db_path = fake_home / ".local" / "share" / "opencode" / "opencode.db"
+            self._write_catalog_db(
+                db_path,
+                {
+                    "opencode": {
+                        "models": {
+                            "big-pickle": {"capabilities": {"reasoning": {"supported": True}}},
+                            "glm-5-free": {"capabilities": {"reasoning": {"supported": True, "toggle": True}}},
+                            "deepseek-v4.1-flash-free": {
+                                "capabilities": {
+                                    "reasoning": {
+                                        "supported": True,
+                                        "toggle": True,
+                                        "effort": ["low", "high", "max"],
+                                        "default": {"type": "effort", "value": "high"},
+                                    }
+                                }
+                            },
+                            "trinity-large-preview-free": {"capabilities": {"reasoning": {"supported": False}}},
+                        }
+                    }
+                },
+            )
+
+            oc = OpenCodeAdapter()
+            with patch("sisters_mascot.agents.base.Path.home", return_value=fake_home):
+                self.assertEqual(oc.supported_efforts(""), [])
+                self.assertEqual(oc.supported_efforts("opencode/big-pickle"), [])
+                self.assertEqual(oc.supported_efforts("opencode/trinity-large-preview-free"), [])
+                self.assertEqual(oc.supported_efforts("opencode/glm-5-free"), ["none", "thinking"])
+                self.assertEqual(
+                    oc.supported_efforts("opencode/deepseek-v4.1-flash-free"),
+                    ["none", "low", "high", "max"],
+                )
+                self.assertEqual(oc.default_effort_hint("opencode/deepseek-v4.1-flash-free"), "high")
+                # Unknown model falls back conservatively; unsupported effort stripped at build_command
+                self.assertTrue(len(oc.supported_efforts("opencode/unknown-custom")) >= 3)
+                cmd_bad, _ = oc.build_command("hi", model="opencode/big-pickle", effort="xhigh")
+                self.assertEqual(cmd_bad[cmd_bad.index("-m") + 1], "opencode/big-pickle")
+
+            # Local OpenCode HTTP /api/model override check
+            class _ModelHandler(http.server.BaseHTTPRequestHandler):
+                def log_message(self, format, *args):  # noqa: ANN001, A002
+                    pass
+
+                def do_GET(self) -> None:  # noqa: N802
+                    if self.path == "/api/model":
+                        body = json.dumps(
+                            [
+                                {
+                                    "providerID": "opencode",
+                                    "id": "custom-srv",
+                                    "name": "Custom Srv",
+                                    "variants": [{"id": "low"}, {"id": "max"}],
+                                    "defaultVariant": "max",
+                                },
+                                {
+                                    "providerID": "opencode",
+                                    "id": "no-think",
+                                    "variants": [],
+                                },
+                            ]
+                        ).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    self.send_response(404)
+                    self.end_headers()
+
+            srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ModelHandler)
+            th = threading.Thread(target=srv.serve_forever, daemon=True)
+            th.start()
+            try:
+                svc_file = fake_home / "service.json"
+                svc_file.write_text(
+                    json.dumps({"url": f"http://127.0.0.1:{srv.server_address[1]}", "password": "pw"}),
+                    encoding="utf-8",
+                )
+                with patch("sisters_mascot.agents.opencode_adapter.Path.home", return_value=fake_home):
+                    choices, vmap, dmap = oc._probe_server_models(svc_file)
+                oc._server_variants = vmap
+                oc._server_defaults = dmap
+                self.assertEqual(len(choices), 2)
+                self.assertEqual(oc.supported_efforts("opencode/custom-srv"), ["low", "max"])
+                self.assertEqual(oc.default_effort_hint("opencode/custom-srv"), "max")
+                self.assertEqual(oc.supported_efforts("opencode/no-think"), [])
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+    def test_codex_per_model_effort_and_config_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            codex_dir = fake_home / ".codex"
+            codex_dir.mkdir(parents=True, exist_ok=True)
+            (codex_dir / "config.toml").write_text('model = "gpt-6-luna"\n', encoding="utf-8")
+            (codex_dir / "models_cache.json").write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {
+                                "slug": "gpt-6.2-sol",
+                                "visibility": "list",
+                                "priority": 1,
+                                "default_reasoning_level": "low",
+                                "supported_reasoning_levels": [
+                                    {"effort": "low"},
+                                    {"effort": "medium"},
+                                    {"effort": "high"},
+                                    {"effort": "xhigh"},
+                                    {"effort": "max"},
+                                    {"effort": "ultra"},
+                                ],
+                            },
+                            {
+                                "slug": "gpt-6-luna",
+                                "visibility": "list",
+                                "priority": 2,
+                                "default_reasoning_level": "medium",
+                                "supported_reasoning_levels": [
+                                    {"effort": "low"},
+                                    {"effort": "medium"},
+                                    {"effort": "high"},
+                                    {"effort": "xhigh"},
+                                    {"effort": "max"},
+                                ],
+                            },
+                            {
+                                "slug": "gpt-no-think",
+                                "visibility": "list",
+                                "priority": 3,
+                                "supported_reasoning_levels": [],
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            codex = CodexAdapter()
+            with patch("sisters_mascot.agents.codex_adapter.Path.home", return_value=fake_home):
+                self.assertEqual(codex.supported_efforts(""), ["low", "medium", "high", "xhigh", "max"])
+                self.assertEqual(codex.default_effort_hint(""), "medium")
+                self.assertIn("ultra", codex.supported_efforts("gpt-6.2-sol"))
+                self.assertEqual(codex.default_effort_hint("gpt-6.2-sol"), "low")
+                self.assertEqual(codex.supported_efforts("gpt-no-think"), [])
+                cmd_bad, _ = codex.build_command("hi", model="gpt-6-luna", effort="ultra")
+                self.assertFalse(any("model_reasoning_effort" in tok for tok in cmd_bad))
+
+    def test_agy_and_claude_per_model_effort_and_sanitization(self) -> None:
+        # 1. Agy discovers real sibling efforts from `agy models`
+        agy = AgyAdapter()
+        fake_stdout = "\n".join(
+            [
+                "gemini-4-neon-low      Gemini 4 Neon Low",
+                "gemini-4-neon-medium   Gemini 4 Neon Medium",
+                "gemini-4-neon-high     Gemini 4 Neon High",
+                "gemini-4-neon-xhigh    Gemini 4 Neon XHigh",
+                "gemini-plain-chat      Gemini Plain Chat",
+            ]
+        )
+        with (
+            patch.object(agy, "is_available", return_value=True),
+            patch(
+                "sisters_mascot.agents.agy_adapter.subprocess.run",
+                return_value=SimpleNamespace(returncode=0, stdout=fake_stdout),
+            ),
+        ):
+            agy.discover_model_choices()
+
+        self.assertEqual(agy.supported_efforts("gemini-4-neon-high"), ["low", "medium", "high", "xhigh"])
+        self.assertEqual(agy.default_effort_hint("gemini-4-neon-high"), "high")
+        self.assertEqual(agy.supported_efforts("gemini-plain-chat"), [])
+        cmd_agy, _ = agy.build_command("hi", model="gemini-4-neon-high", effort="max")
+        self.assertNotIn("--effort", cmd_agy)
+
+        # 2. Claude resolves catalog + settings/env aliases + fallback
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            db_path = fake_home / ".local" / "share" / "opencode" / "opencode.db"
+            self._write_catalog_db(
+                db_path,
+                {
+                    "anthropic": {
+                        "models": {
+                            "claude-haiku-4-5": {"capabilities": {"reasoning": {"supported": True, "toggle": True}}},
+                            "claude-sonnet-4-5": {"capabilities": {"reasoning": {"supported": True, "toggle": True}}},
+                            "claude-opus-4-5": {
+                                "capabilities": {"reasoning": {"supported": True, "effort": ["low", "medium", "high"]}}
+                            },
+                            "claude-opus-4-6": {
+                                "capabilities": {
+                                    "reasoning": {"supported": True, "effort": ["low", "medium", "high", "max"]}
+                                }
+                            },
+                            "claude-sonnet-5-5": {
+                                "capabilities": {
+                                    "reasoning": {
+                                        "supported": True,
+                                        "default": {"type": "effort", "value": "high"},
+                                        "effort": ["low", "medium", "high", "xhigh", "max"],
+                                    }
+                                }
+                            },
+                        }
+                    }
+                },
+            )
+            cl = ClaudeAdapter()
+            with (
+                patch("sisters_mascot.agents.base.Path.home", return_value=fake_home),
+                patch("sisters_mascot.agents.claude_adapter.Path.home", return_value=fake_home),
+                patch.dict(os.environ, {"ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5"}, clear=False),
+            ):
+                self.assertEqual(cl.supported_efforts("claude-haiku-4-5"), [])
+                self.assertEqual(cl.supported_efforts("haiku"), [])
+                self.assertEqual(cl.supported_efforts("claude-sonnet-4-5"), [])
+                self.assertEqual(cl.supported_efforts("claude-opus-4-5"), ["low", "medium", "high"])
+                self.assertEqual(cl.supported_efforts("claude-opus-4-6"), ["low", "medium", "high", "max"])
+                self.assertEqual(
+                    cl.supported_efforts("sonnet[1m]"),
+                    ["low", "medium", "high", "xhigh", "max"],
+                )
+                self.assertEqual(cl.default_effort_hint("sonnet"), "high")
+                cmd_cl, _ = cl.build_command("hi", model="claude-haiku-4-5", effort="xhigh")
+                self.assertNotIn("--effort", cmd_cl)
+
+    def test_router_sanitizes_unsupported_effort_and_warns(self) -> None:
+        import time
+
+        app = _ensure_qapp()
+        router = AgentRouter()
+        logs: list[str] = []
+        replies: list[str] = []
+        router.activity_logged.connect(lambda _lvl, msg: logs.append(msg))
+        router.reply_finished.connect(replies.append)
+
+        captured_cmds: list[list[str]] = []
+
+        class _FakeProc:
+            pid = 8888
+            stderr = iter(())
+            stdout = iter([json.dumps({"type": "text", "part": {"text": "ok"}}) + "\n"])
+
+            def poll(self):  # noqa: ANN201
+                return 0
+
+            def wait(self, timeout=None):  # noqa: ANN001, ANN201
+                return 0
+
+        def _fake_popen(cmd, **_kw):  # noqa: ANN001
+            captured_cmds.append(list(cmd))
+            return _FakeProc()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            self._write_catalog_db(
+                fake_home / ".local" / "share" / "opencode" / "opencode.db",
+                {"opencode": {"models": {"big-pickle": {"capabilities": {"reasoning": {"supported": True}}}}}},
+            )
+            sisters = get_sister_map()
+            with (
+                patch("sisters_mascot.agents.base.Path.home", return_value=fake_home),
+                patch.object(router.get_adapter("opencode"), "is_available", return_value=True),
+                patch("sisters_mascot.agents.router.subprocess.Popen", side_effect=_fake_popen),
+            ):
+                router.send_message(
+                    "opencode",
+                    "テスト",
+                    sister=sisters["hiiro"],
+                    model="opencode/big-pickle",
+                    effort="xhigh",
+                )
+                for _ in range(60):
+                    app.processEvents()
+                    if replies:
+                        break
+                    time.sleep(0.01)
+
+        self.assertEqual(replies, ["ok"])
+        self.assertEqual(len(captured_cmds), 1)
+        self.assertEqual(captured_cmds[0][captured_cmds[0].index("-m") + 1], "opencode/big-pickle")
+        self.assertTrue(any("非対応" in m and "effort=xhigh" in m for m in logs))
+
+    def test_ui_disables_unsupported_effort_and_clears_incompatible_saved_value(self) -> None:
+        app = _ensure_qapp()
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            self._write_catalog_db(
+                fake_home / ".local" / "share" / "opencode" / "opencode.db",
+                {
+                    "opencode": {
+                        "models": {
+                            "big-pickle": {"capabilities": {"reasoning": {"supported": True}}},
+                            "deepseek-v4.1-flash-free": {
+                                "capabilities": {
+                                    "reasoning": {
+                                        "supported": True,
+                                        "default": {"type": "effort", "value": "high"},
+                                        "effort": ["low", "high", "max"],
+                                    }
+                                }
+                            },
+                        }
+                    },
+                    "anthropic": {
+                        "models": {
+                            "claude-haiku-4-5": {"capabilities": {"reasoning": {"supported": True, "toggle": True}}},
+                        }
+                    },
+                },
+            )
+            with (
+                patch("sisters_mascot.agents.base.Path.home", return_value=fake_home),
+                patch("sisters_mascot.agents.claude_adapter.Path.home", return_value=fake_home),
+            ):
+                cfg = AppConfig(
+                    agent_id="opencode",
+                    models_by_agent={"opencode": ""},
+                    efforts_by_agent={"opencode": "high"},
+                    sister_assignments={
+                        "hiiro": SisterAgentAssignment(agent_id="opencode", model=""),
+                        "ruri": SisterAgentAssignment(agent_id="claude", model="claude-haiku-4-5"),
+                    },
+                )
+                mascot, panel = _make_ui(cfg)
+                try:
+                    # OpenCode with no model -> disabled with "モデル要"
+                    self.assertFalse(panel._effort_combo.isEnabled())
+                    self.assertEqual(panel._effort_combo.currentText(), "モデル要")
+
+                    # Switch to deepseek-v4.1-flash-free -> enabled with default hint + saved "high"
+                    panel._save_model_selection("opencode/deepseek-v4.1-flash-free")
+                    self.assertTrue(panel._effort_combo.isEnabled())
+                    self.assertEqual(panel._effort_combo.itemText(0), "既定(High)")
+                    self.assertEqual(panel._effort_combo.currentData(), "high")
+
+                    # Switch to big-pickle -> incompatible effort cleared and combo disabled with "非対応"
+                    panel._save_model_selection("opencode/big-pickle")
+                    self.assertFalse(panel._effort_combo.isEnabled())
+                    self.assertEqual(panel._effort_combo.currentText(), "非対応")
+                    self.assertNotIn("opencode", cfg.efforts_by_agent)
+
+                    # OrchestratorTeamDialog disables unsupported rows & preserves state on toggle
+                    dlg = OrchestratorTeamDialog(load_all_sisters(), cfg, panel._router)
+                    try:
+                        hiiro_ctrl = dlg._rows["hiiro"]
+                        ruri_ctrl = dlg._rows["ruri"]
+                        # hiiro inherits opencode/big-pickle -> unsupported
+                        self.assertFalse(hiiro_ctrl.effort_combo.isEnabled())
+                        self.assertEqual(hiiro_ctrl.effort_combo.currentText(), "（非対応）")
+                        # When OpenCode default model is cleared, inherits empty -> requires model
+                        cfg.models_by_agent.pop("opencode", None)
+                        dlg._populate_row_efforts("hiiro")
+                        self.assertFalse(hiiro_ctrl.effort_combo.isEnabled())
+                        self.assertEqual(hiiro_ctrl.effort_combo.currentText(), "（モデル指定要）")
+                        self.assertFalse(ruri_ctrl.effort_combo.isEnabled())
+                        self.assertEqual(ruri_ctrl.effort_combo.currentText(), "（非対応）")
+
+                        # Disable and re-enable ruri row: unsupported effort_combo must remain disabled
+                        ruri_ctrl.enabled_check.setChecked(False)
+                        ruri_ctrl.enabled_check.setChecked(True)
+                        self.assertFalse(ruri_ctrl.effort_combo.isEnabled())
+                    finally:
+                        dlg.close()
+                finally:
+                    mascot.close()
+                    panel.close()
+                    app.processEvents()
+
+
 if __name__ == "__main__":
     unittest.main()

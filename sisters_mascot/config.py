@@ -42,6 +42,7 @@ VALID_EFFORT_LEVELS: tuple[str, ...] = (
     "xhigh",
     "max",
     "ultra",
+    "thinking",
 )
 
 

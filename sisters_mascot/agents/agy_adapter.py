@@ -15,6 +15,7 @@ from sisters_mascot.agents.base import (
     ModelChoice,
     StreamEvent,
     extract_effective_tool_name,
+    lookup_catalog_reasoning,
     make_tool_event,
     make_tool_result_event,
 )
@@ -25,7 +26,8 @@ _MODEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,}$")
 _SKIP_PREFIXES = ("fetching", "loading", "available", "models", "usage", "#", "-", "=")
 _DONE_STATES = frozenset({"DONE", "COMPLETED", "SUCCESS"})
 _ERROR_STATES = frozenset({"ERROR", "FAILED", "FAILURE", "CANCELED", "CANCELLED", "DENIED"})
-_VALID_AGY_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_AGY_EFFORT_ORDER: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+_VALID_AGY_EFFORTS = frozenset(_AGY_EFFORT_ORDER)
 _EFFORT_SUFFIX_RE = re.compile(r"^(?P<base>.+)-(?P<level>low|medium|high|xhigh|max)$", re.IGNORECASE)
 
 
@@ -92,6 +94,9 @@ class AgyAdapter(BaseAgentAdapter):
         self._last_text_step_index: int | None = None
         self._last_text_ended_newline: bool = True
         self._seen_tool_steps: dict[int, str] = {}
+        self._has_discovered = False
+        self._discovered_model_ids: set[str] = set()
+        self._discovered_efforts_by_base: dict[str, list[str]] = {}
 
     def reset_state(self) -> None:
         self._saw_stream_delta = False
@@ -151,14 +156,77 @@ class AgyAdapter(BaseAgentAdapter):
             label = f"{display} ({model_id})" if display and display != model_id else model_id
             discovered.append(ModelChoice(id=model_id, label=label))
 
-        return discovered if discovered else fallback
+        if discovered:
+            self._discovered_model_ids = {c.id for c in discovered}
+            raw_by_base: dict[str, set[str]] = {}
+            for mid in self._discovered_model_ids:
+                m = _EFFORT_SUFFIX_RE.match(mid)
+                if m:
+                    raw_by_base.setdefault(m.group("base"), set()).add(m.group("level").lower())
+            self._discovered_efforts_by_base = {
+                base: [lv for lv in _AGY_EFFORT_ORDER if lv in lv_set]
+                for base, lv_set in raw_by_base.items()
+            }
+            self._has_discovered = True
+            return discovered
+
+        return fallback
 
     def discover_models(self) -> list[str]:
         return [choice.id for choice in self.discover_model_choices()]
 
+    @staticmethod
+    def _catalog_reasoning_for_base(base: str) -> tuple[bool, dict[str, Any] | None]:
+        for prov in ("google", "anthropic"):
+            found, reasoning = lookup_catalog_reasoning(prov, base)
+            if found:
+                return True, reasoning
+        return False, None
+
     def supported_efforts(self, model: str = "") -> list[str]:
-        _ = model
-        return ["low", "medium", "high", "xhigh", "max"]
+        cleaned = (model or "").strip()
+        if not cleaned:
+            return list(_AGY_EFFORT_ORDER)
+        match = _EFFORT_SUFFIX_RE.match(cleaned)
+        base = match.group("base") if match else cleaned
+
+        if self._has_discovered:
+            if base in self._discovered_efforts_by_base:
+                return list(self._discovered_efforts_by_base[base])
+            if cleaned in self._discovered_model_ids:
+                return []
+
+        found, reasoning = self._catalog_reasoning_for_base(base)
+        if found:
+            if not isinstance(reasoning, dict) or not reasoning.get("supported"):
+                return []
+            raw_efforts = reasoning.get("effort")
+            if isinstance(raw_efforts, list):
+                effs = [
+                    str(e).strip().lower()
+                    for e in raw_efforts
+                    if str(e).strip().lower() in _VALID_AGY_EFFORTS
+                ]
+                return effs
+            return []
+
+        return list(_AGY_EFFORT_ORDER)
+
+    def default_effort_hint(self, model: str = "") -> str:
+        cleaned = (model or "").strip()
+        if not cleaned:
+            return ""
+        match = _EFFORT_SUFFIX_RE.match(cleaned)
+        if match:
+            return match.group("level").lower()
+        found, reasoning = self._catalog_reasoning_for_base(cleaned)
+        if found and isinstance(reasoning, dict) and reasoning.get("supported"):
+            raw_def = reasoning.get("default")
+            if isinstance(raw_def, dict) and str(raw_def.get("type") or "").lower() == "effort":
+                cand = str(raw_def.get("value") or "").strip().lower()
+                if cand in _VALID_AGY_EFFORTS:
+                    return cand
+        return ""
 
     def build_command(
         self,
@@ -173,7 +241,8 @@ class AgyAdapter(BaseAgentAdapter):
         attachments: Sequence[AttachmentItem] = (),
     ) -> tuple[list[str], str | None]:
         _ = system_prompt
-        eff_model, eff_effort = resolve_model_and_effort(model, effort)
+        safe_effort = self.sanitize_effort(model, effort)
+        eff_model, eff_effort = resolve_model_and_effort(model, safe_effort)
         cmd = [self.resolved_binary(), "-p", prompt, "--output-format", "stream-json"]
         if eff_model:
             cmd.extend(["--model", eff_model])

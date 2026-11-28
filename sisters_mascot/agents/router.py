@@ -293,11 +293,17 @@ class AgentRouter(QObject):
                 )
 
         effective_cwd = cwd.strip() or str(Path.home())
+        safe_effort = adapter.sanitize_effort(model, effort)
+        if (effort or "").strip() and not safe_effort:
+            self._emit_activity(
+                "warn",
+                f"⚠️ モデル {model or '既定'} は effort={effort} 非対応のため既定値で実行します",
+            )
         adapter.reset_state()
         cmd, stdin_text = adapter.build_command(
             effective_prompt,
             model=model,
-            effort=effort,
+            effort=safe_effort,
             session_id=session_id,
             cwd=effective_cwd,
             system_prompt=system_prompt_arg,
@@ -305,7 +311,7 @@ class AgentRouter(QObject):
             attachments=att_tuple,
         )
 
-        effort_desc = f", effort={effort}" if effort.strip() else ""
+        effort_desc = f", effort={safe_effort}" if safe_effort else ""
         start_desc = f"{'継続セッション' if session_id else '新規セッション'}, model={model or '既定'}{effort_desc}"
         sister_short = sister.display_name.split("（", 1)[0].split("(", 1)[0].strip() or sister.display_name
         worker = threading.Thread(
@@ -316,7 +322,7 @@ class AgentRouter(QObject):
                 "interactive_ctx": {
                     "effective_prompt": effective_prompt,
                     "model": model,
-                    "effort": effort,
+                    "effort": safe_effort,
                     "session_id": session_id,
                     "system_prompt_arg": system_prompt_arg,
                     "auto_approve": auto_approve,
@@ -367,11 +373,17 @@ class AgentRouter(QObject):
             )
 
         effective_cwd = cwd.strip() or str(Path.home())
+        safe_effort = adapter.sanitize_effort(model, effort)
+        if (effort or "").strip() and not safe_effort:
+            self._emit_activity(
+                "warn",
+                f"⚠️ モデル {model or '既定'} は effort={effort} 非対応のため既定値で実行します",
+            )
         adapter.reset_state()
         cmd, stdin_text = adapter.build_command(
             effective_prompt,
             model=model,
-            effort=effort,
+            effort=safe_effort,
             session_id=None,
             cwd=effective_cwd,
             system_prompt=system_prompt_arg,
@@ -379,7 +391,7 @@ class AgentRouter(QObject):
             attachments=(),
         )
 
-        effort_desc = f", effort={effort}" if effort.strip() else ""
+        effort_desc = f", effort={safe_effort}" if safe_effort else ""
         start_desc = f"コンパクト, model={model or '既定'}{effort_desc}"
         worker = threading.Thread(
             target=self._run_subprocess,
@@ -933,10 +945,16 @@ class AgentRouter(QObject):
                 )
 
         effective_cwd = cwd.strip() or str(Path.home())
+        safe_effort = adapter.sanitize_effort(model, effort)
+        if (effort or "").strip() and not safe_effort:
+            self._emit_activity(
+                "warn",
+                f"{log_prefix}⚠️ モデル {model or '既定'} は effort={effort} 非対応のため既定値で実行します",
+            )
         cmd, stdin_text = adapter.build_command(
             effective_prompt,
             model=model,
-            effort=effort,
+            effort=safe_effort,
             session_id=None,
             cwd=effective_cwd,
             system_prompt=system_prompt_arg,
@@ -945,7 +963,7 @@ class AgentRouter(QObject):
         )
 
         started_at = time.monotonic()
-        effort_tag = f", effort={effort}" if effort.strip() else ""
+        effort_tag = f", effort={safe_effort}" if safe_effort else ""
         self._emit_activity(
             "info",
             f"{log_prefix}▶ {adapter.spec.display_name} 開始 (model={model or '既定'}{effort_tag})",
@@ -1003,7 +1021,7 @@ class AgentRouter(QObject):
                 effective_prompt,
                 adapter=adapter,
                 model=model,
-                effort=effort,
+                effort=safe_effort,
                 session_id=None,
                 effective_cwd=effective_cwd,
                 system_prompt_arg=system_prompt_arg,

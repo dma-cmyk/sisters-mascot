@@ -491,7 +491,7 @@ class BubblePanel(QWidget):
         row2.addWidget(self._model_combo, 1)
 
         self._effort_combo = QComboBox(self._header_widget)
-        self._effort_combo.setFixedWidth(92)
+        self._effort_combo.setFixedWidth(108)
         self._effort_combo.setToolTip("思考エフォート（推論の深さ）を選択")
         self._effort_combo.view().setMinimumWidth(165)
         self._effort_combo.currentIndexChanged.connect(self._on_effort_combo_changed)
@@ -1389,12 +1389,34 @@ class BubblePanel(QWidget):
         adapter = self._router.get_adapter(agent_id)
         levels = list(adapter.supported_efforts(effective_model))
         saved_effort = normalize_effort((getattr(self._config, "efforts_by_agent", {}) or {}).get(agent_id, ""))
-        if saved_effort and saved_effort not in levels:
-            levels.append(saved_effort)
 
         self._effort_combo.clear()
-        self._effort_combo.addItem(EFFORT_SHORT_LABELS[""], "")
-        self._effort_combo.setItemData(0, EFFORT_DISPLAY_LABELS[""], Qt.ItemDataRole.ToolTipRole)
+        if not levels:
+            is_oc_empty = agent_id == "opencode" and not effective_model
+            label = "モデル要" if is_oc_empty else "非対応"
+            tip = (
+                "OpenCode でエフォートを指定するには先にモデルを選択してください"
+                if is_oc_empty
+                else f"{effective_model or '選択中のモデル'} は思考エフォートの個別指定に非対応です"
+            )
+            self._effort_combo.addItem(label, "")
+            self._effort_combo.setItemData(0, tip, Qt.ItemDataRole.ToolTipRole)
+            self._effort_combo.setToolTip(tip)
+            self._effort_combo.setEnabled(False)
+            self._effort_combo.setCurrentIndex(0)
+            return
+
+        hint = adapter.default_effort_hint(effective_model)
+        def_short = f"既定({EFFORT_SHORT_LABELS.get(hint, hint)})" if hint else EFFORT_SHORT_LABELS[""]
+        def_tip = (
+            f"（既定: {EFFORT_DISPLAY_LABELS.get(hint, hint)}）"
+            if hint
+            else EFFORT_DISPLAY_LABELS[""]
+        )
+        self._effort_combo.setEnabled(True)
+        self._effort_combo.setToolTip("思考エフォート（推論の深さ）を選択")
+        self._effort_combo.addItem(def_short, "")
+        self._effort_combo.setItemData(0, def_tip, Qt.ItemDataRole.ToolTipRole)
         for lv in levels:
             idx = self._effort_combo.count()
             self._effort_combo.addItem(EFFORT_SHORT_LABELS.get(lv, lv), lv)
@@ -1402,7 +1424,7 @@ class BubblePanel(QWidget):
                 idx, EFFORT_DISPLAY_LABELS.get(lv, lv), Qt.ItemDataRole.ToolTipRole
             )
 
-        if saved_effort:
+        if saved_effort and saved_effort in levels:
             idx = self._effort_combo.findData(saved_effort)
             self._effort_combo.setCurrentIndex(idx if idx >= 0 else 0)
         else:
@@ -3765,6 +3787,10 @@ class BubblePanel(QWidget):
             self._config.models_by_agent[aid] = model_name
         else:
             self._config.models_by_agent.pop(aid, None)
+        adapter = self._router.get_adapter(aid)
+        cur_eff = normalize_effort((getattr(self._config, "efforts_by_agent", {}) or {}).get(aid, ""))
+        if cur_eff and cur_eff not in adapter.supported_efforts(model_name):
+            self._config.efforts_by_agent.pop(aid, None)
         self._updating_controls = True
         try:
             self._populate_effort_combo(aid, model_name)
