@@ -21,9 +21,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from sisters_mascot.agents.base import ModelChoice
+from sisters_mascot.agents.base import EFFORT_DISPLAY_LABELS, ModelChoice
 from sisters_mascot.agents.router import AGENT_IDS, AgentRouter
-from sisters_mascot.config import AppConfig, SisterAgentAssignment
+from sisters_mascot.config import AppConfig, SisterAgentAssignment, normalize_effort
 from sisters_mascot.sisters_loader import SisterProfile
 from sisters_mascot.ui.widgets import (
     DARK_DIALOG_QSS,
@@ -32,8 +32,10 @@ from sisters_mascot.ui.widgets import (
 )
 
 _DEFAULT_MODEL_LABEL = "（エージェント既定）"
-_AGENT_COMBO_WIDTH = 172
-_MODEL_COMBO_WIDTH = 250
+_DEFAULT_EFFORT_LABEL = "（既定）"
+_AGENT_COMBO_WIDTH = 165
+_MODEL_COMBO_WIDTH = 230
+_EFFORT_COMBO_WIDTH = 112
 
 
 def _short_name(display_name: str) -> str:
@@ -83,6 +85,7 @@ class _SisterRowControls:
     enabled_check: QCheckBox | None
     agent_combo: QComboBox
     model_combo: QComboBox
+    effort_combo: QComboBox
     card: QFrame | None = None
     name_lbl: QLabel | None = None
     role_lbl: QLabel | None = None
@@ -108,8 +111,8 @@ class OrchestratorTeamDialog(QDialog):
         self._checkbox_style = DarkCheckBoxStyle()
 
         self.setWindowTitle("👥 碧オーケストレーター・姉妹別AI編成")
-        self.resize(840, 680)
-        self.setMinimumSize(740, 520)
+        self.resize(960, 680)
+        self.setMinimumSize(860, 520)
         self.setStyleSheet(
             DARK_DIALOG_QSS
             + """
@@ -307,6 +310,7 @@ class OrchestratorTeamDialog(QDialog):
             ("参加 / 姉妹 · 役割", 1, 0),
             ("AIエージェント", 0, _AGENT_COMBO_WIDTH),
             ("モデル", 0, _MODEL_COMBO_WIDTH),
+            ("エフォート", 0, _EFFORT_COMBO_WIDTH),
         ):
             lbl = QLabel(text, self)
             lbl.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 700; background: transparent;")
@@ -439,12 +443,18 @@ class OrchestratorTeamDialog(QDialog):
         if model_combo.lineEdit() is not None:
             model_combo.lineEdit().setPlaceholderText(_DEFAULT_MODEL_LABEL)
 
+        effort_combo = QComboBox(row_widget)
+        effort_combo.setFixedWidth(_EFFORT_COMBO_WIDTH)
+        effort_combo.setToolTip("思考エフォート（推論の深さ）")
+        effort_combo.view().setMinimumWidth(165)
+
         controls = _SisterRowControls(
             sister_id=sister.id,
             is_orchestrator=is_orchestrator,
             enabled_check=enabled_check,
             agent_combo=agent_combo,
             model_combo=model_combo,
+            effort_combo=effort_combo,
             card=card,
             name_lbl=name_lbl,
             role_lbl=role_lbl,
@@ -452,12 +462,14 @@ class OrchestratorTeamDialog(QDialog):
         self._rows[sister.id] = controls
 
         saved_model = (assignment.model if assignment is not None else "") or ""
+        saved_effort = normalize_effort(getattr(assignment, "effort", "") if assignment is not None else "")
         self._populate_row_models(sister.id, preserve_model=saved_model)
+        self._populate_row_efforts(sister.id, preserve_effort=saved_effort)
         agent_combo.currentIndexChanged.connect(
             lambda _idx, sid=sister.id: self._on_row_agent_changed(sid)
         )
         model_combo.currentIndexChanged.connect(
-            lambda _idx, mc=model_combo: self._sync_model_combo_display(mc)
+            lambda _idx, sid=sister.id, mc=model_combo: self._on_row_model_changed(sid, mc)
         )
         if enabled_check is not None:
             enabled_check.toggled.connect(
@@ -467,6 +479,7 @@ class OrchestratorTeamDialog(QDialog):
 
         lay.addWidget(agent_combo)
         lay.addWidget(model_combo)
+        lay.addWidget(effort_combo)
         return row_widget
 
     @staticmethod
@@ -479,6 +492,7 @@ class OrchestratorTeamDialog(QDialog):
     def _apply_row_visual_state(self, ctrl: _SisterRowControls, checked: bool) -> None:
         ctrl.agent_combo.setEnabled(checked)
         ctrl.model_combo.setEnabled(checked)
+        ctrl.effort_combo.setEnabled(checked)
         if ctrl.name_lbl is not None:
             color = "#f8fafc" if checked else "#64748b"
             ctrl.name_lbl.setStyleSheet(
@@ -590,6 +604,47 @@ class OrchestratorTeamDialog(QDialog):
         finally:
             self._updating_rows = False
 
+    def _populate_row_efforts(
+        self,
+        sister_id: str,
+        *,
+        preserve_effort: str | None = None,
+    ) -> None:
+        ctrl = self._rows.get(sister_id)
+        if ctrl is None:
+            return
+        target_effort = normalize_effort(
+            ctrl.effort_combo.currentData() if preserve_effort is None else preserve_effort
+        )
+        effective_agent = self._effective_agent_for_row(ctrl)
+        effective_model = self._current_row_model_value(ctrl) or (
+            (self._config.models_by_agent.get(effective_agent, "") or "").strip()
+        )
+        adapter = self._router.get_adapter(effective_agent)
+        levels = list(adapter.supported_efforts(effective_model))
+        if target_effort and target_effort not in levels:
+            levels.append(target_effort)
+
+        combo = ctrl.effort_combo
+        self._updating_rows = True
+        try:
+            combo.clear()
+            combo.addItem(_DEFAULT_EFFORT_LABEL, "")
+            for lv in levels:
+                combo.addItem(EFFORT_DISPLAY_LABELS.get(lv, lv), lv)
+            if target_effort:
+                idx = combo.findData(target_effort)
+                combo.setCurrentIndex(idx if idx >= 0 else 0)
+            else:
+                combo.setCurrentIndex(0)
+        finally:
+            self._updating_rows = False
+
+    def _on_row_model_changed(self, sister_id: str, combo: QComboBox) -> None:
+        self._sync_model_combo_display(combo)
+        if not self._updating_rows:
+            self._populate_row_efforts(sister_id)
+
     def _on_row_agent_changed(self, sister_id: str) -> None:
         if self._updating_rows:
             return
@@ -605,6 +660,7 @@ class OrchestratorTeamDialog(QDialog):
             known_ids = set(getattr(getattr(adapter, "spec", None), "default_models", []) or [])
         kept = prev_model if prev_model and prev_model in known_ids else ""
         self._populate_row_models(sister_id, preserve_model=kept)
+        self._populate_row_efforts(sister_id)
         if effective_agent not in self._discovered_choices:
             self._router.refresh_models_async(effective_agent)
 
@@ -643,6 +699,7 @@ class OrchestratorTeamDialog(QDialog):
             self._updating_rows = False
         for sid in list(self._rows.keys()):
             self._populate_row_models(sid, preserve_model="")
+            self._populate_row_efforts(sid, preserve_effort="")
 
     def apply_to_config(self) -> None:
         """Write dialog selections back into `self._config`."""
@@ -656,11 +713,13 @@ class OrchestratorTeamDialog(QDialog):
             if aid not in AGENT_IDS:
                 aid = ""
             model = self._current_row_model_value(ctrl)
+            effort = normalize_effort(ctrl.effort_combo.currentData())
             enabled = True if ctrl.enabled_check is None else bool(ctrl.enabled_check.isChecked())
-            if aid or model or not enabled:
+            if aid or model or effort or not enabled:
                 updated[sid] = SisterAgentAssignment(
                     agent_id=aid,
                     model=model,
+                    effort=effort,
                     enabled=enabled,
                 )
         self._config.sister_assignments = updated

@@ -25,6 +25,26 @@ _MODEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,}$")
 _SKIP_PREFIXES = ("fetching", "loading", "available", "models", "usage", "#", "-", "=")
 _DONE_STATES = frozenset({"DONE", "COMPLETED", "SUCCESS"})
 _ERROR_STATES = frozenset({"ERROR", "FAILED", "FAILURE", "CANCELED", "CANCELLED", "DENIED"})
+_VALID_AGY_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_EFFORT_SUFFIX_RE = re.compile(r"^(?P<base>.+)-(?P<level>low|medium|high|xhigh|max)$", re.IGNORECASE)
+
+
+def resolve_model_and_effort(model: str, effort: str) -> tuple[str, str]:
+    """Resolve `(model, effort)` avoiding `--model <name-level> --effort=<level>` conflicts."""
+    cleaned_model = (model or "").strip()
+    cleaned_effort = (effort or "").strip().lower()
+    if cleaned_effort not in _VALID_AGY_EFFORTS:
+        return cleaned_model, ""
+    if not cleaned_model:
+        return "", cleaned_effort
+    match = _EFFORT_SUFFIX_RE.match(cleaned_model)
+    if match:
+        base = match.group("base")
+        suffix_level = match.group("level").lower()
+        if suffix_level == cleaned_effort:
+            return cleaned_model, ""
+        return base, cleaned_effort
+    return cleaned_model, cleaned_effort
 
 
 def _default_agy_binary() -> str:
@@ -136,11 +156,16 @@ class AgyAdapter(BaseAgentAdapter):
     def discover_models(self) -> list[str]:
         return [choice.id for choice in self.discover_model_choices()]
 
+    def supported_efforts(self, model: str = "") -> list[str]:
+        _ = model
+        return ["low", "medium", "high", "xhigh", "max"]
+
     def build_command(
         self,
         prompt: str,
         *,
         model: str = "",
+        effort: str = "",
         session_id: str | None = None,
         cwd: str = "",
         system_prompt: str = "",
@@ -148,9 +173,12 @@ class AgyAdapter(BaseAgentAdapter):
         attachments: Sequence[AttachmentItem] = (),
     ) -> tuple[list[str], str | None]:
         _ = system_prompt
+        eff_model, eff_effort = resolve_model_and_effort(model, effort)
         cmd = [self.resolved_binary(), "-p", prompt, "--output-format", "stream-json"]
-        if model.strip():
-            cmd.extend(["--model", model.strip()])
+        if eff_model:
+            cmd.extend(["--model", eff_model])
+        if eff_effort:
+            cmd.extend(["--effort", eff_effort])
         if session_id:
             cmd.extend(["--conversation", session_id])
         if auto_approve:

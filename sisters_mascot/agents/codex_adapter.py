@@ -24,6 +24,8 @@ from sisters_mascot.attachments import (
 )
 
 _CONFIG_MODEL_RE = re.compile(r'^\s*model\s*=\s*["\']([^"\']+)["\']')
+_VALID_CODEX_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+_DEFAULT_CODEX_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"]
 
 
 class CodexAdapter(BaseAgentAdapter):
@@ -120,11 +122,39 @@ class CodexAdapter(BaseAgentAdapter):
     def discover_models(self) -> list[str]:
         return [choice.id for choice in self.discover_model_choices()]
 
+    def supported_efforts(self, model: str = "") -> list[str]:
+        target_slug = (model or "").strip()
+        cache_path = Path.home() / ".codex" / "models_cache.json"
+        if target_slug and cache_path.is_file():
+            try:
+                data = json.loads(cache_path.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, json.JSONDecodeError):
+                data = None
+            raw_models = data.get("models") if isinstance(data, dict) else None
+            if isinstance(raw_models, list):
+                for entry in raw_models:
+                    if not isinstance(entry, dict):
+                        continue
+                    if str(entry.get("slug") or "").strip() != target_slug:
+                        continue
+                    levels = entry.get("supported_reasoning_levels")
+                    if isinstance(levels, list):
+                        found = [
+                            str(lv.get("effort") or "").strip().lower()
+                            for lv in levels
+                            if isinstance(lv, dict)
+                            and str(lv.get("effort") or "").strip().lower() in _VALID_CODEX_EFFORTS
+                        ]
+                        if found:
+                            return found
+        return list(_DEFAULT_CODEX_EFFORTS)
+
     def build_command(
         self,
         prompt: str,
         *,
         model: str = "",
+        effort: str = "",
         session_id: str | None = None,
         cwd: str = "",
         system_prompt: str = "",
@@ -134,6 +164,9 @@ class CodexAdapter(BaseAgentAdapter):
         _ = system_prompt
         binary = self.resolved_binary()
         cleaned_model = model.strip()
+        cleaned_effort = (effort or "").strip().lower()
+        if cleaned_effort not in _VALID_CODEX_EFFORTS:
+            cleaned_effort = ""
         effective_cwd = cwd.strip() or str(Path.home())
         images = collect_image_paths(attachments)
 
@@ -141,6 +174,8 @@ class CodexAdapter(BaseAgentAdapter):
             cmd = [binary, "exec", "resume", "--json", "--skip-git-repo-check"]
             if cleaned_model:
                 cmd.extend(["-m", cleaned_model])
+            if cleaned_effort:
+                cmd.extend(["-c", f'model_reasoning_effort="{cleaned_effort}"'])
             for img_path in images:
                 cmd.append(f"--image={img_path}")
             cmd.extend([session_id, "-"])
@@ -149,6 +184,8 @@ class CodexAdapter(BaseAgentAdapter):
         cmd = [binary, "exec", "--json", "--skip-git-repo-check", "-C", effective_cwd]
         if cleaned_model:
             cmd.extend(["-m", cleaned_model])
+        if cleaned_effort:
+            cmd.extend(["-c", f'model_reasoning_effort="{cleaned_effort}"'])
         if auto_approve:
             cmd.append("--approve-for-me")
         for extra_dir in collect_attachment_dirs(attachments, effective_cwd):

@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sqlite3
 import subprocess
+from pathlib import Path
 from typing import Any, Sequence
 
 from sisters_mascot.agents.base import (
@@ -20,6 +22,22 @@ from sisters_mascot.agents.base import (
 from sisters_mascot.attachments import AttachmentItem, collect_file_paths
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_VALID_OPENCODE_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+_DEFAULT_OPENCODE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+
+
+def format_model_with_effort(model: str, effort: str) -> str:
+    """Attach `#variant` to `provider/model`, replacing any prior variant when effort is set."""
+    cleaned_model = (model or "").strip()
+    cleaned_effort = (effort or "").strip().lower()
+    if not cleaned_model:
+        return ""
+    if not cleaned_effort or cleaned_effort not in _VALID_OPENCODE_EFFORTS or "/" not in cleaned_model:
+        return cleaned_model
+    base_model = cleaned_model.split("#", 1)[0].strip()
+    if not base_model or "/" not in base_model:
+        return cleaned_model
+    return f"{base_model}#{cleaned_effort}"
 
 
 class OpenCodeAdapter(BaseAgentAdapter):
@@ -88,11 +106,55 @@ class OpenCodeAdapter(BaseAgentAdapter):
     def discover_models(self) -> list[str]:
         return [choice.id for choice in self.discover_model_choices()]
 
+    def supported_efforts(self, model: str = "") -> list[str]:
+        cleaned = (model or "").strip()
+        db_path = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+        if cleaned and "/" in cleaned and db_path.is_file():
+            provider_id, rest = cleaned.split("/", 1)
+            model_id = rest.split("#", 1)[0].strip()
+            if provider_id and model_id:
+                try:
+                    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)
+                    try:
+                        row = conn.execute(
+                            "SELECT value FROM kv WHERE key='models-dev:v3:catalog'"
+                        ).fetchone()
+                    finally:
+                        conn.close()
+                    if row and row[0]:
+                        outer = json.loads(row[0])
+                        body_raw = outer.get("body") if isinstance(outer, dict) else None
+                        cat = json.loads(body_raw) if isinstance(body_raw, str) else outer
+                        if isinstance(cat, dict):
+                            m_info = (
+                                cat.get(provider_id, {})
+                                .get("models", {})
+                                .get(model_id, {})
+                            )
+                            reasoning = (
+                                m_info.get("capabilities", {}).get("reasoning", {})
+                                if isinstance(m_info, dict)
+                                else {}
+                            )
+                            efforts = reasoning.get("effort") if isinstance(reasoning, dict) else None
+                            if isinstance(efforts, list):
+                                found = [
+                                    str(e).strip().lower()
+                                    for e in efforts
+                                    if str(e).strip().lower() in _VALID_OPENCODE_EFFORTS
+                                ]
+                                if found:
+                                    return found
+                except (OSError, sqlite3.Error, json.JSONDecodeError, TypeError, ValueError):
+                    pass
+        return list(_DEFAULT_OPENCODE_EFFORTS)
+
     def build_command(
         self,
         prompt: str,
         *,
         model: str = "",
+        effort: str = "",
         session_id: str | None = None,
         cwd: str = "",
         system_prompt: str = "",
@@ -101,8 +163,9 @@ class OpenCodeAdapter(BaseAgentAdapter):
     ) -> tuple[list[str], str | None]:
         _ = cwd, system_prompt
         cmd = [self.resolved_binary(), "run", "--format", "json"]
-        if model.strip():
-            cmd.extend(["-m", model.strip()])
+        formatted_model = format_model_with_effort(model, effort)
+        if formatted_model:
+            cmd.extend(["-m", formatted_model])
         if session_id:
             cmd.extend(["-s", session_id])
         if auto_approve:

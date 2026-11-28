@@ -17,7 +17,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from sisters_mascot.agents.base import is_playwright_tool
 from sisters_mascot.agents.router import AGENT_IDS, AgentRouter, IsolatedTurnResult
 from sisters_mascot.attachments import AttachmentItem, format_attachments_for_chat_display
-from sisters_mascot.config import AppConfig, SisterAgentAssignment
+from sisters_mascot.config import AppConfig, SisterAgentAssignment, normalize_effort
 from sisters_mascot.sisters_loader import SisterProfile
 
 MAX_ORCHESTRATOR_TASKS: int = 6
@@ -58,6 +58,7 @@ class OrchestrationSubTask:
     depends_on: list[str] = field(default_factory=list)
     agent_id: str = ""
     model: str = ""
+    effort: str = ""
     fallback_note: str = ""
     dispatch_line: str = ""
     status: str = "pending"  # pending | running | done | error | skipped | cancelled
@@ -157,6 +158,26 @@ def resolve_sister_execution_target(
             return cand, fb_model, note
 
     return chosen_agent, chosen_model, ""
+
+
+def resolve_sister_effort(
+    config: AppConfig,
+    sister_id: str,
+    resolved_agent_id: str,
+    *,
+    fallback_occurred: bool = False,
+) -> str:
+    """Resolve effective reasoning effort for `sister_id` on `resolved_agent_id`."""
+    assignments = getattr(config, "sister_assignments", {}) or {}
+    assignment = assignments.get(sister_id)
+    explicit_agent = (getattr(assignment, "agent_id", "") or "").strip()
+    explicit_effort = normalize_effort(getattr(assignment, "effort", ""))
+    agent_default_effort = normalize_effort(
+        (getattr(config, "efforts_by_agent", {}) or {}).get(resolved_agent_id, "")
+    )
+    if fallback_occurred and explicit_agent and explicit_agent != resolved_agent_id:
+        return agent_default_effort
+    return explicit_effort or agent_default_effort
 
 
 def _extract_json_dict(raw_text: str) -> dict[str, Any] | None:
@@ -469,9 +490,12 @@ def build_synthesis_prompts(
         sister = sister_map.get(task.sister_id)
         sname = _short_name(sister.display_name) if sister else task.sister_id
         rank = sister.rank_label if sister else ""
+        model_spec = task.model or ""
+        if task.effort:
+            model_spec = f"{model_spec} · {task.effort}".strip(" ·")
         header = (
             f"### [{task.id}] {rank} {sname} ({task.agent_id}"
-            + (f" / {task.model}" if task.model else "")
+            + (f" / {model_spec}" if model_spec else "")
             + f") — {task.title} [{task.status}, {task.elapsed:.1f}s]"
         )
         if task.status == "done":
@@ -503,7 +527,10 @@ def build_fallback_synthesis_text(plan: OrchestrationPlan, sister_map: dict[str,
         sister = sister_map.get(task.sister_id) if sister_map else None
         sname = _short_name(sister.display_name) if sister else task.sister_id
         icon = {"done": "✅", "error": "❌", "skipped": "⏭️", "cancelled": "⏹"}.get(task.status, "•")
-        model_tag = f"{task.agent_id} / {task.model}" if task.model else task.agent_id
+        model_spec = task.model or ""
+        if task.effort:
+            model_spec = f"{model_spec} · {task.effort}".strip(" ·")
+        model_tag = f"{task.agent_id} / {model_spec}" if model_spec else task.agent_id
         lines.append(f"\n### {icon} {sname} ({model_tag}) — {task.title}")
         if task.output:
             lines.append(_clip_text(task.output, 2_000))
@@ -568,6 +595,7 @@ class OrchestratorEngine(QObject):
             sid: SisterAgentAssignment(
                 agent_id=a.agent_id,
                 model=a.model,
+                effort=getattr(a, "effort", ""),
                 enabled=a.enabled,
             )
             for sid, a in (config.sister_assignments or {}).items()
@@ -576,6 +604,7 @@ class OrchestratorEngine(QObject):
             sister_id=config.sister_id,
             agent_id=config.agent_id,
             models_by_agent=dict(config.models_by_agent),
+            efforts_by_agent=dict(getattr(config, "efforts_by_agent", {}) or {}),
             orchestrator_mode=bool(config.orchestrator_mode),
             orchestrator_confirm_plan=bool(config.orchestrator_confirm_plan),
             orchestrator_max_parallel=max(1, min(4, int(config.orchestrator_max_parallel))),
@@ -681,6 +710,9 @@ class OrchestratorEngine(QObject):
         aoi = self._sister_map.get("aoi") or self._sisters[0]
         try:
             aoi_agent, aoi_model, aoi_fb = resolve_sister_execution_target(cfg, self._router, aoi.id)
+            aoi_effort = resolve_sister_effort(
+                cfg, aoi.id, aoi_agent, fallback_occurred=bool(aoi_fb)
+            )
             if aoi_fb:
                 self._router._emit_activity("warn", f"[碧·計画] ⚠️ {aoi_fb}")
 
@@ -713,8 +745,11 @@ class OrchestratorEngine(QObject):
                 plan_user,
                 system_prompt=plan_sys,
                 model=aoi_model,
+                effort=aoi_effort,
                 cwd=cwd,
                 auto_approve=False,
+                allow_interactive=False,
+                sister_name="碧",
                 attachments=(),
                 cancel_event=cancel_event,
                 log_prefix=f"[碧·計画 / {aoi_agent}:{aoi_model or '既定'}] ",
@@ -735,6 +770,9 @@ class OrchestratorEngine(QObject):
                 t_agent, t_model, t_fb = resolve_sister_execution_target(cfg, self._router, task.sister_id)
                 task.agent_id = t_agent
                 task.model = t_model
+                task.effort = resolve_sister_effort(
+                    cfg, task.sister_id, t_agent, fallback_occurred=bool(t_fb)
+                )
                 task.fallback_note = t_fb
                 target_sister = self._sister_map.get(task.sister_id)
                 if target_sister is not None:
@@ -837,8 +875,11 @@ class OrchestratorEngine(QObject):
                     user_p,
                     system_prompt=sys_p,
                     model=task.model,
+                    effort=task.effort,
                     cwd=cwd,
                     auto_approve=bool(cfg.auto_approve),
+                    allow_interactive=True,
+                    sister_name=short,
                     attachments=attachments,
                     cancel_event=cancel_event,
                     log_prefix=prefix,
@@ -954,7 +995,10 @@ class OrchestratorEngine(QObject):
                 aoi_ret_line,
             )
 
-            aoi_agent, aoi_model, _ = resolve_sister_execution_target(cfg, self._router, aoi.id)
+            aoi_agent, aoi_model, aoi_syn_fb = resolve_sister_execution_target(cfg, self._router, aoi.id)
+            aoi_effort = resolve_sister_effort(
+                cfg, aoi.id, aoi_agent, fallback_occurred=bool(aoi_syn_fb)
+            )
             syn_sys, syn_user = build_synthesis_prompts(
                 self._router,
                 aoi,
@@ -968,8 +1012,11 @@ class OrchestratorEngine(QObject):
                 syn_user,
                 system_prompt=syn_sys,
                 model=aoi_model,
+                effort=aoi_effort,
                 cwd=cwd,
                 auto_approve=False,
+                allow_interactive=False,
+                sister_name="碧",
                 attachments=(),
                 cancel_event=cancel_event,
                 log_prefix=f"[碧·統合 / {aoi_agent}:{aoi_model or '既定'}] ",

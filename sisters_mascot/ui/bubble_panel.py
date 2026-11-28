@@ -21,6 +21,7 @@ from PyQt6.QtGui import (
     QGuiApplication,
 )
 from PyQt6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -36,6 +37,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizeGrip,
     QSlider,
@@ -48,7 +50,16 @@ from PyQt6.QtWidgets import (
 )
 
 from sisters_mascot import USER_SPRITES_DIR
-from sisters_mascot.agents.base import ModelChoice
+from sisters_mascot.agents.base import (
+    EFFORT_DISPLAY_LABELS,
+    EFFORT_SHORT_LABELS,
+    ModelChoice,
+)
+from sisters_mascot.agents.interaction import (
+    InteractionField,
+    InteractionRequest,
+    InteractionResponse,
+)
 from sisters_mascot.agents.orchestrator import (
     OrchestrationPlan,
     OrchestrationSubTask,
@@ -77,6 +88,7 @@ from sisters_mascot.config import (
     BookmarkItem,
     FolderItem,
     QuickPromptItem,
+    normalize_effort,
 )
 from sisters_mascot.launcher.actions import launch_app, open_bookmark, open_folder
 from sisters_mascot.sisters_loader import (
@@ -329,6 +341,11 @@ class BubblePanel(QWidget):
         self._streaming_text: str | None = None
         self._discovered_choices: dict[str, list[ModelChoice]] = {}
         self._manual_refresh_pending: set[str] = set()
+        self._pending_interaction_queue: list[InteractionRequest] = []
+        self._active_interaction: InteractionRequest | None = None
+        self._interaction_field_getters: list[tuple[str, Any]] = []
+        self._queued_prompts: list[dict[str, Any]] = []
+        self._committed_stream_prefix: str = ""
         self._header_drag_pos: QPoint | None = None
         self._ever_shown: bool = False
 
@@ -472,6 +489,13 @@ class BubblePanel(QWidget):
             self._model_combo.lineEdit().editingFinished.connect(self._on_model_edited)
         self._model_combo.activated.connect(self._on_model_activated)
         row2.addWidget(self._model_combo, 1)
+
+        self._effort_combo = QComboBox(self._header_widget)
+        self._effort_combo.setFixedWidth(92)
+        self._effort_combo.setToolTip("思考エフォート（推論の深さ）を選択")
+        self._effort_combo.view().setMinimumWidth(165)
+        self._effort_combo.currentIndexChanged.connect(self._on_effort_combo_changed)
+        row2.addWidget(self._effort_combo)
 
         self._refresh_models_btn = QToolButton(self._header_widget)
         self._refresh_models_btn.setText("↻")
@@ -690,6 +714,70 @@ class BubblePanel(QWidget):
         self._orch_board.hide()
         layout.addWidget(self._orch_board)
 
+        # Unified interactive permission / form / question approval card
+        self._interaction_card = QFrame(tab)
+        self._interaction_card.setStyleSheet(
+            "QFrame { background-color: rgba(24, 29, 54, 238); "
+            "border: 1px solid rgba(251, 191, 36, 0.72); border-radius: 11px; }"
+        )
+        inter_lay = QVBoxLayout(self._interaction_card)
+        inter_lay.setContentsMargins(10, 8, 10, 8)
+        inter_lay.setSpacing(6)
+
+        inter_hdr = QHBoxLayout()
+        inter_hdr.setSpacing(6)
+        self._interaction_title_lbl = QLabel("🔐 確認のお願い", self._interaction_card)
+        self._interaction_title_lbl.setWordWrap(True)
+        self._interaction_title_lbl.setStyleSheet(
+            "border: none; background: transparent; font-size: 12px; font-weight: 700; color: #fde68a;"
+        )
+        inter_hdr.addWidget(self._interaction_title_lbl, 1)
+
+        self._interaction_queue_lbl = QLabel("", self._interaction_card)
+        self._interaction_queue_lbl.setStyleSheet(
+            "border: 1px solid rgba(251, 191, 36, 0.5); border-radius: 9px; "
+            "background-color: rgba(217, 119, 6, 0.25); padding: 1px 7px; "
+            "font-size: 10.5px; color: #fef3c7; font-weight: 700;"
+        )
+        self._interaction_queue_lbl.hide()
+        inter_hdr.addWidget(self._interaction_queue_lbl)
+        inter_lay.addLayout(inter_hdr)
+
+        self._interaction_desc_lbl = QLabel("", self._interaction_card)
+        self._interaction_desc_lbl.setWordWrap(True)
+        self._interaction_desc_lbl.setStyleSheet(
+            "border: none; background: transparent; font-size: 11.5px; color: #e2e8f0;"
+        )
+        inter_lay.addWidget(self._interaction_desc_lbl)
+
+        self._interaction_detail_view = QPlainTextEdit(self._interaction_card)
+        self._interaction_detail_view.setReadOnly(True)
+        self._interaction_detail_view.setMaximumHeight(88)
+        self._interaction_detail_view.setStyleSheet(
+            "QPlainTextEdit { background-color: rgba(8, 11, 22, 235); color: #cbd5e1; "
+            "border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 7px; "
+            "font-family: monospace; font-size: 10.5px; padding: 4px 6px; }"
+        )
+        self._interaction_detail_view.hide()
+        inter_lay.addWidget(self._interaction_detail_view)
+
+        self._interaction_fields_container = QWidget(self._interaction_card)
+        self._interaction_fields_container.setStyleSheet("background: transparent; border: none;")
+        self._interaction_fields_layout = QVBoxLayout(self._interaction_fields_container)
+        self._interaction_fields_layout.setContentsMargins(0, 0, 0, 0)
+        self._interaction_fields_layout.setSpacing(6)
+        inter_lay.addWidget(self._interaction_fields_container)
+
+        self._interaction_actions_container = QWidget(self._interaction_card)
+        self._interaction_actions_container.setStyleSheet("background: transparent; border: none;")
+        self._interaction_actions_layout = QHBoxLayout(self._interaction_actions_container)
+        self._interaction_actions_layout.setContentsMargins(0, 2, 0, 0)
+        self._interaction_actions_layout.setSpacing(6)
+        inter_lay.addWidget(self._interaction_actions_container)
+
+        self._interaction_card.hide()
+        layout.addWidget(self._interaction_card)
+
         self._status_bar = QLabel(tab)
         self._status_bar.setStyleSheet(_STATUS_STYLE_NORMAL)
         self._status_bar.hide()
@@ -787,6 +875,34 @@ class BubblePanel(QWidget):
         self._attachments_bar.hide()
         layout.addWidget(self._attachments_bar)
 
+        # Queued mid-turn follow-up messages bar
+        self._queued_bar = QWidget(tab)
+        q_bar_lay = QHBoxLayout(self._queued_bar)
+        q_bar_lay.setContentsMargins(0, 0, 0, 0)
+        q_bar_lay.setSpacing(4)
+
+        self._queued_scroll = QScrollArea(self._queued_bar)
+        self._queued_scroll.setWidgetResizable(True)
+        self._queued_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._queued_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._queued_scroll.setFixedHeight(32)
+        self._queued_container = QWidget()
+        self._queued_layout = QHBoxLayout(self._queued_container)
+        self._queued_layout.setContentsMargins(0, 1, 0, 1)
+        self._queued_layout.setSpacing(5)
+        self._queued_scroll.setWidget(self._queued_container)
+        q_bar_lay.addWidget(self._queued_scroll, 1)
+
+        self._clear_queued_btn = QToolButton(self._queued_bar)
+        self._clear_queued_btn.setText("✕")
+        self._clear_queued_btn.setFixedSize(22, 22)
+        self._clear_queued_btn.setToolTip("予約中の追加メッセージをすべて解除")
+        self._clear_queued_btn.clicked.connect(self.clear_queued_prompts)
+        q_bar_lay.addWidget(self._clear_queued_btn)
+
+        self._queued_bar.hide()
+        layout.addWidget(self._queued_bar)
+
         # Input row
         input_row = QHBoxLayout()
         input_row.setSpacing(6)
@@ -808,14 +924,31 @@ class BubblePanel(QWidget):
         btn_col = QVBoxLayout()
         btn_col.setSpacing(4)
 
+        top_btn_row = QHBoxLayout()
+        top_btn_row.setSpacing(4)
         self._mic_btn = QPushButton("🎤", tab)
-        self._mic_btn.setFixedSize(64, 26)
+        self._mic_btn.setFixedHeight(26)
+        self._mic_btn.setMinimumWidth(36)
         self._mic_btn.setToolTip("音声入力を録音 / 停止")
         self._mic_btn.clicked.connect(self._on_mic_clicked)
-        btn_col.addWidget(self._mic_btn)
+        top_btn_row.addWidget(self._mic_btn, 1)
+
+        self._stop_btn = QToolButton(tab)
+        self._stop_btn.setText("⏹")
+        self._stop_btn.setFixedSize(28, 26)
+        self._stop_btn.setToolTip("実行中の処理を停止")
+        self._stop_btn.setStyleSheet(
+            "QToolButton { background-color: rgba(225, 29, 72, 0.78); "
+            "border: 1px solid #fda4af; border-radius: 7px; color: #fff; font-weight: 700; }"
+            "QToolButton:hover { background-color: rgba(244, 63, 94, 0.92); }"
+        )
+        self._stop_btn.clicked.connect(self._stop_active_run)
+        self._stop_btn.hide()
+        top_btn_row.addWidget(self._stop_btn)
+        btn_col.addLayout(top_btn_row)
 
         self._send_btn = QPushButton("送信", tab)
-        self._send_btn.setFixedSize(64, 28)
+        self._send_btn.setFixedSize(72, 28)
         self._send_btn.clicked.connect(self._on_send_or_stop)
         btn_col.addWidget(self._send_btn)
 
@@ -1118,6 +1251,7 @@ class BubblePanel(QWidget):
                 self._agent_combo.setCurrentIndex(aidx)
 
             self._populate_model_combo(self._config.agent_id)
+            self._populate_effort_combo(self._config.agent_id)
             self._sync_mute_button()
 
             orch_on = bool(getattr(self._config, "orchestrator_mode", False))
@@ -1243,6 +1377,36 @@ class BubblePanel(QWidget):
         else:
             self._model_combo.setCurrentIndex(0)
             self._model_combo.setEditText("")
+
+    def _populate_effort_combo(self, agent_id: str, model: str | None = None) -> None:
+        if not hasattr(self, "_effort_combo"):
+            return
+        effective_model = (
+            model.strip()
+            if model is not None
+            else (self._config.models_by_agent.get(agent_id, "") or "").strip()
+        )
+        adapter = self._router.get_adapter(agent_id)
+        levels = list(adapter.supported_efforts(effective_model))
+        saved_effort = normalize_effort((getattr(self._config, "efforts_by_agent", {}) or {}).get(agent_id, ""))
+        if saved_effort and saved_effort not in levels:
+            levels.append(saved_effort)
+
+        self._effort_combo.clear()
+        self._effort_combo.addItem(EFFORT_SHORT_LABELS[""], "")
+        self._effort_combo.setItemData(0, EFFORT_DISPLAY_LABELS[""], Qt.ItemDataRole.ToolTipRole)
+        for lv in levels:
+            idx = self._effort_combo.count()
+            self._effort_combo.addItem(EFFORT_SHORT_LABELS.get(lv, lv), lv)
+            self._effort_combo.setItemData(
+                idx, EFFORT_DISPLAY_LABELS.get(lv, lv), Qt.ItemDataRole.ToolTipRole
+            )
+
+        if saved_effort:
+            idx = self._effort_combo.findData(saved_effort)
+            self._effort_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        else:
+            self._effort_combo.setCurrentIndex(0)
 
     def reposition_near_mascot(self, mascot_rect: QRect) -> None:
         """Anchor panel cleanly beside MascotWindow, auto-flipping and clamping."""
@@ -1633,10 +1797,14 @@ class BubblePanel(QWidget):
             self._turn_warn_count = 0
             self._stall_notified = False
             self._base_status_text = status or "✨ 考え中…"
-            self._send_btn.setText("⏹ 停止")
-            self._send_btn.setStyleSheet(
-                "background-color: rgba(225, 29, 72, 0.72); border-color: #fda4af; color: #fff;"
+            self._send_btn.setText("📨 追送")
+            self._send_btn.setToolTip(
+                "実行中でも追加メッセージを送れます（ライブ反映または完了後に自動送信）"
             )
+            self._send_btn.setStyleSheet(
+                "background-color: rgba(79, 70, 229, 0.68); border-color: #a5b4fc; color: #fff;"
+            )
+            self._stop_btn.show()
             self._activity_tick_timer.start()
             self._on_activity_tick()
         else:
@@ -1645,7 +1813,9 @@ class BubblePanel(QWidget):
             self._last_activity_ts = None
             self._stall_notified = False
             self._base_status_text = ""
+            self._stop_btn.hide()
             self._send_btn.setText("送信")
+            self._send_btn.setToolTip("")
             self._send_btn.setStyleSheet("")
             self._status_bar.setStyleSheet(_STATUS_STYLE_NORMAL)
             self._status_bar.hide()
@@ -1771,9 +1941,20 @@ class BubblePanel(QWidget):
             return
         now = time.monotonic()
         elapsed = max(0.0, now - self._run_started_ts)
-        idle = max(0.0, now - (self._last_activity_ts or self._run_started_ts))
         mins, secs = divmod(int(elapsed), 60)
         elapsed_str = f"{mins:02d}:{secs:02d}"
+
+        if self._active_interaction is not None:
+            self._last_activity_ts = now
+            self._stall_notified = False
+            self._status_bar.setStyleSheet(_STATUS_STYLE_WARN)
+            self._status_bar.setText(
+                f"🔐 確認待ち: {self._active_interaction.title} · 経過 {elapsed_str}"
+            )
+            self._status_bar.show()
+            return
+
+        idle = max(0.0, now - (self._last_activity_ts or self._run_started_ts))
         base = self._base_status_text or "✨ 考え中…"
         err_suffix = (
             f" · ⚠️エラー{self._turn_error_count}件"
@@ -1827,13 +2008,21 @@ class BubblePanel(QWidget):
         _ = partial_text
         self._stream_flush_timer.stop()
         self._streaming_text = None
+        self._committed_stream_prefix = ""
+        self._clear_all_interactions()
         self.set_running_state(False)
         self._render_chat_log()
         self._refresh_context_bar()
 
     def finalize_stream_reply(self, full_text: str) -> None:
         self._stream_flush_timer.stop()
-        final_text = (full_text or self._streaming_text or "").strip()
+        raw_final = full_text if full_text else (self._committed_stream_prefix + (self._streaming_text or ""))
+        if self._committed_stream_prefix and raw_final.startswith(self._committed_stream_prefix):
+            raw_final = raw_final[len(self._committed_stream_prefix) :]
+        elif self._committed_stream_prefix and self._streaming_text is not None:
+            raw_final = self._streaming_text
+        self._committed_stream_prefix = ""
+        final_text = raw_final.strip()
         self._streaming_text = None
 
         turn_agent = self._pending_turn_agent_id or self._config.agent_id
@@ -1875,9 +2064,12 @@ class BubblePanel(QWidget):
         self._refresh_context_bar()
         self.conversation_changed.emit()
         self._maybe_warn_or_auto_compact()
+        self._schedule_queued_dispatch()
 
     def append_error_message(self, err: str) -> None:
         self._stream_flush_timer.stop()
+        self._clear_all_interactions()
+        self._committed_stream_prefix = ""
         now_str = datetime.now().strftime("%H:%M")
         if self._streaming_text:
             turn_agent = self._pending_turn_agent_id or self._config.agent_id
@@ -1938,6 +2130,7 @@ class BubblePanel(QWidget):
             self._updating_controls = True
             try:
                 self._populate_model_combo(agent_id)
+                self._populate_effort_combo(agent_id)
             finally:
                 self._updating_controls = False
 
@@ -2344,6 +2537,7 @@ class BubblePanel(QWidget):
 
         compact_prompt = self._conversation.build_compaction_prompt()
         model = (self._config.models_by_agent.get(agent_id, "") or "").strip()
+        effort = normalize_effort((getattr(self._config, "efforts_by_agent", {}) or {}).get(agent_id, ""))
         cwd = (self._config.working_dir or str(Path.home())).strip() or str(Path.home())
 
         self._compacting = True
@@ -2352,6 +2546,7 @@ class BubblePanel(QWidget):
             agent_id,
             compact_prompt,
             model=model,
+            effort=effort,
             cwd=cwd,
         )
         if not started:
@@ -2371,6 +2566,7 @@ class BubblePanel(QWidget):
         else:
             label = f"{self._config.agent_id} AI要約"
         self.apply_compacted_summary(clean, method_label=label)
+        self._schedule_queued_dispatch()
 
     def handle_compact_error(self, err: str) -> None:
         """Reset compaction state and inform user when AI compaction fails."""
@@ -2472,7 +2668,10 @@ class BubblePanel(QWidget):
             sname = _short_name(sister.display_name) if sister else task.sister_id
             rank = sister.rank_label if sister else ""
             accent = sister.accent_color if sister else "#818cf8"
-            model_tag = f"{task.agent_id} / {task.model}" if task.model else task.agent_id
+            model_spec = task.model or ""
+            if getattr(task, "effort", ""):
+                model_spec = f"{model_spec} · {task.effort}".strip(" ·")
+            model_tag = f"{task.agent_id} / {model_spec}" if model_spec else task.agent_id
 
             row_frame = QFrame(self._orch_tasks_container)
             row_frame.setStyleSheet(
@@ -2554,7 +2753,10 @@ class BubblePanel(QWidget):
         sname = _short_name(sister.display_name) if sister else task.sister_id
         rank = sister.rank_label if sister else ""
         accent = sister.accent_color if sister else "#818cf8"
-        model_tag = f"{task.agent_id} / {task.model}" if task.model else task.agent_id
+        model_spec = task.model or ""
+        if getattr(task, "effort", ""):
+            model_spec = f"{model_spec} · {task.effort}".strip(" ·")
+        model_tag = f"{task.agent_id} / {model_spec}" if model_spec else task.agent_id
         elapsed_suffix = f" · {task.elapsed:.1f}s" if task.elapsed > 0 else ""
 
         body = (task.output or "").strip()
@@ -2646,6 +2848,7 @@ class BubblePanel(QWidget):
         self._refresh_context_bar()
         self.conversation_changed.emit()
         self._maybe_warn_or_auto_compact()
+        self._schedule_queued_dispatch()
 
     def handle_orch_cancelled(self, summary_text: str) -> None:
         _ = summary_text
@@ -2654,6 +2857,7 @@ class BubblePanel(QWidget):
         self._orch_synthesis_streaming = False
         self._orch_approval_row.hide()
         self._orch_board.hide()
+        self._clear_all_interactions()
         if not self._messages or "中断しました" not in str(self._messages[-1].get("text", "")):
             self._messages.append(
                 {
@@ -2675,7 +2879,391 @@ class BubblePanel(QWidget):
         self._orch_synthesis_streaming = False
         self._orch_approval_row.hide()
         self._orch_board.hide()
+        self._clear_all_interactions()
         self.append_error_message(err)
+
+    # Interactive approvals, forms & questions
+    def handle_interaction_requested(self, req: InteractionRequest) -> None:
+        """Queue an interactive approval/form/question request and show it if idle."""
+        if req.is_resolved():
+            return
+        if self._active_interaction is not None and self._active_interaction.request_id == req.request_id:
+            return
+        if any(q.request_id == req.request_id for q in self._pending_interaction_queue):
+            return
+        self._pending_interaction_queue.append(req)
+        self._last_activity_ts = time.monotonic()
+        self._stall_notified = False
+        if self._active_interaction is None:
+            self._show_next_interaction()
+        else:
+            self._update_interaction_queue_badge()
+
+    def handle_interaction_resolved(self, request_id: str) -> None:
+        """Dismiss the interaction card when `request_id` is settled or cancelled."""
+        self._pending_interaction_queue = [
+            r for r in self._pending_interaction_queue if r.request_id != request_id
+        ]
+        if self._active_interaction is not None and self._active_interaction.request_id == request_id:
+            self._active_interaction = None
+            self._interaction_field_getters.clear()
+            self._show_next_interaction()
+        else:
+            self._update_interaction_queue_badge()
+
+    def _clear_all_interactions(self) -> None:
+        active = self._active_interaction
+        queued = list(self._pending_interaction_queue)
+        self._active_interaction = None
+        self._pending_interaction_queue.clear()
+        self._interaction_field_getters.clear()
+        self._clear_layout(self._interaction_fields_layout)
+        self._clear_layout(self._interaction_actions_layout)
+        if hasattr(self, "_interaction_card"):
+            self._interaction_card.hide()
+        for r in [active, *queued]:
+            if r is not None and not r.is_resolved():
+                r.cancel("中断されました")
+
+    def _update_interaction_queue_badge(self) -> None:
+        total_waiting = (1 if self._active_interaction else 0) + len(self._pending_interaction_queue)
+        if total_waiting > 1:
+            self._interaction_queue_lbl.setText(f"1 / {total_waiting}")
+            self._interaction_queue_lbl.show()
+        else:
+            self._interaction_queue_lbl.hide()
+
+    def _submit_interaction_response(self, resp: InteractionResponse) -> None:
+        req = self._active_interaction
+        if req is None:
+            return
+        self._active_interaction = None
+        self._interaction_field_getters.clear()
+        if not self._router.resolve_interaction(req.request_id, resp):
+            req.resolve(resp)
+        self._last_activity_ts = time.monotonic()
+        self._stall_notified = False
+        self._show_next_interaction()
+        if self._run_started_ts is not None:
+            self._on_activity_tick()
+
+    def _submit_interaction_fields(self) -> None:
+        answers: dict[str, Any] = {}
+        for key, getter in self._interaction_field_getters:
+            val = getter()
+            if val is not None:
+                answers[key] = val
+        self._submit_interaction_response(InteractionResponse(answers=answers))
+
+    def _show_next_interaction(self) -> None:
+        while self._pending_interaction_queue and self._pending_interaction_queue[0].is_resolved():
+            self._pending_interaction_queue.pop(0)
+
+        self._interaction_field_getters.clear()
+        self._clear_layout(self._interaction_fields_layout)
+        self._clear_layout(self._interaction_actions_layout)
+
+        if not self._pending_interaction_queue:
+            self._active_interaction = None
+            self._interaction_card.hide()
+            return
+
+        req = self._pending_interaction_queue.pop(0)
+        self._active_interaction = req
+        who = f"{req.sister_name} · " if req.sister_name else ""
+        self._interaction_title_lbl.setText(f"🔐 {who}{req.title}")
+        if req.description:
+            self._interaction_desc_lbl.setText(req.description)
+            self._interaction_desc_lbl.show()
+        else:
+            self._interaction_desc_lbl.hide()
+
+        if req.detail:
+            self._interaction_detail_view.setPlainText(req.detail)
+            self._interaction_detail_view.show()
+        else:
+            self._interaction_detail_view.hide()
+
+        self._update_interaction_queue_badge()
+
+        # Single simple choice field -> 1-click shortcut buttons
+        if (
+            len(req.fields) == 1
+            and req.fields[0].field_type == "choice"
+            and not req.fields[0].allow_custom
+            and req.fields[0].options
+        ):
+            fld = req.fields[0]
+            if fld.description:
+                hint = QLabel(fld.description, self._interaction_fields_container)
+                hint.setWordWrap(True)
+                hint.setStyleSheet("color: #cbd5e1; font-size: 11px;")
+                self._interaction_fields_layout.addWidget(hint)
+            for opt in fld.options:
+                btn = QPushButton(opt.label, self._interaction_fields_container)
+                if opt.description:
+                    btn.setToolTip(opt.description)
+                btn.setStyleSheet(
+                    "QPushButton { text-align: left; padding: 6px 10px; "
+                    "background-color: rgba(45, 55, 92, 225); "
+                    "border: 1px solid rgba(129, 140, 248, 0.45); border-radius: 8px; }"
+                    "QPushButton:hover { background-color: rgba(79, 70, 229, 0.72); border-color: #a5b4fc; }"
+                )
+                btn.clicked.connect(
+                    lambda _=False, k=fld.key, v=opt.value: self._submit_interaction_response(
+                        InteractionResponse(answers={k: v})
+                    )
+                )
+                self._interaction_fields_layout.addWidget(btn)
+            cancel_btn = QPushButton("✕ キャンセル", self._interaction_actions_container)
+            cancel_btn.setStyleSheet(
+                "QPushButton { background-color: rgba(225, 29, 72, 0.35); "
+                "border: 1px solid rgba(251, 113, 133, 0.65); color: #ffe4e6; }"
+            )
+            cancel_btn.clicked.connect(
+                lambda: self._submit_interaction_response(InteractionResponse(cancelled=True))
+            )
+            self._interaction_actions_layout.addStretch(1)
+            self._interaction_actions_layout.addWidget(cancel_btn)
+        elif req.fields:
+            for fld in req.fields:
+                self._add_interaction_field_widget(fld)
+            submit_btn = QPushButton("✅ 送信", self._interaction_actions_container)
+            submit_btn.setStyleSheet(
+                "QPushButton { background-color: rgba(16, 185, 129, 0.48); "
+                "border: 1px solid rgba(52, 211, 153, 0.8); color: #ecfdf5; font-weight: 700; }"
+                "QPushButton:hover { background-color: rgba(16, 185, 129, 0.68); }"
+            )
+            submit_btn.clicked.connect(self._submit_interaction_fields)
+            cancel_btn = QPushButton("✕ キャンセル", self._interaction_actions_container)
+            cancel_btn.setStyleSheet(
+                "QPushButton { background-color: rgba(225, 29, 72, 0.35); "
+                "border: 1px solid rgba(251, 113, 133, 0.65); color: #ffe4e6; }"
+            )
+            cancel_btn.clicked.connect(
+                lambda: self._submit_interaction_response(InteractionResponse(cancelled=True))
+            )
+            self._interaction_actions_layout.addWidget(submit_btn, 1)
+            self._interaction_actions_layout.addWidget(cancel_btn)
+        else:
+            btn_styles = {
+                "success": (
+                    "QPushButton { background-color: rgba(16, 185, 129, 0.42); "
+                    "border: 1px solid rgba(52, 211, 153, 0.78); color: #ecfdf5; font-weight: 700; }"
+                    "QPushButton:hover { background-color: rgba(16, 185, 129, 0.64); }"
+                ),
+                "primary": (
+                    "QPushButton { background-color: rgba(79, 70, 229, 0.48); "
+                    "border: 1px solid rgba(129, 140, 248, 0.78); color: #eef2ff; font-weight: 600; }"
+                    "QPushButton:hover { background-color: rgba(99, 102, 241, 0.70); }"
+                ),
+                "danger": (
+                    "QPushButton { background-color: rgba(225, 29, 72, 0.36); "
+                    "border: 1px solid rgba(251, 113, 133, 0.72); color: #ffe4e6; }"
+                    "QPushButton:hover { background-color: rgba(225, 29, 72, 0.56); }"
+                ),
+                "secondary": (
+                    "QPushButton { background-color: rgba(51, 65, 95, 210); "
+                    "border: 1px solid rgba(148, 163, 184, 0.35); color: #e2e8f0; }"
+                ),
+            }
+            for act in req.actions:
+                b = QPushButton(act.label, self._interaction_actions_container)
+                b.setStyleSheet(btn_styles.get(act.style, btn_styles["secondary"]))
+                b.clicked.connect(
+                    lambda _=False, aid=act.id: self._submit_interaction_response(
+                        InteractionResponse(action_id=aid)
+                    )
+                )
+                self._interaction_actions_layout.addWidget(b, 1)
+
+        apply_dark_checkbox_style(self._interaction_card, self._checkbox_style)
+        self._interaction_card.show()
+        if self._run_started_ts is not None:
+            self._on_activity_tick()
+
+    def _add_interaction_field_widget(self, fld: InteractionField) -> None:
+        hdr_txt = fld.title or fld.key
+        lbl = QLabel(hdr_txt, self._interaction_fields_container)
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet("font-size: 11.5px; font-weight: 700; color: #f8fafc;")
+        self._interaction_fields_layout.addWidget(lbl)
+
+        if fld.description:
+            dlbl = QLabel(fld.description, self._interaction_fields_container)
+            dlbl.setWordWrap(True)
+            dlbl.setStyleSheet("font-size: 10.5px; color: #94a3b8;")
+            self._interaction_fields_layout.addWidget(dlbl)
+
+        if fld.field_type == "external" and fld.url:
+            open_btn = QPushButton(f"🌐 ブラウザで開く: {fld.url}", self._interaction_fields_container)
+            open_btn.clicked.connect(
+                lambda _=False, u=fld.url: QDesktopServices.openUrl(QUrl(u))
+            )
+            self._interaction_fields_layout.addWidget(open_btn)
+            self._interaction_field_getters.append((fld.key, lambda u=fld.url: u))
+            return
+
+        if fld.field_type == "boolean":
+            cb = QCheckBox(fld.title or "はい", self._interaction_fields_container)
+            cb.setChecked(bool(fld.default))
+            self._interaction_fields_layout.addWidget(cb)
+            self._interaction_field_getters.append((fld.key, lambda c=cb: c.isChecked()))
+            return
+
+        if fld.field_type == "multiselect" and fld.options:
+            checks: list[tuple[str, QCheckBox]] = []
+            default_vals = set(str(x) for x in fld.default) if isinstance(fld.default, list) else set()
+            for opt in fld.options:
+                cb = QCheckBox(opt.label, self._interaction_fields_container)
+                if opt.description:
+                    cb.setToolTip(opt.description)
+                cb.setChecked(opt.value in default_vals)
+                self._interaction_fields_layout.addWidget(cb)
+                checks.append((opt.value, cb))
+            custom_edit: QLineEdit | None = None
+            if fld.allow_custom:
+                custom_edit = QLineEdit(self._interaction_fields_container)
+                custom_edit.setPlaceholderText("その他の入力（任意）…")
+                self._interaction_fields_layout.addWidget(custom_edit)
+
+            def _get_multi(cks=checks, ce=custom_edit) -> list[str]:
+                picked = [v for v, c in cks if c.isChecked()]
+                if ce is not None and ce.text().strip():
+                    picked.append(ce.text().strip())
+                return picked
+
+            self._interaction_field_getters.append((fld.key, _get_multi))
+            return
+
+        if fld.field_type == "choice" and fld.options:
+            group = QButtonGroup(self._interaction_fields_container)
+            radios: list[tuple[str, QRadioButton]] = []
+            for idx, opt in enumerate(fld.options):
+                rb = QRadioButton(opt.label, self._interaction_fields_container)
+                rb.setStyleSheet("color: #e2e8f0; font-size: 11.5px;")
+                if opt.description:
+                    rb.setToolTip(opt.description)
+                if (fld.default is not None and str(fld.default) == opt.value) or (
+                    fld.default is None and idx == 0
+                ):
+                    rb.setChecked(True)
+                group.addButton(rb)
+                self._interaction_fields_layout.addWidget(rb)
+                radios.append((opt.value, rb))
+
+            custom_edit = None
+            custom_radio = None
+            if fld.allow_custom:
+                custom_row = QHBoxLayout()
+                custom_radio = QRadioButton("その他:", self._interaction_fields_container)
+                custom_radio.setStyleSheet("color: #e2e8f0; font-size: 11.5px;")
+                group.addButton(custom_radio)
+                custom_edit = QLineEdit(self._interaction_fields_container)
+                custom_edit.setPlaceholderText("自由入力…")
+                custom_edit.textEdited.connect(lambda _t, cr=custom_radio: cr.setChecked(True))
+                custom_row.addWidget(custom_radio)
+                custom_row.addWidget(custom_edit, 1)
+                self._interaction_fields_layout.addLayout(custom_row)
+
+            def _get_choice(rbs=radios, cr=custom_radio, ce=custom_edit) -> str:
+                if cr is not None and cr.isChecked() and ce is not None:
+                    return ce.text().strip()
+                for v, r in rbs:
+                    if r.isChecked():
+                        return v
+                return rbs[0][0] if rbs else ""
+
+            self._interaction_field_getters.append((fld.key, _get_choice))
+            return
+
+        edit = QLineEdit(self._interaction_fields_container)
+        if fld.placeholder:
+            edit.setPlaceholderText(fld.placeholder)
+        if fld.default is not None:
+            edit.setText(str(fld.default))
+        if fld.is_secret:
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._interaction_fields_layout.addWidget(edit)
+
+        if fld.field_type == "number":
+            def _get_num(ed=edit) -> Any:
+                raw = ed.text().strip()
+                if not raw:
+                    return None
+                try:
+                    return int(raw) if "." not in raw else float(raw)
+                except ValueError:
+                    return raw
+
+            self._interaction_field_getters.append((fld.key, _get_num))
+        else:
+            self._interaction_field_getters.append((fld.key, lambda ed=edit: ed.text().strip()))
+
+    # Mid-turn queued follow-up helpers
+    def _rebuild_queued_bar(self) -> None:
+        self._clear_layout(self._queued_layout)
+        for idx, item in enumerate(self._queued_prompts):
+            raw = str(item.get("text") or "").strip()
+            atts = item.get("attachments") or []
+            snippet = " ".join(raw.split()) if raw else f"📎 {len(atts)}件の添付"
+            if len(snippet) > 28:
+                snippet = snippet[:27] + "…"
+            chip = QFrame(self._queued_container)
+            chip.setToolTip(raw or "添付送信予約")
+            chip.setStyleSheet(
+                "QFrame { background-color: rgba(16, 185, 129, 0.16); "
+                "border: 1px solid rgba(52, 211, 153, 0.45); border-radius: 11px; }"
+            )
+            c_lay = QHBoxLayout(chip)
+            c_lay.setContentsMargins(7, 1, 4, 1)
+            c_lay.setSpacing(4)
+            lbl = QLabel(f"📨 待機: {snippet}", chip)
+            lbl.setStyleSheet("border: none; background: transparent; color: #ecfdf5; font-size: 11px;")
+            c_lay.addWidget(lbl)
+
+            rm_btn = QToolButton(chip)
+            rm_btn.setText("×")
+            rm_btn.setFixedSize(16, 16)
+            rm_btn.setToolTip("予約を取り消す")
+            rm_btn.setStyleSheet(
+                "QToolButton { border: none; background: transparent; color: #cbd5e1; font-size: 12px; padding: 0; }"
+                "QToolButton:hover { background-color: rgba(244, 63, 94, 0.45); color: #fff; border-radius: 8px; }"
+            )
+            rm_btn.clicked.connect(lambda _=False, i=idx: self.remove_queued_prompt(i))
+            c_lay.addWidget(rm_btn)
+            self._queued_layout.addWidget(chip)
+
+        self._queued_layout.addStretch(1)
+        self._queued_bar.setVisible(bool(self._queued_prompts))
+
+    def remove_queued_prompt(self, index: int) -> None:
+        """Remove a single queued follow-up message by index."""
+        if 0 <= index < len(self._queued_prompts):
+            del self._queued_prompts[index]
+            self._rebuild_queued_bar()
+
+    def clear_queued_prompts(self) -> None:
+        """Clear all queued follow-up messages."""
+        if not self._queued_prompts:
+            return
+        self._queued_prompts.clear()
+        self._rebuild_queued_bar()
+
+    def _schedule_queued_dispatch(self) -> None:
+        if self._queued_prompts and not self._is_busy():
+            QTimer.singleShot(80, self._dispatch_next_queued_prompt)
+
+    def _dispatch_next_queued_prompt(self) -> None:
+        if not self._queued_prompts or self._is_busy():
+            return
+        item = self._queued_prompts.pop(0)
+        self._rebuild_queued_bar()
+        self.send_prompt(
+            str(item.get("text") or ""),
+            preferred_agent=str(item.get("preferred_agent") or ""),
+            attachments=list(item.get("attachments") or ()),
+        )
 
     def send_prompt(
         self,
@@ -2692,7 +3280,77 @@ class BubblePanel(QWidget):
         if not prompt and not resolved_attachments:
             return
         if self._is_busy():
-            self.toast_requested.emit("現在処理中です。停止してから送信してください。", True)
+            if not prompt:
+                self.toast_requested.emit(
+                    "実行中は追加メッセージを入力して追送してください（添付は保持されます）。",
+                    True,
+                )
+                return
+            if using_queued and self._attachments:
+                self._attachments.clear()
+                self._rebuild_attachment_chips()
+            if (
+                not self._orchestrator.is_running()
+                and not self._compacting
+                and self._router.is_running()
+                and (not preferred_agent or preferred_agent == self._config.agent_id)
+                and self._router.inject_followup_message(prompt, attachments=resolved_attachments)
+            ):
+                now_str = datetime.now().strftime("%H:%M")
+                if self._streaming_text:
+                    committed = self._streaming_text
+                    self._committed_stream_prefix += committed
+                    self._streaming_text = ""
+                    turn_agent = self._pending_turn_agent_id or self._config.agent_id
+                    turn_sister = self._pending_turn_sister_id or self._sister.id
+                    turn_name = self._pending_turn_sister_name or _short_name(self._sister.display_name)
+                    self._conversation.add_sister_turn(
+                        committed.strip(),
+                        author=turn_name,
+                        sister_id=turn_sister,
+                        agent_id=turn_agent,
+                        time_str=now_str,
+                    )
+                    self._messages.append(
+                        {
+                            "role": "sister",
+                            "author": f"💠 {turn_name} ({turn_agent})",
+                            "accent": self._sister.accent_color,
+                            "text": committed.strip(),
+                            "time": now_str,
+                        }
+                    )
+                att_labels = [f"{att.icon} {att.name}" for att in resolved_attachments]
+                self._conversation.add_user_turn(prompt, attachments=att_labels, time_str=now_str)
+                self._messages.append(
+                    {
+                        "role": "user",
+                        "author": "美緒ちゃん · 途中送信",
+                        "accent": "#6366f1",
+                        "text": prompt,
+                        "attachments": format_attachments_for_chat_display(resolved_attachments),
+                        "time": now_str,
+                    }
+                )
+                self._render_chat_log()
+                self._refresh_context_bar()
+                self.touch_activity("📨 途中メッセージ反映中…")
+                self.conversation_changed.emit()
+                self.toast_requested.emit("📨 実行中のAIへ途中メッセージを送りました", False)
+                return
+
+            if len(self._queued_prompts) >= 10:
+                self.toast_requested.emit("予約メッセージの上限（10件）に達しています。", True)
+                return
+            self._queued_prompts.append(
+                {
+                    "text": prompt,
+                    "attachments": resolved_attachments,
+                    "preferred_agent": preferred_agent,
+                }
+            )
+            self._rebuild_queued_bar()
+            self.toast_requested.emit("📨 送信予約しました（今の処理が終わったら自動で送ります）", False)
             return
 
         if using_queued and self._attachments:
@@ -2775,16 +3433,19 @@ class BubblePanel(QWidget):
             }
         )
         self._streaming_text = ""
+        self._committed_stream_prefix = ""
         self._render_chat_log()
         self.set_running_state(True, "✨ 考え中…")
 
         model = (self._config.models_by_agent.get(agent_id, "") or "").strip()
+        effort = normalize_effort((getattr(self._config, "efforts_by_agent", {}) or {}).get(agent_id, ""))
         cwd = (self._config.working_dir or str(Path.home())).strip() or str(Path.home())
         self._router.send_message(
             agent_id,
             prompt,
             sister=self._sister,
             model=model,
+            effort=effort,
             cwd=cwd,
             auto_approve=bool(self._config.auto_approve),
             attachments=resolved_attachments,
@@ -2792,7 +3453,9 @@ class BubblePanel(QWidget):
         )
         self.conversation_changed.emit()
 
-    def _on_send_or_stop(self) -> None:
+    def _stop_active_run(self) -> None:
+        self._clear_all_interactions()
+        self._committed_stream_prefix = ""
         if self._orchestrator.is_running():
             was_awaiting = self._orchestrator.is_awaiting_approval()
             self._orchestrator.cancel()
@@ -2835,13 +3498,15 @@ class BubblePanel(QWidget):
             self._streaming_text = None
             self._render_chat_log()
             self._refresh_context_bar()
-            return
 
+    def _on_send_or_stop(self) -> None:
         text = self._chat_input.toPlainText().strip()
-        if not text and not self._attachments:
+        if text or self._attachments:
+            self._chat_input.clear()
+            self.send_prompt(text)
             return
-        self._chat_input.clear()
-        self.send_prompt(text)
+        if self._is_busy():
+            self._stop_active_run()
 
     def _on_mic_clicked(self) -> None:
         self._voice_recorder.toggle(self._config)
@@ -3050,11 +3715,23 @@ class BubblePanel(QWidget):
             self._updating_controls = True
             try:
                 self._populate_model_combo(aid)
+                self._populate_effort_combo(aid)
             finally:
                 self._updating_controls = False
             self.ensure_models_discovered(aid)
             self.agent_changed.emit(aid)
             self.config_updated.emit()
+
+    def _on_effort_combo_changed(self, idx: int) -> None:
+        if self._updating_controls or idx < 0:
+            return
+        aid = self._config.agent_id
+        effort = normalize_effort(self._effort_combo.itemData(idx))
+        if effort:
+            self._config.efforts_by_agent[aid] = effort
+        else:
+            self._config.efforts_by_agent.pop(aid, None)
+        self.config_updated.emit()
 
     def _on_model_activated(self, idx: int) -> None:
         if self._updating_controls:
@@ -3088,6 +3765,11 @@ class BubblePanel(QWidget):
             self._config.models_by_agent[aid] = model_name
         else:
             self._config.models_by_agent.pop(aid, None)
+        self._updating_controls = True
+        try:
+            self._populate_effort_combo(aid, model_name)
+        finally:
+            self._updating_controls = False
         self.config_updated.emit()
 
     def _on_refresh_models(self) -> None:
@@ -3096,6 +3778,9 @@ class BubblePanel(QWidget):
         self.ensure_models_discovered(aid, force=True)
 
     def _on_new_session(self) -> None:
+        self._clear_all_interactions()
+        self.clear_queued_prompts()
+        self._committed_stream_prefix = ""
         if self._orchestrator.is_running():
             self._orchestrator.cancel()
             self.set_running_state(False)

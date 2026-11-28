@@ -33,12 +33,29 @@ PANEL_HEIGHT_MIN = 440
 PANEL_HEIGHT_MAX = 4320
 ANIMATION_MODES = ("rich", "subtle", "off")
 VALID_AGENT_IDS: tuple[str, ...] = ("agy", "claude", "codex", "opencode")
+VALID_EFFORT_LEVELS: tuple[str, ...] = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+)
+
+
+def normalize_effort(value: Any) -> str:
+    """Normalize an effort/reasoning level string, returning '' if empty or invalid."""
+    clean = str(value or "").strip().lower()
+    return clean if clean in VALID_EFFORT_LEVELS else ""
 
 
 @dataclass
 class SisterAgentAssignment:
     agent_id: str = ""
     model: str = ""
+    effort: str = ""
     enabled: bool = True
 
 
@@ -177,6 +194,7 @@ class AppConfig:
     sister_id: str = "aoi"
     agent_id: str = "agy"
     models_by_agent: dict[str, str] = field(default_factory=dict)
+    efforts_by_agent: dict[str, str] = field(default_factory=dict)
     orchestrator_mode: bool = False
     orchestrator_confirm_plan: bool = False
     orchestrator_max_parallel: int = 2
@@ -291,6 +309,15 @@ def load_config(path: Path | None = None) -> AppConfig:
     if isinstance(data.get("models_by_agent"), dict):
         cfg.models_by_agent = {str(k): str(v) for k, v in data["models_by_agent"].items()}
 
+    if isinstance(data.get("efforts_by_agent"), dict):
+        cleaned_efforts: dict[str, str] = {}
+        for raw_k, raw_v in data["efforts_by_agent"].items():
+            kk = str(raw_k or "").strip()
+            vv = normalize_effort(raw_v)
+            if kk in VALID_AGENT_IDS and vv:
+                cleaned_efforts[kk] = vv
+        cfg.efforts_by_agent = cleaned_efforts
+
     if isinstance(data.get("tts_reading_overrides"), dict):
         cleaned_readings: dict[str, str] = {}
         for raw_k, raw_v in data["tts_reading_overrides"].items():
@@ -316,16 +343,19 @@ def load_config(path: Path | None = None) -> AppConfig:
                 parsed_assignments[sid] = SisterAgentAssignment(
                     agent_id=aid,
                     model=str(raw_val.model or "").strip(),
+                    effort=normalize_effort(getattr(raw_val, "effort", "")),
                     enabled=bool(raw_val.enabled),
                 )
             elif isinstance(raw_val, dict):
                 raw_aid = str(raw_val.get("agent_id") or "").strip()
                 aid = raw_aid if raw_aid in VALID_AGENT_IDS else ""
                 raw_model = str(raw_val.get("model") or "").strip()
+                raw_effort = normalize_effort(raw_val.get("effort"))
                 raw_enabled = bool(raw_val.get("enabled", True))
                 parsed_assignments[sid] = SisterAgentAssignment(
                     agent_id=aid,
                     model=raw_model,
+                    effort=raw_effort,
                     enabled=raw_enabled,
                 )
         cfg.sister_assignments = parsed_assignments

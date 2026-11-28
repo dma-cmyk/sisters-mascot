@@ -14,6 +14,41 @@ from sisters_mascot.attachments import AttachmentItem
 PLAYWRIGHT_TOOL_KEYWORDS = ("playwright", "browser_")
 _TOOL_CALL_RE = re.compile(r"tools\.([A-Za-z0-9_]+\.[A-Za-z0-9_]+)")
 
+EFFORT_LEVELS: tuple[str, ...] = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+)
+
+EFFORT_SHORT_LABELS: dict[str, str] = {
+    "": "既定",
+    "none": "None",
+    "minimal": "Minimal",
+    "low": "Low",
+    "medium": "Medium",
+    "high": "High",
+    "xhigh": "XHigh",
+    "max": "Max",
+    "ultra": "Ultra",
+}
+
+EFFORT_DISPLAY_LABELS: dict[str, str] = {
+    "": "（既定）",
+    "none": "None (推論なし)",
+    "minimal": "Minimal (最小)",
+    "low": "Low (軽め・高速)",
+    "medium": "Medium (標準)",
+    "high": "High (深め)",
+    "xhigh": "XHigh (超深め)",
+    "max": "Max (最大)",
+    "ultra": "Ultra (極大)",
+}
+
 
 @dataclass
 class StreamEvent:
@@ -319,11 +354,17 @@ class BaseAgentAdapter:
         """Return available model choices (id + display label) for this agent."""
         return [ModelChoice(id=m, label=m) for m in self.discover_models()]
 
+    def supported_efforts(self, model: str = "") -> list[str]:
+        """Return supported reasoning effort levels for this agent/model."""
+        _ = model
+        return ["low", "medium", "high", "xhigh", "max"]
+
     def build_command(
         self,
         prompt: str,
         *,
         model: str = "",
+        effort: str = "",
         session_id: str | None = None,
         cwd: str = "",
         system_prompt: str = "",

@@ -26,6 +26,7 @@ _DYNAMIC_ALIASES: tuple[tuple[str, str], ...] = (
     ("opus[1m]", "Opus 1M (opus[1m])"),
 )
 _SENSITIVE_KEY_PARTS = ("KEY", "TOKEN", "SECRET", "PASS", "AUTH", "CREDENTIAL")
+_VALID_CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 
 def _is_safe_model_key(key: str) -> bool:
@@ -121,11 +122,16 @@ class ClaudeAdapter(BaseAgentAdapter):
     def discover_models(self) -> list[str]:
         return [choice.id for choice in self.discover_model_choices()]
 
+    def supported_efforts(self, model: str = "") -> list[str]:
+        _ = model
+        return ["low", "medium", "high", "xhigh", "max"]
+
     def build_command(
         self,
         prompt: str,
         *,
         model: str = "",
+        effort: str = "",
         session_id: str | None = None,
         cwd: str = "",
         system_prompt: str = "",
@@ -143,6 +149,9 @@ class ClaudeAdapter(BaseAgentAdapter):
         cleaned_model = model.strip()
         if cleaned_model and cleaned_model != "default":
             cmd.extend(["--model", cleaned_model])
+        cleaned_effort = (effort or "").strip().lower()
+        if cleaned_effort in _VALID_CLAUDE_EFFORTS:
+            cmd.extend(["--effort", cleaned_effort])
         if session_id:
             cmd.extend(["--resume", session_id])
         if system_prompt.strip():

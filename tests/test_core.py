@@ -3001,5 +3001,1031 @@ class TestOrchestratorMode(unittest.TestCase):
             app.processEvents()
 
 
+class _FakePipeStream:
+    """Thread-safe queue-backed pipe stream for deterministic JSONL Popen tests."""
+
+    def __init__(self) -> None:
+        import queue
+
+        self._q: queue.Queue[str | None] = queue.Queue()
+        self._closed = False
+
+    def push(self, line: str) -> None:
+        if not self._closed:
+            self._q.put(line if line.endswith("\n") else line + "\n")
+
+    def close_eof(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._q.put(None)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> str:
+        item = self._q.get()
+        if item is None:
+            raise StopIteration
+        return item
+
+    def close(self) -> None:
+        self.close_eof()
+
+
+class _FakePipeStdin:
+    """Fake stdin dispatching each JSON line to a test protocol handler."""
+
+    def __init__(self, on_json_line) -> None:  # noqa: ANN001
+        self._on_json_line = on_json_line
+        self._buf = ""
+        self.closed = False
+
+    def write(self, data: str) -> int:
+        if self.closed:
+            raise ValueError("I/O operation on closed file.")
+        self._buf += data
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                self._on_json_line(json.loads(line))
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeInteractivePopen:
+    """Fake Popen supporting JSONL stdin/stdout/stderr without spawning external binaries."""
+
+    def __init__(self, on_json_line) -> None:  # noqa: ANN001
+        import threading
+
+        self.pid = 99999
+        self.stdout = _FakePipeStream()
+        self.stderr = _FakePipeStream()
+        self.stderr.close_eof()
+        self._done = threading.Event()
+        self.returncode: int | None = None
+        self.stdin = _FakePipeStdin(on_json_line)
+
+    def finish(self, code: int = 0) -> None:
+        self.returncode = code
+        self.stdout.close_eof()
+        self._done.set()
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        self._done.wait(timeout=timeout)
+        self.stdout.close_eof()
+        return 0 if self.returncode is None else self.returncode
+
+    def terminate(self) -> None:
+        self.finish(-15)
+
+    def kill(self) -> None:
+        self.finish(-9)
+
+
+class TestReasoningEffortConfigAndAdapters(unittest.TestCase):
+    def test_effort_config_roundtrip_and_normalization(self) -> None:
+        from sisters_mascot.config import VALID_EFFORT_LEVELS, normalize_effort
+
+        self.assertEqual(normalize_effort("XHIGH"), "xhigh")
+        self.assertEqual(normalize_effort("invalid-level"), "")
+        self.assertEqual(normalize_effort(None), "")
+        self.assertIn("high", VALID_EFFORT_LEVELS)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg = AppConfig(
+                agent_id="opencode",
+                efforts_by_agent={"opencode": "high", "claude": "BAD", "codex": "xhigh"},
+                sister_assignments={
+                    "aoi": SisterAgentAssignment(agent_id="claude", model="sonnet", effort="max"),
+                    "hiiro": SisterAgentAssignment(agent_id="agy", model="", effort="bogus"),
+                },
+            )
+            save_config(cfg, cfg_path)
+            loaded = load_config(cfg_path)
+            self.assertEqual(loaded.efforts_by_agent.get("opencode"), "high")
+            self.assertEqual(loaded.efforts_by_agent.get("claude", ""), "")
+            self.assertEqual(loaded.efforts_by_agent.get("codex"), "xhigh")
+            self.assertEqual(loaded.sister_assignments["aoi"].effort, "max")
+            self.assertEqual(loaded.sister_assignments["hiiro"].effort, "")
+
+    def test_all_four_adapters_effort_flags_and_suffix_handling(self) -> None:
+        from sisters_mascot.agents.agy_adapter import resolve_model_and_effort
+        from sisters_mascot.agents.opencode_adapter import format_model_with_effort
+
+        # 1. Agy: strip suffix when effort is overridden, omit duplicate when suffix already expresses effort
+        self.assertEqual(resolve_model_and_effort("gemini-4-neon-high", "xhigh"), ("gemini-4-neon", "xhigh"))
+        self.assertEqual(resolve_model_and_effort("gemini-4-neon-xhigh", ""), ("gemini-4-neon-xhigh", ""))
+        agy_cmd, _ = AgyAdapter().build_command("ping", model="gemini-4-neon-high", effort="xhigh")
+        self.assertIn("gemini-4-neon", agy_cmd)
+        self.assertNotIn("gemini-4-neon-high", agy_cmd)
+        self.assertEqual(agy_cmd[agy_cmd.index("--effort") + 1], "xhigh")
+
+        # 2. Claude: --effort flag
+        claude_cmd, _ = ClaudeAdapter().build_command("ping", model="opus", effort="max")
+        self.assertEqual(claude_cmd[claude_cmd.index("--effort") + 1], "max")
+
+        # 3. Codex: -c model_reasoning_effort=... on both exec and exec resume + cache lookup
+        codex = CodexAdapter()
+        cmd_new, _ = codex.build_command("ping", model="gpt-5.3-codex", effort="high")
+        cmd_resume, _ = codex.build_command("ping", model="gpt-5.3-codex", session_id="thr_1", effort="xhigh")
+        self.assertIn('model_reasoning_effort="high"', cmd_new)
+        self.assertIn("resume", cmd_resume)
+        self.assertIn('model_reasoning_effort="xhigh"', cmd_resume)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp) / ".codex"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache = cache_dir / "models_cache.json"
+            cache.write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {
+                                "slug": "gpt-5.3-codex",
+                                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch("sisters_mascot.agents.codex_adapter.Path.home", return_value=Path(tmp)):
+                self.assertEqual(codex.supported_efforts("gpt-5.3-codex"), ["low", "high"])
+
+        # 4. OpenCode: attach #variant only when model is present
+        self.assertEqual(format_model_with_effort("opencode/deepseek-v4.1-flash-free", "high"), "opencode/deepseek-v4.1-flash-free#high")
+        self.assertEqual(format_model_with_effort("", "high"), "")
+        oc = OpenCodeAdapter()
+        oc_cmd, _ = oc.build_command("ping", model="opencode/deepseek-v4.1-flash-free", effort="high")
+        self.assertEqual(oc_cmd[oc_cmd.index("-m") + 1], "opencode/deepseek-v4.1-flash-free#high")
+        oc_no_model_cmd, _ = oc.build_command("ping", model="", effort="high")
+        self.assertNotIn("-m", oc_no_model_cmd)
+
+    def test_orchestrator_effort_resolution_and_propagation(self) -> None:
+        from sisters_mascot.agents.orchestrator import resolve_sister_effort
+
+        cfg = AppConfig(
+            agent_id="agy",
+            efforts_by_agent={"agy": "high", "opencode": "medium"},
+            orchestrator_mode=True,
+            orchestrator_confirm_plan=False,
+            sister_assignments={
+                "aoi": SisterAgentAssignment(agent_id="agy", effort="xhigh"),
+                "hiiro": SisterAgentAssignment(agent_id="opencode", effort=""),
+            },
+        )
+        self.assertEqual(resolve_sister_effort(cfg, "aoi", "agy"), "xhigh")
+        self.assertEqual(resolve_sister_effort(cfg, "hiiro", "opencode"), "medium")
+        self.assertEqual(resolve_sister_effort(cfg, "aoi", "claude", fallback_occurred=True), "")
+
+        _ensure_qapp()
+        sisters = load_all_sisters()
+        router = AgentRouter()
+        engine = OrchestratorEngine(router, sisters)
+        recorded_efforts: list[tuple[str, str, str]] = []
+
+        plan_json = json.dumps(
+            {
+                "mode": "delegate",
+                "aoi_opening": "準備できました",
+                "tasks": [
+                    {
+                        "id": "t1",
+                        "sister_id": "hiiro",
+                        "title": "調査",
+                        "instruction": "概要確認",
+                        "depends_on": [],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+        def _fake_iso(agent_id, prompt, *, model="", effort="", sister_name="", **kwargs):  # noqa: ANN001
+            recorded_efforts.append((sister_name, agent_id, effort))
+            sys_p = kwargs.get("system_prompt", "")
+            if "オーケストレーター計画フェーズ" in sys_p:
+                return IsolatedTurnResult(text=f"```json\n{plan_json}\n```", returncode=0)
+            return IsolatedTurnResult(text="完了しました", returncode=0)
+
+        app = _ensure_qapp()
+        with (
+            patch.object(router, "get_adapter", side_effect=lambda aid: SimpleNamespace(is_available=lambda: True)),
+            patch.object(router, "run_isolated_turn", side_effect=_fake_iso),
+        ):
+            engine.start("調べて", config=cfg)
+            for _ in range(80):
+                app.processEvents()
+                if not engine.is_running():
+                    break
+                import time
+
+                time.sleep(0.01)
+
+        self.assertFalse(engine.is_running())
+        self.assertGreaterEqual(len(recorded_efforts), 2)
+        self.assertEqual(recorded_efforts[0][2], "xhigh")  # 碧 plan
+        self.assertTrue(any(e[1] == "opencode" and e[2] == "medium" for e in recorded_efforts))
+
+
+class TestInteractiveRunnersAndMidTurnSteer(unittest.TestCase):
+    def test_opencode_interactive_http_sse_form_permission_and_steer(self) -> None:
+        import base64
+        import http.server
+        import queue
+        import threading
+        import urllib.parse
+        from sisters_mascot.agents.interaction import InteractionRequest, InteractionResponse
+        from sisters_mascot.agents.interactive import OpenCodeInteractiveRunner
+
+        sse_q: queue.Queue[dict | None] = queue.Queue()
+        recorded_models: list[dict] = []
+        recorded_prompts: list[dict] = []
+        recorded_form_replies: list[dict] = []
+        recorded_perm_replies: list[dict] = []
+        auth_headers_ok: list[bool] = []
+        cwd_headers_ok: list[bool] = []
+        expected_auth = "Basic " + base64.b64encode(b"opencode:secret-pw").decode("ascii")
+        expected_cwd = "/tmp/test-oc-proj"
+        expected_cwd_header = urllib.parse.quote(expected_cwd, safe="")
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):  # noqa: ANN001, A002
+                pass
+
+            def _check_headers(self) -> bool:
+                ok_auth = self.headers.get("Authorization") == expected_auth
+                ok_cwd = self.headers.get("x-opencode-directory") == expected_cwd_header
+                auth_headers_ok.append(ok_auth)
+                cwd_headers_ok.append(ok_cwd)
+                return ok_auth and ok_cwd
+
+            def _read_json(self) -> dict:
+                ln = int(self.headers.get("Content-Length") or "0")
+                raw = self.rfile.read(ln) if ln > 0 else b"{}"
+                return json.loads(raw.decode("utf-8"))
+
+            def _send_json(self, code: int, obj) -> None:  # noqa: ANN001
+                body = json.dumps(obj).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:  # noqa: N802
+                if not self._check_headers():
+                    self._send_json(401, {"error": "unauthorized"})
+                    return
+                if self.path == "/api/info":
+                    self._send_json(200, {"version": "2.4.1"})
+                    return
+                if self.path.startswith("/api/session/ses_oc_1/permission"):
+                    self._send_json(200, [])
+                    return
+                if self.path.startswith("/api/session/ses_oc_1/form"):
+                    self._send_json(200, [])
+                    return
+                if self.path == "/api/event":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    while True:
+                        ev = sse_q.get()
+                        if ev is None:
+                            break
+                        chunk = f"data: {json.dumps(ev)}\n\n".encode("utf-8")
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    return
+                self._send_json(404, {})
+
+            def do_POST(self) -> None:  # noqa: N802
+                if not self._check_headers():
+                    self._send_json(401, {})
+                    return
+                payload = self._read_json()
+                if self.path == "/api/session":
+                    self._send_json(200, {"id": "ses_oc_1"})
+                    return
+                if self.path == "/api/session/ses_oc_1/model":
+                    recorded_models.append(payload)
+                    self._send_json(200, {})
+                    return
+                if self.path == "/api/session/ses_oc_1/prompt":
+                    recorded_prompts.append(payload)
+                    self._send_json(200, {})
+                    if len(recorded_prompts) == 1:
+                        sse_q.put(
+                            {
+                                "type": "form.created",
+                                "data": {
+                                    "form": {
+                                        "id": "frm_ws",
+                                        "sessionID": "ses_oc_1",
+                                        "title": "Web Search",
+                                        "fields": [
+                                            {
+                                                "key": "provider",
+                                                "title": "Provider",
+                                                "type": "select",
+                                                "options": [
+                                                    {"value": "exa", "label": "Exa"},
+                                                    {"value": "tavily", "label": "Tavily"},
+                                                ],
+                                            }
+                                        ],
+                                    }
+                                },
+                            }
+                        )
+                        sse_q.put(
+                            {
+                                "type": "permission.asked",
+                                "data": {
+                                    "id": "prm_1",
+                                    "sessionID": "ses_oc_1",
+                                    "action": "bash",
+                                    "resources": ["ls -la"],
+                                },
+                            }
+                        )
+                        sse_q.put(
+                            {
+                                "type": "session.text.delta",
+                                "data": {
+                                    "sessionID": "ses_oc_1",
+                                    "assistantMessageID": "msg_1",
+                                    "ordinal": 0,
+                                    "delta": "前半テキスト",
+                                },
+                            }
+                        )
+                    else:
+                        sse_q.put(
+                            {
+                                "type": "session.text.delta",
+                                "data": {
+                                    "sessionID": "ses_oc_1",
+                                    "assistantMessageID": "msg_1",
+                                    "ordinal": 1,
+                                    "delta": "後半ステア結果",
+                                },
+                            }
+                        )
+                        sse_q.put({"type": "session.execution.succeeded", "data": {"sessionID": "ses_oc_1"}})
+                    return
+                if "/form/" in self.path and self.path.endswith("/reply"):
+                    recorded_form_replies.append(payload)
+                    self._send_json(200, {})
+                    return
+                if "/permission/" in self.path and self.path.endswith("/reply"):
+                    recorded_perm_replies.append(payload)
+                    self._send_json(200, {})
+                    return
+                self._send_json(404, {})
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        srv_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        srv_thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                svc_file = Path(tmp) / "service.json"
+                svc_file.write_text(
+                    json.dumps(
+                        {
+                            "url": f"http://127.0.0.1:{srv.server_address[1]}",
+                            "password": "secret-pw",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                seen_interactions: list[InteractionRequest] = []
+                steer_ref = [None]
+                steered_once = [False]
+                events = []
+
+                def _on_interaction(req: InteractionRequest) -> InteractionResponse:
+                    seen_interactions.append(req)
+                    if req.kind == "form":
+                        return InteractionResponse(answers={"provider": "exa"})
+                    return InteractionResponse(action_id="always")
+
+                def _on_event(ev) -> None:  # noqa: ANN001
+                    events.append(ev)
+                    if ev.kind == "delta" and "前半" in ev.text and not steered_once[0]:
+                        steered_once[0] = True
+                        assert steer_ref[0] is not None
+                        self.assertTrue(steer_ref[0]("追記も確認して", ()))
+
+                outcome = OpenCodeInteractiveRunner(svc_file).run(
+                    "調べて",
+                    model="opencode/deepseek-v4.1-flash-free",
+                    effort="high",
+                    cwd=expected_cwd,
+                    auto_approve=False,
+                    sister_name="緋色",
+                    on_event=_on_event,
+                    on_interaction=_on_interaction,
+                    on_log=lambda _l, _m: None,
+                    set_steer_handler=lambda cb: steer_ref.__setitem__(0, cb),
+                )
+                sse_q.put(None)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.session_id, "ses_oc_1")
+        self.assertIn("前半テキスト", outcome.text)
+        self.assertIn("後半ステア結果", outcome.text)
+        self.assertTrue(all(auth_headers_ok))
+        self.assertTrue(all(cwd_headers_ok))
+        self.assertEqual(
+            recorded_models[0]["model"],
+            {"providerID": "opencode", "id": "deepseek-v4.1-flash-free", "variant": "high"},
+        )
+        self.assertEqual(len(recorded_prompts), 2)
+        self.assertEqual(recorded_prompts[0]["delivery"], "steer")
+        self.assertEqual(recorded_prompts[1]["text"], "追記も確認して")
+        self.assertEqual(recorded_form_replies[0], {"answer": {"provider": "exa"}})
+        self.assertEqual(recorded_perm_replies[0], {"decision": "always"})
+        self.assertEqual([r.title for r in seen_interactions], ["Web Search", "実行許可: bash"])
+
+    def test_claude_codex_and_agy_interactive_runners_and_steering(self) -> None:
+        from sisters_mascot.agents.interaction import InteractionResponse
+        from sisters_mascot.agents.interactive import (
+            AgyInteractiveRunner,
+            ClaudeInteractiveRunner,
+            CodexInteractiveRunner,
+        )
+
+        # --- 1. Claude Code control_request + AskUserQuestion + session allow + mid-turn steer ---
+        cl_inputs: list[dict] = []
+        cl_proc_holder: list[_FakeInteractivePopen] = []
+
+        def _cl_on_in(obj: dict) -> None:
+            cl_inputs.append(obj)
+            proc = cl_proc_holder[0]
+            if len(cl_inputs) == 1:
+                proc.stdout.push(json.dumps({"type": "system", "subtype": "init", "session_id": "cl_s1"}))
+                proc.stdout.push(
+                    json.dumps(
+                        {
+                            "type": "control_request",
+                            "request_id": "cr_bash_1",
+                            "request": {
+                                "subtype": "can_use_tool",
+                                "tool_name": "Bash",
+                                "input": {"command": "ls"},
+                            },
+                        }
+                    )
+                )
+            elif obj.get("type") == "control_response" and obj["response"]["request_id"] == "cr_bash_1":
+                proc.stdout.push(
+                    json.dumps(
+                        {
+                            "type": "control_request",
+                            "request_id": "cr_bash_2",
+                            "request": {
+                                "subtype": "can_use_tool",
+                                "tool_name": "Bash",
+                                "input": {"command": "pwd"},
+                            },
+                        }
+                    )
+                )
+                proc.stdout.push(
+                    json.dumps(
+                        {
+                            "type": "control_request",
+                            "request_id": "cr_ask_1",
+                            "request": {
+                                "subtype": "can_use_tool",
+                                "tool_name": "AskUserQuestion",
+                                "input": {
+                                    "questions": [
+                                        {
+                                            "question": "どちらにする?",
+                                            "header": "選択",
+                                            "options": [{"label": "A"}, {"label": "B"}],
+                                        }
+                                    ]
+                                },
+                            },
+                        }
+                    )
+                )
+            elif obj.get("type") == "control_response" and obj["response"]["request_id"] == "cr_ask_1":
+                proc.stdout.push(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "message": {"content": [{"type": "text", "text": "了解、"}]},
+                        }
+                    )
+                )
+            elif obj.get("type") == "user" and len(cl_inputs) > 1:
+                proc.stdout.push(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "message": {"content": [{"type": "text", "text": "追加も対応したよ"}]},
+                        }
+                    )
+                )
+                proc.stdout.push(json.dumps({"type": "result", "session_id": "cl_s1"}))
+                proc.finish(0)
+
+        def _cl_popen(*_a, **_kw):  # noqa: ANN001
+            p = _FakeInteractivePopen(_cl_on_in)
+            cl_proc_holder.append(p)
+            return p
+
+        cl_prompts_seen: list[str] = []
+        cl_steer = [None]
+        with patch("sisters_mascot.agents.interactive.subprocess.Popen", side_effect=_cl_popen):
+            cl_outcome = ClaudeInteractiveRunner(ClaudeAdapter()).run(
+                "最初のお願い",
+                model="sonnet",
+                effort="max",
+                auto_approve=False,
+                sister_name="瑠璃",
+                on_event=lambda ev: (
+                    cl_steer[0]("これも追加して", ())
+                    if ev.kind == "delta" and "了解、" in ev.text
+                    else None
+                ),
+                on_interaction=lambda req: (
+                    cl_prompts_seen.append(req.kind)
+                    or (
+                        InteractionResponse(answers={"どちらにする?": "B"})
+                        if req.kind == "question"
+                        else InteractionResponse(action_id="allow_session")
+                    )
+                ),
+                on_log=lambda _l, _m: None,
+                register_process=lambda _p: None,
+                unregister_process=lambda _p: None,
+                terminate_process=lambda p: p.terminate() if p else None,
+                set_steer_handler=lambda cb: cl_steer.__setitem__(0, cb),
+            )
+        self.assertTrue(cl_outcome.handled)
+        self.assertEqual(cl_outcome.session_id, "cl_s1")
+        self.assertEqual(cl_prompts_seen, ["permission", "question"])  # cr_bash_2 auto-allowed!
+        self.assertIn("了解、", cl_outcome.text)
+        self.assertIn("追加も対応したよ", cl_outcome.text)
+        ctrl_resps = {
+            x["response"]["request_id"]: x["response"]["response"]
+            for x in cl_inputs
+            if x.get("type") == "control_response"
+        }
+        self.assertEqual(ctrl_resps["cr_bash_2"]["behavior"], "allow")
+        self.assertEqual(ctrl_resps["cr_ask_1"]["updatedInput"]["answers"], {"どちらにする?": "B"})
+
+        # --- 2. Codex app-server approvals + requestUserInput + turn/steer ---
+        cx_inputs: list[dict] = []
+        cx_proc_holder: list[_FakeInteractivePopen] = []
+
+        def _cx_on_in(obj: dict) -> None:
+            cx_inputs.append(obj)
+            proc = cx_proc_holder[0]
+            method = obj.get("method")
+            rid = obj.get("id")
+            if method == "initialize":
+                proc.stdout.push(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {}}))
+            elif method == "thread/start":
+                proc.stdout.push(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"thread": {"id": "thr_cx"}}}))
+            elif method == "turn/start":
+                proc.stdout.push(
+                    json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"turn": {"id": "trn_1"}}})
+                )
+                proc.stdout.push(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 901,
+                            "method": "item/commandExecution/requestApproval",
+                            "params": {"command": "pytest", "cwd": "/tmp"},
+                        }
+                    )
+                )
+            elif rid == 901:
+                proc.stdout.push(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 902,
+                            "method": "item/tool/requestUserInput",
+                            "params": {
+                                "questions": [
+                                    {
+                                        "id": "q1",
+                                        "question": "実行モード",
+                                        "options": [{"label": "高速"}, {"label": "慎重"}],
+                                    }
+                                ]
+                            },
+                        }
+                    )
+                )
+            elif rid == 902:
+                proc.stdout.push(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "item/agentMessage/delta",
+                            "params": {"itemId": "i1", "delta": "半分完了"},
+                        }
+                    )
+                )
+            elif method == "turn/steer":
+                proc.stdout.push(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "item/agentMessage/delta",
+                            "params": {"itemId": "i2", "delta": "全完了"},
+                        }
+                    )
+                )
+                proc.stdout.push(
+                    json.dumps({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"status": "completed"}}})
+                )
+                proc.finish(0)
+
+        def _cx_popen(*_a, **_kw):  # noqa: ANN001
+            p = _FakeInteractivePopen(_cx_on_in)
+            cx_proc_holder.append(p)
+            return p
+
+        cx_steer = [None]
+        cx_steered = [False]
+        with patch("sisters_mascot.agents.interactive.subprocess.Popen", side_effect=_cx_popen):
+            cx_outcome = CodexInteractiveRunner(CodexAdapter()).run(
+                "コード書いて",
+                model="gpt-5.3-codex",
+                effort="xhigh",
+                auto_approve=False,
+                sister_name="琥珀",
+                on_event=lambda ev: (
+                    (cx_steered.__setitem__(0, True), cx_steer[0]("テストも走らせて", ()))
+                    if ev.kind == "delta" and "半分完了" in ev.text and not cx_steered[0]
+                    else None
+                ),
+                on_interaction=lambda req: (
+                    InteractionResponse(answers={"q1": "高速"})
+                    if req.kind == "question"
+                    else InteractionResponse(action_id="acceptForSession")
+                ),
+                on_log=lambda _l, _m: None,
+                register_process=lambda _p: None,
+                unregister_process=lambda _p: None,
+                terminate_process=lambda p: p.terminate() if p else None,
+                set_steer_handler=lambda cb: cx_steer.__setitem__(0, cb),
+            )
+        self.assertTrue(cx_outcome.handled)
+        self.assertEqual(cx_outcome.session_id, "thr_cx")
+        self.assertIn("半分完了", cx_outcome.text)
+        self.assertIn("全完了", cx_outcome.text)
+        turn_start_req = next(x for x in cx_inputs if x.get("method") == "turn/start")
+        self.assertEqual(turn_start_req["params"]["effort"], "xhigh")
+        turn_steer_req = next(x for x in cx_inputs if x.get("method") == "turn/steer")
+        self.assertEqual(turn_steer_req["params"]["expectedTurnId"], "trn_1")
+        self.assertEqual(next(x for x in cx_inputs if x.get("id") == 901)["result"], {"decision": "acceptForSession"})
+        self.assertEqual(next(x for x in cx_inputs if x.get("id") == 902)["result"], {"answers": {"q1": {"answers": ["高速"]}}})
+
+        # --- 3. Agy ACP permission + elicitation + set_model + set_config_option ---
+        agy_inputs: list[dict] = []
+        agy_proc_holder: list[_FakeInteractivePopen] = []
+
+        def _agy_on_in(obj: dict) -> None:
+            agy_inputs.append(obj)
+            proc = agy_proc_holder[0]
+            method = obj.get("method")
+            rid = obj.get("id")
+            if method == "initialize":
+                proc.stdout.push(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1}}))
+            elif method == "session/new":
+                proc.stdout.push(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": rid,
+                            "result": {
+                                "sessionId": "acp_1",
+                                "configOptions": [{"id": "thought_level", "category": "thought_level"}],
+                            },
+                        }
+                    )
+                )
+            elif method in ("session/set_model", "session/set_config_option"):
+                proc.stdout.push(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {}}))
+            elif method == "session/prompt":
+                proc.stdout.push(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 701,
+                            "method": "session/request_permission",
+                            "params": {
+                                "toolCall": {"title": "run_command"},
+                                "options": [
+                                    {"optionId": "allow_once", "name": "1回許可", "kind": "allow_once"},
+                                    {"optionId": "reject_once", "name": "拒否", "kind": "reject_once"},
+                                ],
+                            },
+                        }
+                    )
+                )
+            elif rid == 701:
+                proc.stdout.push(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 702,
+                            "method": "elicitation/create",
+                            "params": {
+                                "message": "確認パラメータ",
+                                "requestedSchema": {
+                                    "type": "object",
+                                    "properties": {"env": {"type": "string", "enum": ["dev", "prod"]}},
+                                    "required": ["env"],
+                                },
+                            },
+                        }
+                    )
+                )
+            elif rid == 702:
+                proc.stdout.push(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": {"type": "text", "text": "ACP完了"},
+                                }
+                            },
+                        }
+                    )
+                )
+                prompt_rid = next(x["id"] for x in agy_inputs if x.get("method") == "session/prompt")
+                proc.stdout.push(json.dumps({"jsonrpc": "2.0", "id": prompt_rid, "result": {}}))
+                proc.finish(0)
+
+        def _agy_popen(*_a, **_kw):  # noqa: ANN001
+            p = _FakeInteractivePopen(_agy_on_in)
+            agy_proc_holder.append(p)
+            return p
+
+        with patch("sisters_mascot.agents.interactive.subprocess.Popen", side_effect=_agy_popen):
+            agy_outcome = AgyInteractiveRunner(AgyAdapter()).run(
+                "確認お願い",
+                model="gemini-4-neon-high",
+                effort="xhigh",
+                auto_approve=False,
+                sister_name="碧",
+                on_event=lambda _ev: None,
+                on_interaction=lambda req: (
+                    InteractionResponse(answers={"env": "prod"})
+                    if req.fields
+                    else InteractionResponse(action_id="allow_once")
+                ),
+                on_log=lambda _l, _m: None,
+                register_process=lambda _p: None,
+                unregister_process=lambda _p: None,
+                terminate_process=lambda p: p.terminate() if p else None,
+            )
+        self.assertTrue(agy_outcome.handled)
+        self.assertEqual(agy_outcome.text, "ACP完了")
+        self.assertEqual(agy_outcome.session_id, "acp_1")
+        set_mod = next(x for x in agy_inputs if x.get("method") == "session/set_model")
+        set_eff = next(x for x in agy_inputs if x.get("method") == "session/set_config_option")
+        self.assertEqual(set_mod["params"]["modelId"], "gemini-4-neon")
+        self.assertEqual(set_eff["params"], {"sessionId": "acp_1", "configId": "thought_level", "value": "xhigh"})
+        self.assertEqual(next(x for x in agy_inputs if x.get("id") == 701)["result"], {"outcome": {"outcome": "selected", "optionId": "allow_once"}})
+        self.assertEqual(next(x for x in agy_inputs if x.get("id") == 702)["result"], {"action": "accept", "content": {"env": "prod"}})
+
+    def test_opencode_late_cancelled_input_safeguard(self) -> None:
+        import time
+
+        app = _ensure_qapp()
+        router = AgentRouter()
+        replies: list[str] = []
+        errors: list[str] = []
+        logs: list[str] = []
+        router.reply_finished.connect(replies.append)
+        router.error_occurred.connect(errors.append)
+        router.activity_logged.connect(lambda _lvl, msg: logs.append(msg))
+
+        class _FakeCliProc:
+            def __init__(self) -> None:
+                self.pid = 7777
+                self.stderr = iter(())
+                self.stdout = iter(
+                    [
+                        json.dumps({"type": "text", "sessionID": "ses_1", "part": {"text": "調査レポート本文"}}) + "\n",
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "error": {
+                                    "data": {
+                                        "message": "Cancelled a request for input this run cannot answer: Web Search"
+                                    }
+                                },
+                            }
+                        )
+                        + "\n",
+                    ]
+                )
+
+            def poll(self):  # noqa: ANN201
+                return 0
+
+            def wait(self, timeout=None):  # noqa: ANN001, ANN201
+                return 0
+
+        with (
+            patch.object(router.get_adapter("opencode"), "is_available", return_value=True),
+            patch("sisters_mascot.agents.router.subprocess.Popen", return_value=_FakeCliProc()),
+        ):
+            sisters = get_sister_map()
+            router.send_message(
+                "opencode",
+                "調べて",
+                sister=sisters["hiiro"],
+            )
+            for _ in range(60):
+                app.processEvents()
+                if replies or errors:
+                    break
+                time.sleep(0.01)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(replies, ["調査レポート本文"])
+        self.assertTrue(any("Cancelled a request for input this run cannot answer" in m for m in logs))
+
+
+class TestInteractiveAndEffortUI(unittest.TestCase):
+    def test_bubble_panel_effort_interaction_card_steer_and_queue(self) -> None:
+        from sisters_mascot.agents.interaction import (
+            InteractionAction,
+            InteractionField,
+            InteractionOption,
+            InteractionRequest,
+        )
+
+        app = _ensure_qapp()
+        cfg = AppConfig(agent_id="codex", efforts_by_agent={"codex": "high"})
+        mascot, panel = _make_ui(cfg)
+        try:
+            panel.show()
+            app.processEvents()
+            # 1. Effort combo reflects saved value and persists change
+            self.assertEqual(panel._effort_combo.currentData(), "high")
+            idx_xhigh = panel._effort_combo.findData("xhigh")
+            self.assertGreaterEqual(idx_xhigh, 0)
+            panel._effort_combo.setCurrentIndex(idx_xhigh)
+            self.assertEqual(cfg.efforts_by_agent.get("codex"), "xhigh")
+
+            # 2. Interaction card: single-choice 1-click button + queue badge + stall pause + permission
+            r1 = InteractionRequest(
+                agent_id="opencode",
+                sister_name="緋色",
+                kind="form",
+                title="Web Search",
+                description="Provider?",
+                fields=[
+                    InteractionField(
+                        key="provider",
+                        field_type="choice",
+                        options=[InteractionOption("exa", "Exa"), InteractionOption("tavily", "Tavily")],
+                    )
+                ],
+            )
+            r2 = InteractionRequest(
+                agent_id="claude",
+                sister_name="瑠璃",
+                kind="permission",
+                title="Bash 許可",
+                detail="rm -rf /tmp/x",
+                actions=[
+                    InteractionAction("allow_once", "✅ 許可", "success"),
+                    InteractionAction("deny", "❌ 拒否", "danger"),
+                ],
+            )
+            panel.set_running_state(True, "実行中")
+            panel.handle_interaction_requested(r1)
+            panel.handle_interaction_requested(r2)
+            self.assertTrue(panel._interaction_card.isVisible())
+            self.assertEqual(panel._interaction_queue_lbl.text(), "1 / 2")
+            panel._on_activity_tick()
+            self.assertIn("🔐 確認待ち:", panel._status_bar.text())
+
+            # Click first 1-click choice button ("Exa")
+            from PyQt6.QtWidgets import QPushButton
+
+            btns = panel._interaction_fields_container.findChildren(QPushButton)
+            self.assertGreaterEqual(len(btns), 2)
+            btns[0].click()
+            app.processEvents()
+            self.assertTrue(r1.is_resolved())
+            self.assertEqual(r1.wait().answers, {"provider": "exa"})
+            # Second interaction card now shown automatically
+            self.assertEqual(panel._active_interaction, r2)
+            self.assertTrue(panel._interaction_card.isVisible())
+
+            # Deny permission button
+            act_btns = panel._interaction_actions_container.findChildren(QPushButton)
+            deny_btn = next(b for b in act_btns if "拒否" in b.text())
+            deny_btn.click()
+            app.processEvents()
+            self.assertEqual(r2.wait().action_id, "deny")
+            self.assertFalse(panel._interaction_card.isVisible())
+
+            # 3. Mid-turn live steering commits partial streaming text without duplication
+            panel._streaming_text = "途中までの回答"
+            panel._committed_stream_prefix = ""
+            with (
+                patch.object(panel._router, "is_running", return_value=True),
+                patch.object(panel._router, "inject_followup_message", return_value=True) as mock_steer,
+            ):
+                panel.send_prompt("方針変更して")
+            mock_steer.assert_called_once()
+            self.assertEqual(panel._committed_stream_prefix, "途中までの回答")
+            panel.finalize_stream_reply("途中までの回答\n新しい方向で完了")
+            last_msg = panel._messages[-1]
+            self.assertEqual(last_msg["text"], "新しい方向で完了")
+
+            # 4. Auto-queue when live steer returns False -> chip shown & dispatches when idle
+            dispatched: list[str] = []
+            with (
+                patch.object(panel._router, "is_running", return_value=True),
+                patch.object(panel._router, "inject_followup_message", return_value=False),
+            ):
+                panel.send_prompt("次の質問です")
+            self.assertEqual(len(panel._queued_prompts), 1)
+            self.assertTrue(panel._queued_bar.isVisible())
+
+            with patch.object(panel, "send_prompt", side_effect=lambda txt, **_kw: dispatched.append(txt)):
+                panel.set_running_state(False)
+                panel._dispatch_next_queued_prompt()
+            self.assertEqual(dispatched, ["次の質問です"])
+            self.assertEqual(panel._queued_prompts, [])
+        finally:
+            mascot.close()
+            panel.close()
+            app.processEvents()
+
+    def test_orchestrator_dialog_per_sister_effort_controls(self) -> None:
+        app = _ensure_qapp()
+        sisters = load_all_sisters()
+        router = AgentRouter()
+        cfg = AppConfig(
+            agent_id="agy",
+            sister_assignments={"aoi": SisterAgentAssignment(agent_id="claude", model="sonnet", effort="max")},
+        )
+        dlg = OrchestratorTeamDialog(sisters, cfg, router)
+        try:
+            aoi_ctrl = dlg._rows["aoi"]
+            hiiro_ctrl = dlg._rows["hiiro"]
+            self.assertEqual(aoi_ctrl.effort_combo.currentData(), "max")
+
+            # Disabling a sister disables its effort combo too
+            hiiro_ctrl.enabled_check.setChecked(False)
+            self.assertFalse(hiiro_ctrl.effort_combo.isEnabled())
+            hiiro_ctrl.enabled_check.setChecked(True)
+            self.assertTrue(hiiro_ctrl.effort_combo.isEnabled())
+
+            idx_high = hiiro_ctrl.effort_combo.findData("high")
+            if idx_high >= 0:
+                hiiro_ctrl.effort_combo.setCurrentIndex(idx_high)
+            dlg.apply_to_config()
+            self.assertEqual(cfg.sister_assignments["aoi"].effort, "max")
+
+            dlg._reset_all_to_default()
+            self.assertEqual(aoi_ctrl.effort_combo.currentData(), "")
+        finally:
+            dlg.close()
+            app.processEvents()
+
+
 if __name__ == "__main__":
     unittest.main()

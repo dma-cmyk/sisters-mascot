@@ -17,9 +17,18 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from sisters_mascot import CONFIG_DIR
 from sisters_mascot.agents.agy_adapter import AgyAdapter
-from sisters_mascot.agents.base import BaseAgentAdapter, ModelChoice
+from sisters_mascot.agents.base import BaseAgentAdapter, ModelChoice, StreamEvent
 from sisters_mascot.agents.claude_adapter import ClaudeAdapter
 from sisters_mascot.agents.codex_adapter import CodexAdapter
+from sisters_mascot.agents.interaction import InteractionRequest, InteractionResponse
+from sisters_mascot.agents.interactive import (
+    AgyInteractiveRunner,
+    ClaudeInteractiveRunner,
+    CodexInteractiveRunner,
+    InteractiveTurnOutcome,
+    OpenCodeInteractiveRunner,
+    SteerHandler,
+)
 from sisters_mascot.agents.opencode_adapter import OpenCodeAdapter
 from sisters_mascot.attachments import AttachmentItem, build_prompt_with_attachments
 from sisters_mascot.conversation import COMPACT_SYSTEM_PROMPT
@@ -27,6 +36,7 @@ from sisters_mascot.sisters_loader import SisterProfile
 
 AGENT_IDS: tuple[str, ...] = ("agy", "claude", "codex", "opencode")
 ACTIVITY_LOG_FILE: Path = CONFIG_DIR / "activity.log"
+_OPENCODE_CANCELLED_INPUT_PREFIX = "Cancelled a request for input this run cannot answer:"
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _ERROR_KEYWORDS = (
     "error",
@@ -129,6 +139,8 @@ class AgentRouter(QObject):
     activity_logged = pyqtSignal(str, str)
     models_discovered = pyqtSignal(str, list)
     model_choices_discovered = pyqtSignal(str, list)
+    interaction_requested = pyqtSignal(object)
+    interaction_resolved = pyqtSignal(str)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -145,6 +157,8 @@ class AgentRouter(QObject):
         self._log_lock = threading.Lock()
         self._process: subprocess.Popen[str] | None = None
         self._aux_processes: set[subprocess.Popen[str]] = set()
+        self._pending_interactions: dict[str, InteractionRequest] = {}
+        self._active_steer_cb: SteerHandler | None = None
         self._running = False
         self._cancel_requested = False
 
@@ -233,6 +247,7 @@ class AgentRouter(QObject):
         *,
         sister: SisterProfile,
         model: str = "",
+        effort: str = "",
         cwd: str = "",
         auto_approve: bool = True,
         attachments: Sequence[AttachmentItem] = (),
@@ -282,6 +297,7 @@ class AgentRouter(QObject):
         cmd, stdin_text = adapter.build_command(
             effective_prompt,
             model=model,
+            effort=effort,
             session_id=session_id,
             cwd=effective_cwd,
             system_prompt=system_prompt_arg,
@@ -289,11 +305,25 @@ class AgentRouter(QObject):
             attachments=att_tuple,
         )
 
-        start_desc = f"{'継続セッション' if session_id else '新規セッション'}, model={model or '既定'}"
+        effort_desc = f", effort={effort}" if effort.strip() else ""
+        start_desc = f"{'継続セッション' if session_id else '新規セッション'}, model={model or '既定'}{effort_desc}"
+        sister_short = sister.display_name.split("（", 1)[0].split("(", 1)[0].strip() or sister.display_name
         worker = threading.Thread(
             target=self._run_subprocess,
             args=(agent_id, sister.id, adapter, cmd, stdin_text, effective_cwd),
-            kwargs={"start_desc": start_desc},
+            kwargs={
+                "start_desc": start_desc,
+                "interactive_ctx": {
+                    "effective_prompt": effective_prompt,
+                    "model": model,
+                    "effort": effort,
+                    "session_id": session_id,
+                    "system_prompt_arg": system_prompt_arg,
+                    "auto_approve": auto_approve,
+                    "attachments": att_tuple,
+                    "sister_name": sister_short,
+                },
+            },
             daemon=True,
         )
         worker.start()
@@ -304,6 +334,7 @@ class AgentRouter(QObject):
         compact_prompt: str,
         *,
         model: str = "",
+        effort: str = "",
         cwd: str = "",
     ) -> bool:
         """Run an isolated non-session AI turn to summarize/compact conversation history."""
@@ -340,6 +371,7 @@ class AgentRouter(QObject):
         cmd, stdin_text = adapter.build_command(
             effective_prompt,
             model=model,
+            effort=effort,
             session_id=None,
             cwd=effective_cwd,
             system_prompt=system_prompt_arg,
@@ -347,7 +379,8 @@ class AgentRouter(QObject):
             attachments=(),
         )
 
-        start_desc = f"コンパクト, model={model or '既定'}"
+        effort_desc = f", effort={effort}" if effort.strip() else ""
+        start_desc = f"コンパクト, model={model or '既定'}{effort_desc}"
         worker = threading.Thread(
             target=self._run_subprocess,
             args=(agent_id, "", adapter, cmd, stdin_text, effective_cwd),
@@ -382,6 +415,208 @@ class AgentRouter(QObject):
         self._write_activity_log(level, clean)
         self.activity_logged.emit(level, clean)
 
+    def has_interaction_handler(self) -> bool:
+        """Return True if a UI slot is connected to handle interactive approvals/forms."""
+        try:
+            return self.receivers(self.interaction_requested) > 0
+        except (TypeError, RuntimeError):
+            return False
+
+    def can_steer_active_turn(self) -> bool:
+        """Return True if the active single-chat turn accepts mid-turn steering messages."""
+        with self._lock:
+            return bool(self._running and self._active_steer_cb is not None)
+
+    def inject_followup_message(
+        self,
+        prompt: str,
+        *,
+        attachments: Sequence[AttachmentItem] = (),
+    ) -> bool:
+        """Send a live follow-up / steering message into the currently running turn."""
+        with self._lock:
+            cb = self._active_steer_cb if self._running else None
+        if cb is None:
+            return False
+        att_tuple = tuple(attachments)
+        msg = build_prompt_with_attachments(prompt, att_tuple)
+        try:
+            ok = bool(cb(msg, att_tuple))
+        except Exception:
+            ok = False
+        if ok:
+            preview = " ".join((prompt or "").split()).strip() or "（添付ファイル）"
+            if len(preview) > 72:
+                preview = preview[:71] + "…"
+            self._emit_activity("info", f"📨 途中メッセージを送信: {preview}")
+        return ok
+
+    def resolve_interaction(self, request_id: str, response: InteractionResponse) -> bool:
+        """Deliver a UI response to a waiting `InteractionRequest`."""
+        with self._lock:
+            req = self._pending_interactions.get(request_id)
+        if req is None:
+            return False
+        return req.resolve(response)
+
+    def cancel_all_interactions(self) -> None:
+        """Cancel all pending interaction requests so blocked workers can exit cleanly."""
+        with self._lock:
+            pending = list(self._pending_interactions.values())
+        for req in pending:
+            req.cancel("ユーザーにより中断されました")
+
+    def _request_user_interaction(
+        self,
+        req: InteractionRequest,
+        *,
+        cancel_event: threading.Event | None = None,
+        log_prefix: str = "",
+        honor_global_cancel: bool = True,
+    ) -> InteractionResponse:
+        if not self.has_interaction_handler():
+            return InteractionResponse(cancelled=True, message="対話ハンドラが未接続です")
+        with self._lock:
+            self._pending_interactions[req.request_id] = req
+        self._emit_activity("info", f"{log_prefix}🔐 確認待ち: {req.title}")
+        self.interaction_requested.emit(req)
+        try:
+            resp = req.wait(
+                cancel_event=cancel_event,
+                is_cancelled=(lambda: self._cancel_requested) if honor_global_cancel else None,
+            )
+        finally:
+            with self._lock:
+                self._pending_interactions.pop(req.request_id, None)
+            self.interaction_resolved.emit(req.request_id)
+        if resp.cancelled:
+            self._emit_activity("warn", f"{log_prefix}⏹ 確認キャンセル: {req.title}")
+        else:
+            summary = resp.action_id or ", ".join(f"{k}={v}" for k, v in resp.answers.items())
+            if len(summary) > 80:
+                summary = summary[:79] + "…"
+            self._emit_activity(
+                "info",
+                f"{log_prefix}🔓 確認応答: {req.title}" + (f" ({summary})" if summary else ""),
+            )
+        return resp
+
+    def _try_run_interactive(
+        self,
+        agent_id: str,
+        effective_prompt: str,
+        *,
+        adapter: BaseAgentAdapter,
+        model: str,
+        effort: str,
+        session_id: str | None,
+        effective_cwd: str,
+        system_prompt_arg: str,
+        auto_approve: bool,
+        attachments: Sequence[AttachmentItem],
+        sister_name: str,
+        cancel_event: threading.Event | None,
+        honor_global_cancel: bool,
+        log_prefix: str,
+        on_event: Callable[[StreamEvent], None],
+        register_proc: Callable[[subprocess.Popen[str]], None],
+        unregister_proc: Callable[[subprocess.Popen[str]], None],
+        set_steer_handler: Callable[[SteerHandler | None], None] | None = None,
+    ) -> InteractiveTurnOutcome:
+        if not self.has_interaction_handler():
+            return InteractiveTurnOutcome(handled=False, fallback_needed=True)
+
+        on_interaction = lambda req: self._request_user_interaction(  # noqa: E731
+            req,
+            cancel_event=cancel_event,
+            log_prefix=log_prefix,
+            honor_global_cancel=honor_global_cancel,
+        )
+        on_log = lambda lvl, msg: self._emit_activity(lvl, f"{log_prefix}{msg}")  # noqa: E731
+        is_cancelled_cb = (lambda: self._cancel_requested) if honor_global_cancel else None
+
+        if agent_id == "opencode":
+            return OpenCodeInteractiveRunner().run(
+                effective_prompt,
+                model=model,
+                effort=effort,
+                session_id=session_id,
+                cwd=effective_cwd,
+                auto_approve=auto_approve,
+                sister_name=sister_name,
+                cancel_event=cancel_event,
+                is_cancelled=is_cancelled_cb,
+                on_event=on_event,
+                on_interaction=on_interaction,
+                on_log=on_log,
+                set_steer_handler=set_steer_handler,
+            )
+
+        if agent_id == "claude" and isinstance(adapter, ClaudeAdapter):
+            return ClaudeInteractiveRunner(adapter).run(
+                effective_prompt,
+                model=model,
+                effort=effort,
+                session_id=session_id,
+                cwd=effective_cwd,
+                system_prompt=system_prompt_arg,
+                auto_approve=auto_approve,
+                attachments=attachments,
+                sister_name=sister_name,
+                cancel_event=cancel_event,
+                is_cancelled=is_cancelled_cb,
+                on_event=on_event,
+                on_interaction=on_interaction,
+                on_log=on_log,
+                register_process=register_proc,
+                unregister_process=unregister_proc,
+                terminate_process=_terminate_process,
+                set_steer_handler=set_steer_handler,
+            )
+
+        if agent_id == "codex" and isinstance(adapter, CodexAdapter):
+            return CodexInteractiveRunner(adapter).run(
+                effective_prompt,
+                model=model,
+                effort=effort,
+                session_id=session_id,
+                cwd=effective_cwd,
+                auto_approve=auto_approve,
+                attachments=attachments,
+                sister_name=sister_name,
+                cancel_event=cancel_event,
+                is_cancelled=is_cancelled_cb,
+                on_event=on_event,
+                on_interaction=on_interaction,
+                on_log=on_log,
+                register_process=register_proc,
+                unregister_process=unregister_proc,
+                terminate_process=_terminate_process,
+                set_steer_handler=set_steer_handler,
+            )
+
+        if agent_id == "agy" and not auto_approve and isinstance(adapter, AgyAdapter):
+            return AgyInteractiveRunner(adapter).run(
+                effective_prompt,
+                model=model,
+                effort=effort,
+                session_id=session_id,
+                cwd=effective_cwd,
+                auto_approve=False,
+                attachments=attachments,
+                sister_name=sister_name,
+                cancel_event=cancel_event,
+                is_cancelled=is_cancelled_cb,
+                on_event=on_event,
+                on_interaction=on_interaction,
+                on_log=on_log,
+                register_process=register_proc,
+                unregister_process=unregister_proc,
+                terminate_process=_terminate_process,
+            )
+
+        return InteractiveTurnOutcome(handled=False, fallback_needed=True)
+
     def _run_subprocess(
         self,
         agent_id: str,
@@ -393,9 +628,11 @@ class AgentRouter(QObject):
         *,
         compact_mode: bool = False,
         start_desc: str = "",
+        interactive_ctx: dict | None = None,
     ) -> None:
         full_text = ""
         saw_error = False
+        deferred_opencode_notice = ""
         stderr_lines: list[str] = []
         started_at = time.monotonic()
 
@@ -406,6 +643,105 @@ class AgentRouter(QObject):
             "info",
             f"▶ {adapter.spec.display_name} 開始" + (f" ({start_desc})" if start_desc else ""),
         )
+
+        def _handle_stream_event(ev: StreamEvent) -> None:
+            nonlocal full_text, saw_error, deferred_opencode_notice
+            if ev.kind == "session" and ev.session_id and not compact_mode:
+                with self._lock:
+                    self._sessions[(agent_id, sister_id)] = ev.session_id
+            elif ev.kind == "delta" and ev.text:
+                full_text += ev.text
+                if not compact_mode:
+                    self.delta_received.emit(ev.text)
+            elif ev.kind == "replace":
+                full_text = ev.text
+                if not compact_mode:
+                    self.replace_received.emit(ev.text)
+            elif ev.kind in ("tool", "status") and ev.text:
+                status_msg = f"{ev.text} ({ev.detail})" if ev.detail else ev.text
+                if not compact_mode:
+                    self.status_changed.emit(status_msg)
+                self._emit_activity(
+                    "tool" if ev.kind == "tool" else "info",
+                    status_msg,
+                )
+            elif ev.kind == "log" and ev.text:
+                self._emit_activity(ev.level or "info", ev.text)
+            elif ev.kind == "error":
+                msg = ev.text or f"{agent_id} でエラーが発生しました。"
+                if agent_id == "opencode" and msg.startswith(_OPENCODE_CANCELLED_INPUT_PREFIX):
+                    deferred_opencode_notice = msg
+                    self._emit_activity("warn", f"⚠️ {msg}")
+                    return
+                saw_error = True
+                self._emit_activity("error", f"❌ {msg}")
+                if compact_mode:
+                    self.compact_error.emit(msg)
+                else:
+                    self.error_occurred.emit(msg)
+
+        if not compact_mode and interactive_ctx is not None:
+            def _reg_main(p: subprocess.Popen[str]) -> None:
+                with self._lock:
+                    self._process = p
+
+            def _unreg_main(_p: subprocess.Popen[str]) -> None:
+                with self._lock:
+                    self._process = None
+
+            def _set_steer(cb: SteerHandler | None) -> None:
+                with self._lock:
+                    self._active_steer_cb = cb
+
+            try:
+                inter_res = self._try_run_interactive(
+                    agent_id,
+                    str(interactive_ctx.get("effective_prompt") or ""),
+                    adapter=adapter,
+                    model=str(interactive_ctx.get("model") or ""),
+                    effort=str(interactive_ctx.get("effort") or ""),
+                    session_id=interactive_ctx.get("session_id"),
+                    effective_cwd=cwd,
+                    system_prompt_arg=str(interactive_ctx.get("system_prompt_arg") or ""),
+                    auto_approve=bool(interactive_ctx.get("auto_approve", True)),
+                    attachments=interactive_ctx.get("attachments") or (),
+                    sister_name=str(interactive_ctx.get("sister_name") or ""),
+                    cancel_event=None,
+                    honor_global_cancel=True,
+                    log_prefix="",
+                    on_event=_handle_stream_event,
+                    register_proc=_reg_main,
+                    unregister_proc=_unreg_main,
+                    set_steer_handler=_set_steer,
+                )
+            finally:
+                _set_steer(None)
+            if inter_res.handled and not inter_res.fallback_needed:
+                with self._lock:
+                    cancelled = self._cancel_requested or inter_res.cancelled
+                    self._process = None
+                    self._running = False
+                    self._cancel_requested = False
+                elapsed = max(0.0, time.monotonic() - started_at)
+                self.status_changed.emit("")
+                if cancelled:
+                    self._emit_activity("warn", f"⏹ ユーザーにより中断 (exit={inter_res.returncode}, {elapsed:.1f}s)")
+                    self.turn_cancelled.emit(full_text)
+                    return
+                if saw_error:
+                    return
+                if inter_res.error:
+                    self._emit_activity("error", f"❌ {inter_res.error}")
+                    self.error_occurred.emit(inter_res.error)
+                    return
+                if not full_text.strip():
+                    msg = f"{adapter.spec.display_name} から応答テキストを取得できませんでした (exit={inter_res.returncode})"
+                    self._emit_activity("error", f"❌ {msg}")
+                    self.error_occurred.emit(msg)
+                    return
+                self._emit_activity("done", f"✔ 完了 (exit={inter_res.returncode}, {elapsed:.1f}s)")
+                self.reply_finished.emit(full_text)
+                return
 
         _resolved_cwd, popen_kwargs = _build_popen_kwargs(cwd, stdin_text)
 
@@ -463,35 +799,7 @@ class AgentRouter(QObject):
                             self._emit_activity("warn", f"[stdout] {stripped_line[:240]}")
                         continue
                     for ev in evs:
-                        if ev.kind == "session" and ev.session_id and not compact_mode:
-                            with self._lock:
-                                self._sessions[(agent_id, sister_id)] = ev.session_id
-                        elif ev.kind == "delta" and ev.text:
-                            full_text += ev.text
-                            if not compact_mode:
-                                self.delta_received.emit(ev.text)
-                        elif ev.kind == "replace":
-                            full_text = ev.text
-                            if not compact_mode:
-                                self.replace_received.emit(ev.text)
-                        elif ev.kind in ("tool", "status") and ev.text:
-                            status_msg = f"{ev.text} ({ev.detail})" if ev.detail else ev.text
-                            if not compact_mode:
-                                self.status_changed.emit(status_msg)
-                            self._emit_activity(
-                                "tool" if ev.kind == "tool" else "info",
-                                status_msg,
-                            )
-                        elif ev.kind == "log" and ev.text:
-                            self._emit_activity(ev.level or "info", ev.text)
-                        elif ev.kind == "error":
-                            saw_error = True
-                            msg = ev.text or f"{agent_id} でエラーが発生しました。"
-                            self._emit_activity("error", f"❌ {msg}")
-                            if compact_mode:
-                                self.compact_error.emit(msg)
-                            else:
-                                self.error_occurred.emit(msg)
+                        _handle_stream_event(ev)
         finally:
             returncode = proc.wait()
             stderr_thread.join(timeout=1.0)
@@ -538,24 +846,22 @@ class AgentRouter(QObject):
 
         if returncode != 0:
             self._emit_activity("error", f"❌ プロセス異常終了 (exit={returncode}, {elapsed:.1f}s)")
-            self.error_occurred.emit(
-                _format_process_error(
-                    f"{adapter.spec.display_name} が途中で終了しました (exit={returncode})",
-                    stderr_lines,
-                )
+            err_summary = (
+                deferred_opencode_notice
+                or f"{adapter.spec.display_name} が途中で終了しました (exit={returncode})"
             )
+            self.error_occurred.emit(_format_process_error(err_summary, stderr_lines))
             return
 
         if not full_text.strip():
             self._emit_activity(
                 "error", f"❌ 応答本文が空のまま終了しました (exit={returncode}, {elapsed:.1f}s)"
             )
-            self.error_occurred.emit(
-                _format_process_error(
-                    f"{adapter.spec.display_name} から応答テキストを取得できませんでした (exit={returncode})",
-                    stderr_lines,
-                )
+            err_summary = (
+                deferred_opencode_notice
+                or f"{adapter.spec.display_name} から応答テキストを取得できませんでした (exit={returncode})"
             )
+            self.error_occurred.emit(_format_process_error(err_summary, stderr_lines))
             return
 
         self._emit_activity("done", f"✔ 完了 (exit={returncode}, {elapsed:.1f}s)")
@@ -565,9 +871,11 @@ class AgentRouter(QObject):
         """Terminate running single-chat and isolated orchestrator subprocesses cleanly."""
         with self._lock:
             self._cancel_requested = True
+            self._active_steer_cb = None
             proc = self._process
             aux_procs = list(self._aux_processes)
 
+        self.cancel_all_interactions()
         _terminate_process(proc)
         for aux in aux_procs:
             _terminate_process(aux)
@@ -579,8 +887,11 @@ class AgentRouter(QObject):
         *,
         system_prompt: str = "",
         model: str = "",
+        effort: str = "",
         cwd: str = "",
         auto_approve: bool = True,
+        allow_interactive: bool = True,
+        sister_name: str = "",
         attachments: Sequence[AttachmentItem] = (),
         cancel_event: threading.Event | None = None,
         log_prefix: str = "",
@@ -625,6 +936,7 @@ class AgentRouter(QObject):
         cmd, stdin_text = adapter.build_command(
             effective_prompt,
             model=model,
+            effort=effort,
             session_id=None,
             cwd=effective_cwd,
             system_prompt=system_prompt_arg,
@@ -633,10 +945,110 @@ class AgentRouter(QObject):
         )
 
         started_at = time.monotonic()
+        effort_tag = f", effort={effort}" if effort.strip() else ""
         self._emit_activity(
             "info",
-            f"{log_prefix}▶ {adapter.spec.display_name} 開始 (model={model or '既定'})",
+            f"{log_prefix}▶ {adapter.spec.display_name} 開始 (model={model or '既定'}{effort_tag})",
         )
+
+        full_text = ""
+        saw_error = False
+        error_msg = ""
+        deferred_opencode_notice = ""
+        stderr_lines: list[str] = []
+
+        def _handle_iso_event(ev: StreamEvent) -> None:
+            nonlocal full_text, saw_error, error_msg, deferred_opencode_notice
+            if ev.kind == "delta" and ev.text:
+                full_text += ev.text
+                if on_delta is not None:
+                    on_delta(ev.text)
+            elif ev.kind == "replace":
+                full_text = ev.text
+                if on_replace is not None:
+                    on_replace(ev.text)
+            elif ev.kind in ("tool", "status") and ev.text:
+                status_msg = f"{ev.text} ({ev.detail})" if ev.detail else ev.text
+                self._emit_activity(
+                    "tool" if ev.kind == "tool" else "info",
+                    f"{log_prefix}{status_msg}",
+                )
+                if on_status is not None:
+                    on_status(status_msg)
+                if ev.kind == "tool" and on_tool is not None:
+                    on_tool(ev.tool_name or "", status_msg)
+            elif ev.kind == "log" and ev.text:
+                self._emit_activity(ev.level or "info", f"{log_prefix}{ev.text}")
+            elif ev.kind == "error":
+                msg = ev.text or f"{agent_id} でエラーが発生しました。"
+                if agent_id == "opencode" and msg.startswith(_OPENCODE_CANCELLED_INPUT_PREFIX):
+                    deferred_opencode_notice = msg
+                    self._emit_activity("warn", f"{log_prefix}⚠️ {msg}")
+                    return
+                saw_error = True
+                error_msg = msg
+                self._emit_activity("error", f"{log_prefix}❌ {error_msg}")
+
+        if allow_interactive:
+            def _reg_aux(p: subprocess.Popen[str]) -> None:
+                with self._lock:
+                    self._aux_processes.add(p)
+
+            def _unreg_aux(p: subprocess.Popen[str]) -> None:
+                with self._lock:
+                    self._aux_processes.discard(p)
+
+            inter_res = self._try_run_interactive(
+                agent_id,
+                effective_prompt,
+                adapter=adapter,
+                model=model,
+                effort=effort,
+                session_id=None,
+                effective_cwd=effective_cwd,
+                system_prompt_arg=system_prompt_arg,
+                auto_approve=auto_approve,
+                attachments=att_tuple,
+                sister_name=sister_name,
+                cancel_event=cancel_event,
+                honor_global_cancel=False,
+                log_prefix=log_prefix,
+                on_event=_handle_iso_event,
+                register_proc=_reg_aux,
+                unregister_proc=_unreg_aux,
+            )
+            if inter_res.handled and not inter_res.fallback_needed:
+                elapsed = max(0.0, time.monotonic() - started_at)
+                cancelled = inter_res.cancelled or bool(cancel_event is not None and cancel_event.is_set())
+                if cancelled:
+                    self._emit_activity("warn", f"{log_prefix}⏹ 中断 (exit={inter_res.returncode}, {elapsed:.1f}s)")
+                    return IsolatedTurnResult(
+                        text=full_text.strip(),
+                        returncode=inter_res.returncode,
+                        cancelled=True,
+                        elapsed=elapsed,
+                    )
+                if saw_error:
+                    return IsolatedTurnResult(
+                        text=full_text.strip(),
+                        returncode=inter_res.returncode,
+                        error=error_msg,
+                        elapsed=elapsed,
+                    )
+                if inter_res.error:
+                    return IsolatedTurnResult(
+                        text=full_text.strip(),
+                        returncode=inter_res.returncode,
+                        error=inter_res.error,
+                        elapsed=elapsed,
+                    )
+                if not full_text.strip():
+                    msg = f"{adapter.spec.display_name} から応答テキストを取得できませんでした (exit={inter_res.returncode})"
+                    self._emit_activity("error", f"{log_prefix}❌ {msg}")
+                    return IsolatedTurnResult(text="", returncode=inter_res.returncode, error=msg, elapsed=elapsed)
+                self._emit_activity("done", f"{log_prefix}✔ 完了 (exit={inter_res.returncode}, {elapsed:.1f}s)")
+                return IsolatedTurnResult(text=full_text.strip(), returncode=inter_res.returncode, elapsed=elapsed)
+
         _resolved_cwd, popen_kwargs = _build_popen_kwargs(effective_cwd, stdin_text)
         try:
             proc = subprocess.Popen(cmd, **popen_kwargs)
@@ -649,11 +1061,6 @@ class AgentRouter(QObject):
             self._aux_processes.add(proc)
         if cancel_event is not None and cancel_event.is_set():
             _terminate_process(proc)
-
-        full_text = ""
-        saw_error = False
-        error_msg = ""
-        stderr_lines: list[str] = []
 
         def _read_stderr() -> None:
             if proc.stderr is None:
@@ -691,30 +1098,7 @@ class AgentRouter(QObject):
                             self._emit_activity("warn", f"{log_prefix}[stdout] {stripped_line[:240]}")
                         continue
                     for ev in evs:
-                        if ev.kind == "delta" and ev.text:
-                            full_text += ev.text
-                            if on_delta is not None:
-                                on_delta(ev.text)
-                        elif ev.kind == "replace":
-                            full_text = ev.text
-                            if on_replace is not None:
-                                on_replace(ev.text)
-                        elif ev.kind in ("tool", "status") and ev.text:
-                            status_msg = f"{ev.text} ({ev.detail})" if ev.detail else ev.text
-                            self._emit_activity(
-                                "tool" if ev.kind == "tool" else "info",
-                                f"{log_prefix}{status_msg}",
-                            )
-                            if on_status is not None:
-                                on_status(status_msg)
-                            if ev.kind == "tool" and on_tool is not None:
-                                on_tool(ev.tool_name or "", status_msg)
-                        elif ev.kind == "log" and ev.text:
-                            self._emit_activity(ev.level or "info", f"{log_prefix}{ev.text}")
-                        elif ev.kind == "error":
-                            saw_error = True
-                            error_msg = ev.text or f"{agent_id} でエラーが発生しました。"
-                            self._emit_activity("error", f"{log_prefix}❌ {error_msg}")
+                        _handle_iso_event(ev)
         finally:
             returncode = proc.wait()
             stderr_thread.join(timeout=1.0)
@@ -742,13 +1126,14 @@ class AgentRouter(QObject):
             self._emit_activity(
                 "error", f"{log_prefix}❌ プロセス異常終了 (exit={returncode}, {elapsed:.1f}s)"
             )
+            err_summary = (
+                deferred_opencode_notice
+                or f"{adapter.spec.display_name} が途中で終了しました (exit={returncode})"
+            )
             return IsolatedTurnResult(
                 text=full_text.strip(),
                 returncode=returncode,
-                error=_format_process_error(
-                    f"{adapter.spec.display_name} が途中で終了しました (exit={returncode})",
-                    stderr_lines,
-                ),
+                error=_format_process_error(err_summary, stderr_lines),
                 elapsed=elapsed,
             )
 
@@ -757,13 +1142,14 @@ class AgentRouter(QObject):
                 "error",
                 f"{log_prefix}❌ 応答本文が空のまま終了しました (exit={returncode}, {elapsed:.1f}s)",
             )
+            err_summary = (
+                deferred_opencode_notice
+                or f"{adapter.spec.display_name} から応答テキストを取得できませんでした (exit={returncode})"
+            )
             return IsolatedTurnResult(
                 text="",
                 returncode=returncode,
-                error=_format_process_error(
-                    f"{adapter.spec.display_name} から応答テキストを取得できませんでした (exit={returncode})",
-                    stderr_lines,
-                ),
+                error=_format_process_error(err_summary, stderr_lines),
                 elapsed=elapsed,
             )
 

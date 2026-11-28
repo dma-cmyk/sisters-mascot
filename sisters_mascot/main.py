@@ -300,6 +300,8 @@ class MascotAppController(QObject):
         self.router.compact_error.connect(self._on_compact_error)
         self.router.activity_logged.connect(self.panel.append_activity_log)
         self.router.model_choices_discovered.connect(self.panel.on_model_choices_discovered)
+        self.router.interaction_requested.connect(self._on_agent_interaction_requested)
+        self.router.interaction_resolved.connect(self.panel.handle_interaction_resolved)
 
         # Orchestrator engine (mascot transitions & voice)
         self.orchestrator.active_sister_changed.connect(self._on_orch_active_sister_changed)
@@ -552,6 +554,17 @@ class MascotAppController(QObject):
         self.panel.handle_compact_error(err)
         self.mascot.set_activity("idle")
         self.mascot.show_toast(err, is_error=True, duration_ms=4500)
+
+    def _on_agent_interaction_requested(self, req: object) -> None:
+        self.panel.handle_interaction_requested(req)  # type: ignore[arg-type]
+        title = getattr(req, "title", "確認のお願い")
+        sister_name = getattr(req, "sister_name", "") or (
+            self.current_sister().display_name.split("（", 1)[0].split("(", 1)[0].strip()
+        )
+        self.mascot.set_activity("thinking", f"🔐 確認待ち: {title}")
+        self.mascot.show_toast(f"🔐 {sister_name}から確認のお願い: {title}", duration_ms=5000)
+        if not self.panel.isVisible():
+            self.panel.show_for_mascot(self.mascot.frameGeometry(), tab_index=0)
 
     def _apply_orch_transition(
         self,
